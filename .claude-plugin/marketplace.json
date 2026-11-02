@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "qa-skills",
+  "description": "The qa-skills plugin, served from this repository.",
+  "owner": {
+    "name": "kinasr"
+  },
+  "plugins": [
+    {
+      "name": "qa-skills",
+      "description": "14 /qa-* skills and one zero-dependency Node CLI that keep a markdown knowledge layer (.qa/) in the repo under test.",
+      "source": "./plugin",
+      "category": "testing",
+      "homepage": "https://github.com/Kinasr/qa-skills"
+    }
+  ]
+}

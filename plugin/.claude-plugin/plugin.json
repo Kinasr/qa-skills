@@ -1,0 +1,11 @@
+{
+  "name": "qa-skills",
+  "description": "14 /qa-* skills and one zero-dependency Node CLI that keep a markdown knowledge layer (.qa/) in the repo under test: Features with Rules, Test Cases that cover them, and change-impact verdicts.",
+  "version": "0.3.6",
+  "license": "MIT",
+  "author": {
+    "name": "kinasr"
+  },
+  "homepage": "https://github.com/Kinasr/qa-skills",
+  "repository": "https://github.com/Kinasr/qa-skills"
+}
