@@ -13,7 +13,7 @@
 - 🔁 **Stay in sync.** When a change lands, it flags the cases that are now stale or conflicting.
 - 🐞 **Close the loop.** It drafts bugs for failures and repairs broken test code.
 
-**0.3.0, Claude Code only.** The [support matrix](https://github.com/Kinasr/qa-skills/blob/v0.3.6/docs/support.md)
+**Claude Code only.** The [support matrix](https://github.com/Kinasr/qa-skills/blob/v0.3.6/docs/support.md)
 says what is tested, what the CLI does with your data and what a Run keeps.
 
 ## 🔄 How it works

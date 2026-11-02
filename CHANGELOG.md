@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## [0.3.7] - 2026-11-02
+
+### Changed
+
+- The README's support line no longer names a version.
+
 ## [0.3.6] - 2026-11-02
 
 ### Changed
