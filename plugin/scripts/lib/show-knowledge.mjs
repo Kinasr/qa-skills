@@ -2,6 +2,7 @@
 // Coverage, prose sections and legend slot, backed by existing domain predicates.
 import { parseDeferred } from './deferred.mjs';
 import { parkedQuestions } from './parked-questions.mjs';
+import { parseProposedRules } from './proposed-rules.mjs';
 import { parseCoverage, coverageDue } from './coverage.mjs';
 import { CATEGORIES_TRAIN_KEY, effectiveCategoriesFromText } from './categories.mjs';
 /** @import {ShowKnowledgeSection} from './page.d.mts' */
@@ -24,6 +25,7 @@ export function showKnowledge(feature, acquisition) {
   return {
     deferred,
     parked,
+    proposed: file ? parseProposedRules(file.text) : [],
     boundaries: file?.boundaries ?? [],
     waivers: (file?.rules ?? []).filter(r => r.waiver !== null).map(r => ({ key: r.key, reason: /** @type {string} */ (r.waiver), elaboration: r.elaboration })),
     coverage: coverage && { ...coverage, problems: coverage.problems.map(({ line, ...problem }) => ({ ...problem, ...(line == null ? {} : { line }) })) }, coverage_due: file ? coverageDue(file, effective) : null, deferred_count: deferred.length, parked_count: parked.length,

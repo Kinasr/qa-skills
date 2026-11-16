@@ -586,7 +586,7 @@ export const command = {
   options: { brief: "value", stdin: "flag" },
   usage: "<judge|design> <reply-path | --stdin> --brief <brief-json>",
   run([contract, ...rest], { brief, stdin }) {
-    if (stdin ? rest.length !== 0 : rest.length !== 1) throw new UsageError("check-reply takes a contract and exactly one <reply-path>, or --stdin");
+    if (stdin ? rest.length !== 0 : rest.length !== 1) throw new UsageError("check-reply takes a contract and exactly one <reply-path>, or --input <file> or --stdin");
     if (brief === undefined) throw new UsageError("check-reply needs --brief <brief-json>, the JSON `brief` printed for this unit");
     /**
      * Reads a path the command line names; being unable to read is a usage error.

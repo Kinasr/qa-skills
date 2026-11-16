@@ -12,8 +12,8 @@ list unasked and undroppable.
 |---|---|---|---|
 | Test levels | `stack.levels` | the first token of test names, guidance files, tracker | `["api", "ui"]` |
 | Tags | `tags` | tags, markers or categories the test framework or tracker already uses | `e2e`, `smoke`, `regression`, each with a written one-line meaning |
-| Roles | `roles`, `role_meaning` | the tracker's Role field | nothing: ask "does this project have user roles?"; with Roles, also ask `role_meaning`, one line on what the list means |
-| Custom fields | `custom_fields` | the tracker's own fields for cases | nothing: ask whether the team classifies cases by anything else (a team category, priority, component) |
+| Roles | `roles`, `role_meaning` | the tracker's Role field | nothing: ask "does this project have user roles?", with any repository hint in `hint`; with Roles, also ask `role_meaning`, one line on what the list means. A first run refuses a non-empty `roles` that states no meaning |
+| Custom fields | `custom_fields` | the tracker's own fields for cases | nothing: ask whether the team classifies cases by anything else (a team category, priority, component), with any repository hint in `hint` |
 
 - **Tags** are a map of Tag to one-line meaning: `{"smoke": "A critical path a release cannot ship
   without"}`. A meaning may be empty, but the `/qa-design` Delegate assigns only Tags that have one,

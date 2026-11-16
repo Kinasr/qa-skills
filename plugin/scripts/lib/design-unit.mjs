@@ -14,11 +14,15 @@ import { createHash } from "node:crypto";
 import { join, resolve } from "node:path";
 import { agreementBlock } from "./design-agreement-brief.mjs";
 import { designBrief } from "./design-prompt.mjs";
+import { noLoginRoles } from "./access.mjs";
 import { SKIPPED } from "./design-json.mjs";
+import { caseLevels } from "./case-fields.mjs";
 import { checkFile, projectConfig } from "./knowledge-file.mjs";
 import { buildIndex, loadWorkingTree } from "./qa-index.mjs";
 import { DESIGN_TRAIN_KEY } from "./schema.mjs";
 import { strip } from "./stripped.mjs";
+import { isOpenQuestionsSection } from "./parked-questions.mjs";
+import { isProposedRulesSection } from "./proposed-rules.mjs";
 import { conventionsText } from "./training.mjs";
 import { dependencyIndex, formatRuleRef, resolveRuleRef } from "./rule-ref.mjs";
 /** @import { LabelDefinitions } from "./case-labels.mjs" */
@@ -39,7 +43,8 @@ import { dependencyIndex, formatRuleRef, resolveRuleRef } from "./rule-ref.mjs";
  */
 
 /**
- * One `### rule_<key>: <statement>` entry of a Feature file.
+ * One Rule entry of a Feature file: a `### rule_<key>: <statement>` heading or a
+ * `1. **rule_<key>**: <statement>` item.
  * @typedef {object} RuleEntry
  * @property {string} key
  * @property {string} statement
@@ -141,7 +146,7 @@ import { dependencyIndex, formatRuleRef, resolveRuleRef } from "./rule-ref.mjs";
  * The brief of one design unit: the contract `design` serialises to the Run dir's
  * `<key>.brief.json`, `check-reply design` reads it with `--brief`, and `design-write` fills with
  * it. `kept` and `replace` name the cases the mode keeps and replaces; `wanted_levels` records the agreed
- * levels, and every case names its own.
+ * levels, which constrain only a case that binds a level; a Layer-free case carries none.
  * @typedef {object} DesignBrief
  * @property {true} ok
  * @property {"design"} unit
@@ -151,8 +156,10 @@ import { dependencyIndex, formatRuleRef, resolveRuleRef } from "./rule-ref.mjs";
  * @property {string} file - the scenario file, relative to `.qa/`
  * @property {string} path - the scenario file, absolute
  * @property {string} root - the `.qa/` directory, resolved
- * @property {string} digest - the SHA-256 of the file text the brief was built from
+ * @property {string} digest - the SHA-256 of the file's LF text the brief was built from
+ * @property {string[]} executable_levels
  * @property {string[]} wanted_levels
+ * @property {Record<string, string>} rule_claims - Rule claims at the time of the brief
  * @property {string[]} rules
  * @property {string[]} waived_rules
  * @property {string[]} relies_targets - the qualified Upstream Rules a Reliance may name
@@ -193,11 +200,13 @@ export function designMode({ expand, regenerate } = {}) {
 export const replaceable = (c, index) => !Object.hasOwn(c.data, "review") && index.tracker.current("case", c.key) === null;
 
 /**
- * The SHA-256 of a text, in hex: what keeps a write to the bytes its brief was built from.
+ * The SHA-256 of a text, in hex: what keeps a write to the knowledge its brief was built from.
+ * Line endings are not knowledge, so a CRLF text digests as its LF copy does: a CRLF checkout
+ * sees the same Scenario state, and an LF text keeps every digest it had.
  * @param {string} text
  * @returns {string}
  */
-export const digest = (text) => createHash("sha256").update(text).digest("hex");
+export const digest = (text) => createHash("sha256").update(text.replace(/\r\n/g, "\n")).digest("hex");
 
 /**
  * A Feature `slug` names in the `.qa/` tree at `root`: `{feature}` with its file, its Rules and
@@ -249,7 +258,7 @@ function scenarioState(root, index, f) {
     scenario: key,
     file: f.rel,
     summary: f.h1?.key === key ? /** @type {{ line: number, key: string, text: string }} */ (f.h1).text : null,
-    levels: [...new Set(f.cases.map((c) => c.data.level).filter((level) => typeof level === "string"))],
+    levels: [...new Set(f.cases.flatMap((c) => caseLevels(c.data)))],
     cases: f.cases.length,
     replaceable: f.cases.filter((c) => replaceable(c, index)).length,
   };
@@ -335,12 +344,15 @@ function designUnitInFeature(key, root, mode, feature, decl, ctx, agreement, agr
     slug: decl.feature,
     feature: featureBody(ctx.feature),
     roles: ctx.roles,
+    signedOutRoles: noLoginRoles(ctx.index),
     levels: ctx.levels,
+    executableLevels: Object.keys(projectConfig(ctx.index.project).execute_levels ?? {}),
+    executeModes: projectConfig(ctx.index.project).execute_levels ?? {},
     labels: ctx.labels,
     conventions: conventionsText(ctx.index, DESIGN_TRAIN_KEY),
     upstreamRules,
     scenarios: ctx.scenarios.filter((s) => s.scenario !== null).map((s) => ({ key: s.scenario, summary: s.summary ?? "" })),
-    scenario: { key, summary: state.summary ?? "", levels: agreement?.scenarios[key]?.levels ?? ctx.levels, mode, kept: kept.map((c) => /** @type {string} */ (entries.get(c.key))) },
+    scenario: { key, summary: state.summary ?? "", mode, kept: kept.map((c) => /** @type {string} */ (entries.get(c.key))) },
     agreement: agreementText,
   }));
   /** @type {DesignBrief} */
@@ -355,7 +367,9 @@ function designUnitInFeature(key, root, mode, feature, decl, ctx, agreement, agr
       path: join(ctx.root, decl.file.rel),
       root: ctx.root,
       digest: digest(decl.file.text),
-      wanted_levels: agreement?.scenarios[key]?.levels ?? ctx.levels,
+      wanted_levels: agreement?.scenarios[key]?.levels ?? [],
+      executable_levels: Object.keys(projectConfig(ctx.index.project).execute_levels ?? {}),
+      rule_claims: Object.fromEntries(strip(ctx.feature).rules),
       rules: ctx.rules.map((r) => r.key),
       waived_rules: ctx.rules.filter((r) => r.waiver).map((r) => r.key),
       relies_targets: reliesTargets,
@@ -389,14 +403,15 @@ export function modeRefusal(mode, state) {
 
 /**
  * The Feature file (parsed) as a design unit reads it: the body without its frontmatter, which is
- * provenance and Bookkeeping, and without `## Open questions`, which is never a basis for a case.
+ * provenance and Bookkeeping, and without `## Open questions` and `## Proposed Rules` (ADR-0067),
+ * neither of which is ever a basis for a case.
  * @param {QaFile} file
  * @returns {string}
  */
 function featureBody(file) {
   const lines = file.text.replace(/\r\n/g, "\n").split("\n");
   const start = file.frontmatter?.end ?? 0;
-  const cut = file.sections.filter((s) => s.level === 2 && s.title === "Open questions");
+  const cut = file.sections.filter((s) => s.level === 2 && (isOpenQuestionsSection(s) || isProposedRulesSection(s)));
   const kept = lines.filter((_, i) => i >= start && !cut.some((s) => i + 1 >= s.line && i + 1 <= s.end));
   return `${kept.join("\n").trim()}\n`;
 }

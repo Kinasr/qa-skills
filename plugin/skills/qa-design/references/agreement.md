@@ -8,25 +8,24 @@ writes nothing.
 
 ## The proposal
 
-Send `design agree feature --stdin`, or `design agree <scenario-key> --stdin` for a scoped run, one
+Run `design agree feature --input <file>`, or `design agree <scenario-key> --input <file>` for a scoped run, with one
 JSON object:
 
 ```json
 {"v": 1, "feature": "<slug>", "scope": "feature",
  "scenarios": {
    "<scenario-key>": {"action": "fill" | "expand" | "regenerate",
-                      "summary": "<new scenario only>", "levels": ["<level>"],
+                      "summary": "<new scenario only>",
                       "rules": ["rule_…"], "highlights": ["rule_…"], "remarks": ["…"]},
-   "new:1": {"action": "fill", "summary": "<one line>", "levels": ["<level>"],
+   "new:1": {"action": "fill", "summary": "<one line>",
              "rules": ["rule_…"], "highlights": [], "remarks": []}},
  "retained": {"rule_…": ["<scenario-key>"]},
  "handoffs": {"proposed_rules": [{"statement": "…", "why": "…"}],
               "coverage_corrections": ["…"]}}
 ```
 
-- `levels` is a non-empty list from `project.stack.levels`. Every case names exactly one of those
-  levels; the scenario file carries no level. Report `missing_levels` entries with code
-  `agreed_level_without_cases` when an agreed level got no cases.
+- `levels` is optional. When the agreement names levels, report `missing_levels` entries with code
+  `agreed_level_without_cases` for any that got no cases. Cases are Layer-free by default.
 - `rules` are the scenario's assignments: the Rules its cases take coverage responsibility for.
 - `highlights` are the Rules elsewhere in the Feature that constrain those assignments. They are
   attention guidance: the whole Feature still governs every case, and an empty list never means none.
@@ -49,13 +48,13 @@ The Feature's other gaps come back in `gaps`, reported and never refused.
 
 `fill` creates the empty file's cases, `expand` adds to a populated file, and `regenerate` replaces
 its unreviewed cases without an effective Tracker key. A `new:N` entry is always a `fill` and
-carries a one-line `summary` and wanted `levels`.
+carries a one-line `summary`.
 
 ## Confirmation and the recorded basis
 
 Word the returned `views` (actual and planned coverage) and `refusals` for the engineer; fix what a
-refusal names and send it again. On confirmation, pipe the canonical `agreement` to
-`design split <feature-key> --stdin` and keep the run `dir` and `agreement`. `design agree` computes
+refusal names and send it again. On confirmation, pass the canonical `agreement` to
+`design split <feature-key> --input <file>` and keep the run `dir` and `agreement`. `design agree` computes
 the agreement's `basis`; `split` records it, and `plan` refuses a stale one.
 
 ## Remark authority
@@ -68,3 +67,10 @@ A remark is the engineer's note on a scenario. It never changes the knowledge.
   Invariant.
 - A **behaviour claim** is a proposed Rule for `/qa-deep-dive`, never a case's premise.
 - A correction that must survive a regenerate becomes a Rule or a Convention before the run ends.
+
+## What reaches the Delegate
+
+`design plan` writes each scenario's part of the confirmed agreement into that unit's brief: its
+assignments (every obligation), the complete allocation map with `retained`, its highlights, its
+remarks under the authority above, the overlap policy and the effective Coverage categories. The
+Delegate writes against the agreement the engineer confirmed.

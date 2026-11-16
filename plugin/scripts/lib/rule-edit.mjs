@@ -65,7 +65,7 @@ export function parseForecast(text) {
   try {
     value = JSON.parse(text);
   } catch {
-    throw new UsageError("deep-dive reconcile reads the confirmed forecast as JSON from --stdin: {\"changes\": [...], \"may_change\": [...], \"unaffected\": [...]}");
+    throw new UsageError("deep-dive reconcile reads the confirmed forecast as JSON from --input <file> or --stdin: {\"changes\": [...], \"may_change\": [...], \"unaffected\": [...]}");
   }
   if (value === null || typeof value !== "object" || Array.isArray(value)) throw new UsageError("deep-dive reconcile: the forecast is a JSON object");
   const data = /** @type {Record<string, unknown>} */ (value);

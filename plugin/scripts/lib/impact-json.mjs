@@ -8,6 +8,7 @@ import { PATTERN } from "./keys.mjs";
 import { wordsOf } from "./stack.mjs";
 
 /** @import {RefusalFact, RefusalResult, Refusals} from "./refusal.mjs" */
+/** @import { PersistChange } from "./scan-history.mjs" */
 
 /**
  * The summaries of `.qa/`'s keys, as `labels.mjs` gives them: a key's label, or nothing when the
@@ -904,7 +905,7 @@ export function featureData(c, s, t) {
 export const REFUSALS = {
   unknown_action: "The step is missing or does not exist: the steps are plan, quick, quick-check, report, persist and escalate.",
   dir_and_out: "`--dir` and `--out` both name the run directory; give `--dir` alone.",
-  bad_arguments: "The step takes other arguments: `plan` and `entry` at most one Feature key, every other step only the run directory (`escalate` also `--case`, `quick-check` also a Feature key and `--stdin`).",
+  bad_arguments: "The step takes other arguments: `plan` and `entry` at most one Feature key, every other step only the run directory (`escalate` also `--case`, `quick-check` also a Feature key and `--input <file>` or `--stdin`).",
   persist_retired: "`/qa-impact --persist` is retired: the quick path takes a change end to end, and `/qa-design` settles the findings already on disk.",
   review_retired: "`/qa-impact --review` is retired: `/qa-design <feature-key> --review` walks the unreviewed and Review overdue cases.",
   target_retired: "`/qa-impact --target` is retired: the judge reads the committed knowledge at HEAD, so commit, then settle with `/qa-design`.",
@@ -923,7 +924,7 @@ export const REFUSALS = {
   forecast_missing: "`--persist` needs the engineer's confirmed forecast of each Rule whose statement changed since the Watermark, and the run dir holds none for the statement these Rules have now: confirm it again through `deep-dive reconcile` or `impact quick-check` with the same `--dir`, then plan again.",
   not_human: "The name for the stamps is not a person's name as a stamp carries it: `human:<name>`, with no space, double quote or backslash.",
   name_differs: "This Run's stamps carry another name, given when its walk began.",
-  needs_stdin: "This step needs its Reply or JSON decisions on stdin.",
+  needs_stdin: "This step needs its Reply or JSON decisions from --input <file> or stdin.",
   bad_answer: "A finding's answer is not dismiss, keep, fix or holds.",
   holds_not_stale: "Holds settles a Stale: it says the case is still right after the change that made it Stale.",
   field_not_allowed: "Only a dismiss takes a reason or a ticket.",
@@ -953,7 +954,29 @@ export const REFUSALS = {
   no_block: "The case has no block of fields to hold its findings or its review.",
   no_feature_file: "The Feature file is not in the knowledge layer to keep the Retired key.",
 };
-export const { fact, refuse, refusalOf } = refusalsFor(REFUSALS);
+
+// A changed file in a `persist_refused` line, by what happened to it.
+/** @type {Record<PersistChange["change"], string>} */
+const PERSIST_CHANGE = { added: "is not committed", deleted: "is deleted", modified: "is modified" };
+
+// The `persist_refused` line names the one reason the dirty check gave, never all three: `dirty`
+// lists the files that differ from HEAD, the other two name the missing commit or repository.
+/**
+ * @param {string | undefined} reason
+ * @param {unknown} changed
+ * @returns {string}
+ */
+function persistRefusedLine(reason, changed) {
+  if (reason === "no_commits") return "`--persist` needs a commit to pin to: the repository has no commits.";
+  if (reason === "not_a_repository") return "`--persist` needs `.qa/` inside a git repository, and it is not.";
+  const files = (Array.isArray(changed) ? changed : []).filter((x) => object(x)).map((x) => {
+    const c = /** @type {PersistChange} */ (x);
+    return `\`${c.file}\` ${PERSIST_CHANGE[c.change]}`;
+  });
+  const dirty = "`--persist` needs the working tree's knowledge to equal HEAD's";
+  return files.length ? `${dirty}: ${files.join(", ")}.` : `${dirty}: \`.qa/\` holds uncommitted knowledge.`;
+}
+export const { fact, refuse, refusalOf } = refusalsFor(REFUSALS, (code, data) => (code === "persist_refused" ? { ...data, line: persistRefusedLine(typeof data.reason === "string" ? data.reason : undefined, data.changed) } : data));
 
 // ---------------------------------------------------------------------------------------------
 // The decisions on one walk case, JSON on stdin:

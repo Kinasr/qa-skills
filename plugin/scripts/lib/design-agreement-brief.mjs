@@ -6,26 +6,26 @@
 //   - any material regression of C keeps the incumbent brief: `off`;
 //   - passing every frozen criterion makes the full agreement block the default: `full`;
 //   - otherwise, allocation delivery alone: `allocation`.
-// Until the confirmation run decides, the switch stays `off`.
-// The follow-up that flips delivery edits this one line. No CLI flag, project setting or training
-// file overrides it; the only exception is the test-only environment variable
-// `agreementBriefPosition` reads, the way tests set QA_SKILLS_MINT_SEED.
+// The confirmation run's locked scoring gave `off`; its corrected scoring gives `full`, and ADR-0042
+// records the superseding decision that ships `full`. A later change of delivery edits this one line.
+// No CLI flag, project setting or training file overrides it; the only exception is the test-only
+// environment variable `agreementBriefPosition` reads, the way tests set QA_SKILLS_MINT_SEED.
 /** @import { Agreement } from "./design-agreement.mjs" */
 /** @import { FeatureContext } from "./design-unit.mjs" */
 import { effectiveCategories } from "./categories.mjs";
 
 /**
- * One position of the design brief's agreement release switch: `off` (today's brief), `allocation`
+ * One position of the design brief's agreement release switch: `off` (no agreement block), `allocation`
  * (assigned Rules, the allocation map and the overlap qualification) or `full` (every element).
  * @typedef {"off" | "allocation" | "full"} AgreementBriefPosition
  */
 
 /**
- * The release switch ADR-0042 gates the agreement block on. Defaults to `off` until the
- * confirmation run decides; flip it here and nowhere else.
+ * The release switch ADR-0042 gates the agreement block on: `full`, per its superseding decision.
+ * Change it here and nowhere else.
  * @type {AgreementBriefPosition}
  */
-export const AGREEMENT_BRIEF_SWITCH = "off";
+export const AGREEMENT_BRIEF_SWITCH = "full";
 
 /**
  * The position in force: the constant above, unless a test sets `QA_SKILLS_AGREEMENT_BRIEF` to one
@@ -86,6 +86,8 @@ export function agreementBlock(ctx, agreement, scenario, position) {
       ...(highlights.length > 0 ? highlights.map(ruleLine) : ["- (none highlighted)"]),
       "",
       "=== REMARKS ===",
+      "",
+      "The engineer's remarks on this scenario. A remark shapes how its cases are written or moves work between scenarios; it never overrides a Rule, a Convention or an Invariant, never removes an assigned obligation, and is never a case's premise.",
       "",
       ...((entry?.remarks.length ?? 0) > 0 ? /** @type {string[]} */ (entry?.remarks).map((remark) => `- ${oneLine(remark)}`) : ["- (none)"]),
       "",

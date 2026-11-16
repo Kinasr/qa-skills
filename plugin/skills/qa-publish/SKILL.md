@@ -54,6 +54,9 @@ A Practice that contradicts an Invariant is void.
   `notices` entry once; accepting the Card authorizes the label operations. Label-only edits keep
   fresh Reviews fresh. A local-copy item records label copies only, with no Publisher write.
   Below the level-on-case schema, publish claims only and relay the migration notice.
+- **A level is written only as claimed.** A Layer-free case writes no level; one binding writes its
+  slug; a list writes several values only where the tracker's Test level field accepts them, and is
+  reported unsupported otherwise.
 - **One case is one atomic field update.** The Publisher refuses before mutating when unsupported,
   preserves unmanaged labels and the marker label, and returns confirmed label values. Record copies
   only from those confirmations; a rejected value fails that case while independent items continue.
@@ -73,10 +76,12 @@ Run from the repository root (`--root` defaults to `./.qa`):
 node <this skill's directory>/../../scripts/scan.mjs publish scope [<feature-key> | --run <execute-run-dir>] [--dir <run-dir>] [--root <qa-dir>]
 node <this skill's directory>/../../scripts/scan.mjs scout brief tracker --dir <run-dir> [--root <qa-dir>]
 node <this skill's directory>/../../scripts/scan.mjs publish card [<feature-key>] --dir <run-dir> [--root <qa-dir>]
-node <this skill's directory>/../../scripts/scan.mjs publish apply --dir <run-dir> --stdin [--root <qa-dir>]
+node <this skill's directory>/../../scripts/scan.mjs publish apply --dir <run-dir> --input <file> [--root <qa-dir>]
 node <this skill's directory>/../../scripts/scan.mjs scout brief publisher --dir <run-dir> [--root <qa-dir>]
 node <this skill's directory>/../../scripts/scan.mjs publish record --dir <run-dir> [--root <qa-dir>]
 ```
+
+Commands that read input take it from a file: write it outside the repository (the run dir or your scratch directory) and pass its absolute path as `--input <file>`. Run each command as one plain `node` line, with no pipe, heredoc, `&&` or `;` chain, variable prefix or `cd`.
 
 Each call prints JSON. Keep `scope`'s `dir` throughout. The CLI checks the Card digest; never carry
 it in decisions. Explain refusal codes, labels and data. Relay a shared guard's `text` intact.
@@ -95,7 +100,9 @@ without subagents. The tracker scout's brief names the exact fetch command. A fa
 named destination other than `labels`, fetch matching tracker identities and cardinalities into
 `tracker.json`'s `label_destinations: [{name, fields: [{id, cardinality}]}]`, `cardinality` being
 `single` or `multiple`. Include zero or multiple matches as observed; the CLI skips affected cases
-rather than choosing a field. Fetch each case's named-field Tags as
+rather than choosing a field. Fetch the Test level destination the same way into
+`level_destinations: [{name: "level", fields: [{id, cardinality}]}]` when its field accepts several
+values; leave it out when it is single-valued. Fetch each case's named-field Tags as
 `label_values: [{id: "label:tags", kind: "tags", destination, value: []}]`, using the actual list in
 `value`, so the Card shows removals. Fetch each mapped Custom field the same way, as
 `{id: "label:field:<name>", kind: "custom_field", destination, value}`: a scalar or null for single.
@@ -122,7 +129,7 @@ tracker and new values, and Divergences needing confirmation. Include skips and 
 
 ## 3. Apply decisions
 
-Translate only clear answers into JSON on stdin:
+Translate only clear answers into a JSON file:
 
 ```json
 {"take":"all","drop":[3]}

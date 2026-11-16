@@ -1,6 +1,7 @@
 // @ts-check
 import { lstatSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, sep } from "node:path";
+import { REPORT_FILE } from "./execution-guard.mjs";
 import { tailOptions } from "./tester.mjs";
 
 /**
@@ -25,6 +26,9 @@ import { tailOptions } from "./tester.mjs";
 
 /** @type {"qa-skills:tester"} */
 export const TESTER_AGENT = "qa-skills:tester";
+/** @type {string} */
+export const TESTER_DENIAL_MESSAGE = "Tester guard: use only standalone tester do|request commands, artifacts and the report of your own Execution, with the brief's --dir.";
+
 const BINDING_FILE = "tester.json";
 const ID = /^[A-Za-z0-9_-]+$/;
 const MARKER = /^<!-- qa-execute-binding (\{.*\}) -->$/;
@@ -231,7 +235,7 @@ export function testerWriteAllowed(path, agentId) {
     const real = artifactRealPath(path);
     const parts = real.split(sep);
     if (authPath(parts)) return false;
-    if (parts.length < 4 || parts.at(-1) !== "report.md" || parts.at(-3) !== "executions" || !parts.at(-2)) return false;
+    if (parts.length < 4 || parts.at(-1) !== REPORT_FILE || parts.at(-3) !== "executions" || !parts.at(-2)) return false;
     try {
       // An existing report must be a plain file: a link would redirect the write elsewhere.
       if (!lstatSync(path).isFile()) return false;

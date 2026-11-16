@@ -54,7 +54,8 @@ A Practice that contradicts an Invariant is void.
   Delegates launch fresh and non-forked, with automatic startup loading of user, project and local
   CLAUDE.md disabled and without parent auto memory. Read is not path-confined; hooks and
   instructions loaded during file access remain residual channels. Qualified live (`docs/support.md`).
-- **Never stage or commit.** Give the engineer the changeset's `commit` command to run.
+- **Never run git to stage or commit yourself.** The commit follows the project's Commit mode through
+  `scan.mjs commit` (ADR-0062), never retried with `--no-verify`.
 - **Never stamp a name the engineer didn't give.** Ask for it.
 - **Never reuse answers given before the case changed.** Walk again.
 - **The quick path runs in this conversation.** Never hand its forecast, Rule edits or walk to a
@@ -65,7 +66,8 @@ A Practice that contradicts an Invariant is void.
 - **Persist only into the run dir that holds the confirmed forecast.** `plan --persist` refuses a Rule
   whose statement changed without one: run `quick-check` into the same dir again.
 - **Over the threshold, stop.** Write the handoff and give `/qa-deep-dive`'s command; never go on.
-- **Checkpoints are the engineer's commits.** Run the next step only after they confirm one.
+- **Checkpoints follow the Commit mode.** Run the next step only once the checkpoint commit exists:
+  under `auto` the CLI makes it and the run goes on.
 - **An old invocation is answered, never run.** Entry refuses it; do not run the retired flow.
 
 ## The CLI
@@ -76,13 +78,15 @@ Run from the repository root (`--root` defaults to `./.qa`); each call prints on
 node <this skill's directory>/../../scripts/scan.mjs <mode> ...
 ```
 
+Commands that read input take it from a file: write it outside the repository (the run dir or your scratch directory) and pass its absolute path as `--input <file>`. Run each command as one plain `node` line, with no pipe, heredoc, `&&` or `;` chain, variable prefix or `cd`.
+
 - `impact entry [<feature-key>] [--persist] [--review [<feature-key>]] [--target <ref>]`, the engineer's arguments as given
-- `impact quick [--dir <run-dir>]`, then `impact quick-check <feature-key> --dir <run-dir> --stdin`
+- `impact quick [--dir <run-dir>]`, then `impact quick-check <feature-key> --dir <run-dir> --input <file>`
 - `impact plan [<feature-key>] --persist --dir <dir>`, then `impact persist --dir <dir>`
 - `delegate resolve|start|next|record ...`, the shared delegation procedure
 - `design walk --dir <dir> [--by human:<name>] [--case <key>]`
-- `design triage --dir <dir> --stdin [--case <key>]`, JSON decisions on stdin
-- `design page --dir <dir>`; `design page-reply --dir <dir> --stdin`, the pasted Reply unchanged
+- `design triage --dir <dir> --input <file> [--case <key>]`, JSON decisions in the `--input` file
+- `design page --dir <dir>`; `design page-reply --dir <dir> --input <file>`, the pasted Reply unchanged
 - `design checkpoint --dir <dir>`
 
 **`ok: false`**: `refusals` carry a `code`, one factual `line` and data. Explain them in your own
@@ -107,8 +111,8 @@ the committed knowledge at HEAD; a call with no Feature key is `/qa-next`'s ques
 2. **Forecast and Rules.** Follow [`/qa-deep-dive`](../qa-deep-dive/SKILL.md) §1 to §9 on the Feature
    and References: intake, Impact forecast, amendment inventory, walk, Rules, `deep-dive check`, the
    written file. Keep its Invariants. Skip its `reconcile` and its close, which step 3 replaces.
-3. **Scope.** Pipe `{"forecast": {...}, "references": ["<URI>"], "open_questions": [...]}` to
-   `impact quick-check <feature-key> --dir <dir> --stdin`: the confirmed forecast (`widened` and `by`
+3. **Scope.** Pass `{"forecast": {...}, "references": ["<URI>"], "open_questions": [...]}` to
+   `impact quick-check <feature-key> --dir <dir> --input <file>`: the confirmed forecast (`widened` and `by`
    as `deep-dive reconcile` takes them), every Reference's URI and each question still open. Settle
    its `outside_band`, `unedited_changes`, `boundary_check` and `downstream` as the deep-dive
    re-run reference says. The engineer may confirm **one** downstream Rule to edit in this run: edit
@@ -117,7 +121,8 @@ the committed knowledge at HEAD; a call with no Feature key is `/qa-next`'s ques
    owe after the downstream walk. When `over` is true, `handoff` is written: tell the engineer the
    total and the limit, give its `next_step` (`/qa-deep-dive <feature-key> --dir <dir>`, which resumes
    from it), and stop. When it is not, go on.
-5. **Checkpoint 1.** Give the engineer the commit command for the Rule edits, and wait for the commit.
+5. **Checkpoint 1.** Make `quick-check`'s `changeset.commit`, the Rule edits, as [the commit reference](../references/commit.md) says, and go on once
+   it exists.
 6. **Store and judge.** Run [the judge step](#the-judge-step) with `impact plan --persist --dir <dir>`
    (with the Feature key when `quick-check`'s `next_step` names it), then its Dispatch, and
    `impact persist --dir <dir>`. Report as its Report does.
@@ -130,10 +135,11 @@ the committed knowledge at HEAD; a call with no Feature key is `/qa-next`'s ques
    Otherwise, and when the engineer declines the page, follow [the chat walk](references/triage.md).
 8. **Cases.** Write the new cases as `/qa-design <feature-key> --expand` does, its §2 to §5, passing
    `--dir <design_dir>` to `design split` and `design plan`.
-9. **Checkpoint 2.** When the walk is `done` and the cases are written, give the commit command, wait
-   for it, and run `design checkpoint --dir <dir>`: it advances each held Watermark to HEAD and prints
-   the final `changeset`, which you give intact. Report `walk_unfinished` or `persist_refused` as what
-   remains to settle or commit.
+9. **Checkpoint 2.** When the walk is `done` and the cases are written, make the commit of
+   the walk's `changeset` as [the commit reference](../references/commit.md) says. Once it exists, run
+   `design checkpoint --dir <dir>`: it advances each held Watermark to HEAD and prints the final
+   `changeset`, which you give intact. Report `walk_unfinished` or `persist_refused` as what remains
+   to settle or commit.
 
 The engineer may stop at any step: a run stopped before a checkpoint stores nothing past the last
 one, and each settled case is already on disk with its Watermark not moved. `/qa-design <feature-key>`

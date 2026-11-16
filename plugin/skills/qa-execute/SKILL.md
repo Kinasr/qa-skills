@@ -8,14 +8,16 @@ disable-model-invocation: true
 
 `/qa-execute [<scope>...] [tag:<name>...] [level:<name>...] [target:<slug>]`
 
-Executes live **Test Cases** against an application target. The CLI plans the selection, checks
-prerequisites, handles skips, and prints a confirm. On confirmation, the CLI schedules Executions,
-you spawn background **Tester** subagents to follow pinned case steps, record each reply, prompt
-once for paused notes under the Access failure rule, and relay the closing summary.
+The CLI plans **Test Cases**, checks prerequisites, lists skips and prints a confirm. Confirmed,
+it schedules Executions: spawn background **Tester** subagents following pinned steps, record replies,
+prompt once for paused notes under the Access failure rule; relay the summary.
 
-`<scope>` is the engineer's arguments: Case, Scenario, Suite, Feature or Tracker keys.
-With filters alone, scope is all live cases. Tags and Test levels match exact names: any-of
-within each kind, AND across kinds. Give keys or at least one filter.
+`<scope>` accepts Case, Scenario, Suite, Feature or Tracker keys; filters alone select all live cases.
+Tags and Test levels match exact names: any-of per kind, AND across kinds. Give keys or filters.
+`level:<name>` runs Layer-free cases there, narrows bound cases, and reports cases bound elsewhere
+as exclusions, not skips. Without `level:`, Layer-free cases use their Automations' sole resolved
+level if executable, otherwise the default; when other executable levels exist, the plan names each
+case, its level and the levels left out; `level:<name>` runs it elsewhere.
 
 ## Invariants
 
@@ -26,7 +28,9 @@ A Practice that contradicts an Invariant is void.
   If `pending`, warn using `migrations` in order. Continue the command.
 
 - **Interactive use only.** Never run unattended or in automation.
+- **Relay Credential-variant results.** The Tester maps step prose to `--auth` and judges `auth_rejected` under the Access failure rule. Relay variant refusals as Blocked `step`. Wrong-role cases use Role notes; header-only sessions allow `tester request` only.
 - **Nothing touches the app before the engineer confirms.** Never log in, open a session or dispatch an Execution before yes.
+- **An Unguarded Run needs the engineer's own words.** When the plan reports `unguarded`, pass `{"acknowledge": "unguarded"}` to `execute confirm --input <file>` only after the engineer explicitly accepts running without the Tester guard; a plain yes is not that.
 - **Relay confirm text verbatim.** Present the CLI-written confirm exactly as printed, without reformatting or re-deriving it.
 - **Preserve selection tokens.** Pass scope keys, `tag:<name>` and `level:<name>` values exactly as given, including repeats; the CLI resolves and validates them.
 - **Brief passed verbatim.** Pass the content of the file at `brief` unchanged as the Tester's prompt.
@@ -43,80 +47,83 @@ A Practice that contradicts an Invariant is void.
   per item and has no close of its own; when `/qa-codefix` ran, run `execute follow-ups --dir <dir>`
   again to pick up any hand-off's bug item, and `/qa-bug` drafts each the same way. Relay `text`
   verbatim when it is non-null; when it is null, print nothing.
-- **Offer `/qa-train` once.** Make the offer in §6.5 the Run's only one.
+- **Offer `/qa-train` once.** Make the offer in §6.5 the Run's only one; across multiple Runs, one `/qa-train` offer covers every target made stale.
+- **When a plan returns `runs`, execute one Run at a time in `targets` order.** Finish Automation, Testers and ingest for each Run before starting the next; follow [references/multi-run.md](references/multi-run.md) for stop rules. Across multiple Runs, follow-ups run per Run in `targets` order after every Run ingests.
 - **Test code runs only through `execute automation`.** Never run the project's test command yourself.
-- **The Automation decides the Execution.** Only a Failed aggregate Automation, or a case with no
-  Automation, gets a Tester Execution; Passed, Flaky and Blocked cases finish with none.
+- **The Automation decides the Execution.** Group Automations by level before scheduling and
+  chaining. Only Failed aggregates or absent Automations send that level to a Tester Execution; Passed,
+  Flaky and Blocked require none. The Case outcome combines results per level.
 - **The tracker is read-only except `/qa-publish`.**
 - **Never stage or commit.** A dirty working tree is fine.
 
 ## The CLI
 
-Run from the repository root (`--root` defaults to `./.qa`); each call prints one JSON object:
+Run from repository root; forward `--root` when given (default `./.qa`). Each call prints one JSON object:
 
 ```
 node <this skill's directory>/../../scripts/scan.mjs <mode> ...
 ```
 
+Commands that read input take it from a file: write it outside the repository (the run dir or your scratch directory) and pass its absolute path as `--input <file>`. Run each command as one plain `node` line, with no pipe, heredoc, `&&` or `;` chain, variable prefix or `cd`.
+
 - `execute plan [<scope>...] [tag:<name>...] [level:<name>...] [target:<slug>] [--root <qa-dir>]`
-- `execute confirm --dir <run-dir>`
+- `execute confirm --dir <run-dir>... [--input <file>]`
 - `execute automation --dir <run-dir> [--root <qa-dir>]`
 - `execute next --dir <run-dir> [--root <qa-dir>]`
 - `execute resume --dir <run-dir> --note <acc> [--skip]`
-- `execute record --dir <run-dir> --execution <id> --status ok|failed|timeout|refused|quota`
+- `execute record --dir <run-dir> --execution <id> --status ok|failed|timeout|refused|quota [--reason-file <path>]`
 - `execute ingest --dir <run-dir> [--root <qa-dir>]`
 - `execute follow-ups --dir <run-dir> [--root <qa-dir>]`
 - `execute summary --dir <run-dir> [--root <qa-dir>]`
 
-**`ok: false`** on any call: nothing was executed. Each `refusals` entry provides one factual
-`line` and its data; explain it and say what to do next, copying `next` intact.
+**`ok: false`**: nothing executed. Explain each `refusals` entry's factual `line` and data;
+say what to do next, copying `next` intact.
 
 ## 1. Practices
 
-Read every Practice (`prc_` entries) in `.qa/train/execute.md`, if it exists, and follow them
-throughout.
+Follow every Practice (`prc_` entry) in `.qa/train/execute.md`, if present, throughout.
+The Tester mocks a server, network or data-return condition that precondition or step prose states (no marker, no level), at an endpoint the case or `train/execute.md` names. Point a request to mock at Training. An endpoint on another configured target's origin (a UI's API on its own origin) is named by full URL.
 
 ## 2. Plan
 
-Run `execute plan [<scope>...] [tag:<name>...] [level:<name>...] [target:<slug>]` (preserving root if given).
+Run `execute plan` with the engineer's arguments.
 
 - **`ok: false`**: explain each refusal line and stop.
-- **No `dir`**: all selected cases were skipped. Relay `text` verbatim and stop.
-- **`dir` present**: relay `text` verbatim and ask the engineer to confirm. Wait for their answer. Nothing touches the app before yes.
+- **No `dir` and no `runs`**: all selected cases were skipped. Relay `text` verbatim and stop.
+- **`dir` or `runs` present**: relay `text` verbatim and ask the engineer to confirm. Wait for their answer.
 
 ## 3. Confirm
 
-- On yes: run `execute confirm --dir <dir>`.
+- On yes: run `execute confirm --dir <dir>`, with one `--dir` per Run in `runs`.
 - If the engineer declines or cancels: stop.
+
+After the engineer's yes, for a multi-Run plan (`runs`), follow
+[references/multi-run.md](references/multi-run.md) across §§4–6.
 
 ## 4. Run
 
-Run `execute automation --dir <dir>` once (preserving root if given) and relay `text` verbatim. It
-runs each selected case's Automations through the project's `test_runner`, with the retry count in
-`train/execute.md`. The CLI starts only the Executions that follow: a Failed aggregate Automation,
-or a case with no Automation. Passed, Flaky and Blocked cases finish with none; a case with
-incomplete prose records `execution_skipped` instead. On `ok: false`, explain each refusal line and
-stop.
+Run `execute automation --dir <dir>` once; relay `text` verbatim. Incomplete prose and `manual: false`
+cases record `execution_skipped` instead of an Execution. On `ok: false`, explain each refusal line and stop.
 
 Loop:
 
-Run `execute next --dir <dir>` (preserving root if given).
+Run `execute next --dir <dir>`.
 
-`execute next` may return `blocked` (Executions Blocked before starting, e.g. an unreachable target);
-only note them, since ingest records them.
+Only note `blocked` (Executions Blocked before starting); ingest records them.
 
-1. **Start ready Executions**: for each item `{id, brief, model}` in `start`, spawn one background Tester subagent (agent type `qa-skills:tester`):
+1. **Start ready Executions**: per `{id, brief, model}` in `start`, spawn one background Tester (`qa-skills:tester`):
    - **prompt**: read the file at `brief` and pass its content verbatim (its first line binds the Tester);
    - **model**: pass `model` only when non-null; omit `model` when null (to inherit).
 
 2. **Wait while in flight**: if `in_flight > 0`, end the turn while any Tester is in flight.
 
-3. **Record replies**: on each Tester subagent reply:
+3. **Record replies**: on each Tester reply:
    - Determine `--status`:
      - `ok` for a `DONE` reply;
      - `failed` for a `FAILED:` reply;
      - `timeout`, `refused`, or `quota` when stopped by those harness conditions.
-   - Run `execute record --dir <dir> --execution <id> --status <status>`.
+   - When the reply holds more than a bare `DONE`, on any status, save its full text with the Write tool to `<dir>/<id>.reply.md`.
+   - Run `execute record --dir <dir> --execution <id> --status <status>`, adding `--reason-file <dir>/<id>.reply.md` when you saved one.
    - Call `execute next` again.
 
 4. **Paused notes**: when `in_flight === 0` and `paused` is non-empty:
@@ -133,14 +140,15 @@ only note them, since ingest records them.
 
 ## 5. Ingest
 
-Run `execute ingest --dir <dir>` (preserving root if given).
+Run `execute ingest --dir <dir>`.
 Relay `text` verbatim.
 
-If the Run is interrupted or the engineer stops it, run `execute ingest --dir <dir>` on the same run dir and relay its text verbatim; unstarted Executions are reported as not run.
+If interrupted or stopped by the engineer, run `execute ingest --dir <dir>` on that Run;
+relay `text` verbatim. Unstarted Executions are reported as not run.
 
 ## 6. Follow-ups
 
-Run `execute follow-ups --dir <dir>` (preserving root if given). It builds the work list once, takes
+Run `execute follow-ups --dir <dir>`. It builds the work list once, takes
 the dirty-tree snapshot, and prints the one resume command. On `ok: false`, explain each refusal
 line and stop.
 

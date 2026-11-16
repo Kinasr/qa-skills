@@ -9,10 +9,13 @@
 // raw rather than half-stripped, so nothing it holds is lost from a comparison. Case and Scenario
 // tracker fields and migration aliases are Bookkeeping; project tracker config and Feature slugs
 // are knowledge (ADR-0027).
+/** @import { CaseLevel } from "./case-fields.mjs" */
+import { normalizeCaseLevel } from "./case-fields.mjs";
 import { KNOWN } from "./schema.mjs";
 import { isMap } from "./dialect.mjs";
 import { quote } from "./render.mjs";
-import { parse } from "./knowledge-file.mjs";
+import { parse, RULE_FIELDS } from "./knowledge-file.mjs";
+import { isProposedRulesSection } from "./proposed-rules.mjs";
 
 /** @type {readonly string[]} */
 export const BOOKKEEPING = ["watermark", "watermark_digest", "review_by", "finding", "review", "mirror"];
@@ -66,6 +69,78 @@ const bookkeeping = (scope) => (scope === "case" || scope === "scenario") ? [...
  */
 
 /**
+ * A stripper: `strip` for the neutral form, or `legacyStrip` for the schema 6 migration's
+ * before/after check.
+ * @typedef {(file: StrippableFile, options?: StripOptions) => Stripped} Stripper
+ */
+
+/**
+ * One Rule or Boundary entry as the parser exposes it, for the neutral canonical form.
+ * @typedef {{
+ *   key: string,
+ *   statement: string,
+ *   fields?: readonly { name: string, value: string }[],
+ *   owner?: string | null,
+ *   elaboration?: string,
+ * }} CanonicalEntry
+ */
+
+/**
+ * A Rule's and Boundary's entry, either written form, rendered once for comparison (ADR-0061): the
+ * key and statement, the field lines in `RULE_FIELDS` order (repeats kept in order), and the
+ * elaboration with blank-line runs collapsed. No number, heading marker or indent belongs, so the
+ * two forms holding the same content compare equal.
+ * @param {CanonicalEntry} entry
+ * @returns {string}
+ */
+export function canonicalRule(entry) {
+  const fields = RULE_FIELDS.flatMap((name) => (entry.fields ?? []).filter((field) => field.name === name).map((field) => `${field.name}: ${field.value}`));
+  return canonicalEntry(entry, fields);
+}
+
+/**
+ * A Boundary's entry in the same neutral form (ADR-0061): its `Owner:` field sits where a Rule's
+ * fields do.
+ * @param {CanonicalEntry} entry
+ * @returns {string}
+ */
+export function canonicalBoundary(entry) {
+  return canonicalEntry(entry, entry.owner === null || entry.owner === undefined ? [] : [`Owner: ${entry.owner}`]);
+}
+
+/**
+ * @param {CanonicalEntry} entry
+ * @param {readonly string[]} fields
+ * @returns {string}
+ */
+function canonicalEntry(entry, fields) {
+  const lines = [`${entry.key}: ${entry.statement}`, ...fields];
+  const body = elaborationLines(entry.elaboration ?? "");
+  if (body.length) lines.push("", ...body);
+  return lines.join("\n");
+}
+
+/**
+ * An elaboration's lines with trailing whitespace removed, leading and trailing blank lines
+ * dropped, and each run of blank lines collapsed to one.
+ * @param {string} text
+ * @returns {string[]}
+ */
+function elaborationLines(text) {
+  const lines = text.replace(/\r\n?/g, "\n").split("\n").map((line) => line.replace(/\s+$/, ""));
+  while (lines.length && !lines[0].trim()) lines.shift();
+  while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+  /** @type {string[]} */
+  const out = [];
+  for (const line of lines) {
+    if (!line.trim()) {
+      if (out.length && out[out.length - 1] !== "") out.push("");
+    } else out.push(line);
+  }
+  return out;
+}
+
+/**
  * Result of stripping a knowledge file for comparison.
  * @typedef {{
  *   text: string,
@@ -89,7 +164,29 @@ const bookkeeping = (scope) => (scope === "case" || scope === "scenario") ? [...
  * @param {StripOptions} [options]
  * @returns {Stripped}
  */
-export function strip(file, { omit = [], caseFields, identity = (_scope, _field, v) => v } = {}) {
+export function strip(file, options = {}) {
+  return stripEntries(file, options, false);
+}
+
+// `strip` as it read before the neutral Rule/Boundary form (ADR-0061): each entry keeps its raw
+// written lines. Only the schema 6 migration reads it, to decide which pins were fresh before it
+// re-pins them; every comparison uses `strip`.
+/**
+ * @param {StrippableFile} file
+ * @param {StripOptions} [options]
+ * @returns {Stripped}
+ */
+export function legacyStrip(file, options = {}) {
+  return stripEntries(file, options, true);
+}
+
+/**
+ * @param {StrippableFile} file
+ * @param {StripOptions} options
+ * @param {boolean} legacyEntries
+ * @returns {Stripped}
+ */
+function stripEntries(file, { omit = [], caseFields, identity = (_scope, _field, v) => v } = {}, legacyEntries = false) {
   const lines = (/** @type {string} */ (file.text)).replace(/\r\n/g, "\n").split("\n");
   /** @type {Map<number, { to: number, lines: string[] }>} */
   const swaps = new Map(); // first line (1-based) → {to, lines}: a YAML range and its canonical form
@@ -110,6 +207,12 @@ export function strip(file, { omit = [], caseFields, identity = (_scope, _field,
   if (file.type === "scenario") {
     heading(file.h1, "scenario");
     for (const c of (/** @type {readonly KnowledgeEntry[]} */ (file.cases))) heading(c, "case");
+  }
+  if (!legacyEntries) for (const e of (/** @type {readonly (CanonicalEntry & { line: number, end: number })[]} */ (file.rules ?? []))) {
+    swaps.set(e.line, { to: e.end, lines: canonicalRule(e).split("\n") });
+  }
+  if (!legacyEntries) for (const e of (/** @type {readonly (CanonicalEntry & { line: number, end: number })[]} */ (file.boundaries ?? []))) {
+    swaps.set(e.line, { to: e.end, lines: canonicalBoundary(e).split("\n") });
   }
 
   /**
@@ -147,38 +250,40 @@ export function strip(file, { omit = [], caseFields, identity = (_scope, _field,
 
 // A case's claim is its stripped entry less labels and links: Tags, `automates` (the Automation
 // link, ADR-0005) and keys outside the case schema. Built-in fields keep exactly the same
-// canonical representation and Bookkeeping rules as strip. Binding a case to an Automation is not a
+// canonical representation and Bookkeeping rules as strip, including canonical case level bindings. Binding a case to an Automation is not a
 // change to what it claims, so it never voids a Review.
 /**
  * @param {StrippableFile} file
  * @param {StripOptions} [options]
+ * @param {Stripper} [stripFn]
  * @returns {Stripped}
  */
-export function claimProjection(file, options = {}) {
-  return strip(file, { ...options, caseFields: KNOWN.case.filter((key) => key !== "tags" && key !== "automates") });
+export function claimProjection(file, options = {}, stripFn = strip) {
+  return stripFn(file, { ...options, caseFields: KNOWN.case.filter((key) => key !== "tags" && key !== "automates") });
 }
 
 // A Feature's impact projection (ADR-0033 as amended): its stripped knowledge without the
-// explicit exceptions `## Coverage`, `## Deferred` and `coverage_digest`, so applicability and
-// deferral changes move no pin. `## Open questions` stays knowledge in the projection. Every other
+// explicit exceptions `## Coverage`, `## Deferred`, `## Proposed Rules` (ADR-0067) and
+// `coverage_digest`, so applicability, deferral and kept-proposal changes move no pin. `## Open questions` stays knowledge in the projection. Every other
 // file projects as stripped text; a Feature without either section projects byte for byte as
 // before, so existing pins still verify.
 /**
  * @param {StrippableFile} file
  * @param {StripOptions} [options]
+ * @param {Stripper} [stripFn]
  * @returns {Stripped}
  */
-export function impactProjection(file, options = {}) {
-  if (file.type !== "feature") return claimProjection(file, options);
+export function impactProjection(file, options = {}, stripFn = strip) {
+  if (file.type !== "feature") return claimProjection(file, options, stripFn);
   const projected = { ...options, omit: [...(options.omit ?? []), "coverage_digest"] };
-  const sections = file.sections?.filter((s) => s.level === 2 && ["Coverage", "Deferred"].includes(s.title)) ?? [];
-  if (!sections.length) return strip(file, projected);
+  const sections = file.sections?.filter((s) => s.level === 2 && (["Coverage", "Deferred"].includes(s.title) || isProposedRulesSection(s))) ?? [];
+  if (!sections.length) return stripFn(file, projected);
   const lines = (file.text ?? "").replace(/\r\n/g, "\n").split("\n");
   // Section lines are 1-based: the heading is `line - 1` as an index and `end` is one past the
   // section's last line. Dropping the whole section leaves the blank line that preceded it, so a
   // Feature with either section projects exactly as the same Feature written without it.
   for (const section of [...sections].reverse()) lines.splice(section.line - 1, section.end - section.line + 1);
-  return strip(parse(file.rel ?? "feature.md", lines.join("\n")), projected);
+  return stripFn(parse(file.rel ?? "feature.md", lines.join("\n")), projected);
 }
 
 // The line numbers (1-based) that hold `file`'s Bookkeeping, for text shown rather than compared
@@ -265,7 +370,8 @@ function canonical(data, omit = [], scope, identity) {
   const out = [];
   for (const [k, raw] of Object.entries(data)) {
     if (bookkeeping(/** @type {string} */ (scope)).includes(k) || omit.includes(k)) continue;
-    const v = /** @type {NonNullable<typeof identity>} */ (identity)(/** @type {string} */ (scope), k, raw);
+    const identified = /** @type {NonNullable<typeof identity>} */ (identity)(/** @type {string} */ (scope), k, raw);
+    const v = scope === "case" && k === "level" ? normalizeCaseLevel(/** @type {CaseLevel} */ (identified)) : identified;
     if (Array.isArray(v) && v.some(isMap)) {
       out.push(`${k}:`);
       for (const item of v) out.push(`  - ${value(item)}`);

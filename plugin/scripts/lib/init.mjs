@@ -45,7 +45,8 @@
 // `evidence` is one of
 //   {file, count, sample}      read from the repository
 //   {tracker, count, sample}   read from the tracker (`tracker` says what was read)
-//   {asked: true}              the engineer's answer (a question on the card)
+//   {asked: true, hint?}       the engineer's answer (a question on the card), with one line the
+//                              repository shows that suggests the answer without giving it
 //   {default: true}            the framework's default, for a field that has one
 //   {picked: true}             the engineer's pick of a Tier's model label (a `tiers.*` field only),
 //                              no question; a label other than `inherit` must have passed its smoke
@@ -53,7 +54,7 @@
 /**
  * @import { CardAdapter, CardApplyDone, CardApplyOut, CardChangeset, CardConfirm, CardContext, CardDecisions, CardLifecycle, CardRefusal, CardRefused } from "./card-run.mjs"
  * @import { CommandAction, CommandContext, CommandDefinition, CommandResult, OptionSpec, UsageError } from "./cli.mjs"
- * @import { InitCardData, InitCardItem, InitCheckError, InitDecisionError, InitDecisions, InitEvidence, InitFieldItem, InitFieldSource, InitGlossary, InitItem, InitMaintenanceData, InitMaintenanceItem, InitMaintenanceSource, InitMintingItem, InitMintingSource, InitNote, InitStack, InitStackItem, InitStackRow, InitStackSource, InitUnread } from "./init-json.mjs"
+ * @import { InitCardData, InitCardItem, InitCheckError, InitDecisionError, InitDecisions, InitEvidence, InitFieldItem, InitFieldSource, InitGlossary, InitItem, InitMaintenanceData, InitMaintenanceItem, InitMaintenanceSource, InitMintingItem, InitMintingSource, InitNote, InitPickedTier, InitStack, InitStackItem, InitStackRow, InitStackSource, InitUnread } from "./init-json.mjs"
  * @import { SmokeOutcome, SmokeRecord, SmokeStarted, SmokeState } from "./init-smoke.mjs"
  * @import { RefusalFact, RefusalResult } from "./refusal.mjs"
  * @import { NewRunDirResult, OpenRunDirResult } from "./run-dir.mjs"
@@ -75,7 +76,8 @@ import { givenOption, MINTING, MINTING_FIELDS, settledOptions } from "./init-min
 import { judgeSmoke, smokeStarted, smokeState, startSmoke } from "./init-smoke.mjs";
 import { FALLBACK, isModelLabel, TIERS, trackerReference } from "./keys.mjs";
 import { checkFile, edit, parse, projectConfig } from "./knowledge-file.mjs";
-import { onPath } from "./on-path.mjs";
+/** @import { PlatformContext } from "./platform.mjs" */
+import { probeOnPath } from "./on-path.mjs";
 import { playwrightCliVersion } from "./playwright-version.mjs";
 import { buildIndex, loadWorkingTree, locate, rootConfig } from "./qa-index.mjs";
 import { block, inline, line, role } from "./render.mjs";
@@ -85,6 +87,7 @@ import { refuseUnreadSchema } from "./schema-guard.mjs";
 import { casesCarrying, categoryOverlaps, editedMeanings, LABEL_KEYS, removedLabels } from "./init-labels.mjs";
 import { ANY_SCHEMA_VERSION, FIELD_RENDER, INIT_SCHEMA_VERSION, INIT_TRAIN_KEY } from "./schema.mjs";
 import { resolveAdapter, wordsOf } from "./stack.mjs";
+import { carrierSupported, stackCarriers } from "./stacks/descriptors.mjs";
 import { trainFor } from "./training.mjs";
 
 /**
@@ -105,6 +108,7 @@ import { trainFor } from "./training.mjs";
  *   sparse?: boolean,
  *   fromTracker?: boolean,
  *   default?: unknown,
+ *   suggested?: unknown,
  *   picked?: boolean,
  *   askable?: boolean,
  *   persist?: boolean,
@@ -206,7 +210,7 @@ import { trainFor } from "./training.mjs";
  * @typedef {{
  *   ok: boolean,
  *   errors: Array<{ code: string, field: string, line?: number, message: string }>,
- *   warnings: Array<{ code: string }>,
+ *   warnings: Array<{ code: string, field?: string, line?: number, message: string }>,
  * }} InitFileCheck
  */
 
@@ -216,6 +220,7 @@ import { trainFor } from "./training.mjs";
  *   ok: boolean,
  *   seal?: unknown,
  *   items: FirstCardItem[],
+ *   picked_tiers: InitPickedTier[],
  *   stacks: InitStackRow[],
  *   files: Array<{ path: string, text: string, check?: InitFileCheck }>,
  *   snippet: InitAnnotationSnippet | null,
@@ -390,6 +395,7 @@ const FIELDS = [
   ...TIERS.map((t) => ({ name: `tiers.${t}`, label: `Model for the ${t} Tier`, kind: "string", picked: true })),
   { name: "targets", label: "Targets", kind: "map", askable: true, persist: true },
   { name: "execute_levels", label: "Execution levels", kind: "map", askable: true, persist: true },
+  { name: "level_targets", label: "Level targets", kind: "map", askable: true, persist: true, sparse: true },
   // What labels a Test Case: optional, with no defaults (a suggestion is a question with a suggested
   // answer, never `{default: true}`). A Tag maps to its one-line meaning, which may be empty.
   // `custom_fields` is a list of definitions `{name, description, values, multiple, required}`.
@@ -400,6 +406,9 @@ const FIELDS = [
   { name: "stack.root", label: "Stack root", kind: "string", sparse: true },
   { name: "test_runner", label: "Test runner", kind: "map", askable: true, persist: true, sparse: true },
   { name: "code_host", label: "Code host", kind: "map", askable: true, persist: true, sparse: true },
+  // How a command treats the commit of the files it wrote (ADR-0062): a suggestion is a question
+  // with a suggested answer, so a new project is offered `ask` and opts in by taking it.
+  { name: "commit_mode", label: "Commit mode", kind: "string", persist: true, suggested: "ask" },
 ];
 /** @type {Map<string, InitFieldDefinition>} */
 const FIELD = new Map(FIELDS.map((f) => [f.name, f]));
@@ -576,7 +585,7 @@ function editProject(current, fields) {
  * @param {InitContext} ctx
  * @param {string} path
  * @param {string} [text]
- * @returns {{ ok: boolean, errors: Array<{ code: string, field: string, line?: number, message: string }>, warnings: Array<{ code: string }> }}
+ * @returns {{ ok: boolean, errors: Array<{ code: string, field: string, line?: number, message: string }>, warnings: Array<{ code: string, field?: string, line?: number, message: string }> }}
  */
 function checkAt(ctx, path, text = readFileSync(join(ctx.repo, path), "utf8")) {
   const { rel, config } = locate(join(ctx.repo, path));
@@ -621,6 +630,26 @@ function problemList() {
   return { problems, problem: (code, field, data) => problems.push({ code, ...(field && { field }), ...data }) };
 }
 
+// The problems a proposed Automation-key carrier raises: a carrier the stack's adapter cannot write
+// holds no Automation key, so init refuses it and gives the forms that are accepted (ADR-0022).
+// `scan` reports the same thing as a warning on an existing project, which init never rewrites.
+/**
+ * @param {{ language?: unknown, framework?: unknown } | null | undefined} stack
+ * @param {unknown} names
+ * @param {ProblemList["problem"]} problem
+ * @returns {void}
+ */
+function unusableCarrier(stack, names, problem) {
+  const carriers = stackCarriers(stack);
+  if (!carriers || !Array.isArray(names)) return;
+  /** @type {string[]} */
+  const accepts = carriers.write === "any" ? [] : carriers.write;
+  for (const name of names) {
+    if (typeof name !== "string" || carrierSupported(carriers, name, "write")) continue;
+    problem("unusable_carrier", "annotation_map.automation_key", { name, accepts, ...(carrierSupported(carriers, name, "read") && { read_only: true }) });
+  }
+}
+
 // The first-run card of `proposal`: `{ok, seal, items, stacks, files, snippet, notes, problems}`; `seal` is
 // what a card is told apart by, missing when the proposal has no shape to build on. `edited` names the
 // fields the engineer answered (`apply` only): their values need no evidence, since the engineer
@@ -630,9 +659,10 @@ function problemList() {
  * @param {InitProposal} proposal
  * @param {Set<string>} [edited]
  * @param {boolean} [rootDropped] An explicit drop suppresses the chosen-root fallback.
+ * @param {Set<string>} [dropped] Fields the decisions dropped, which no suggestion puts back.
  * @returns {FirstBuildCardResult | InitUnbuilt}
  */
-function buildCard(ctx, proposal, edited = new Set(), rootDropped = false) {
+function buildCard(ctx, proposal, edited = new Set(), rootDropped = false, dropped = new Set()) {
   const { problems, problem } = problemList();
   /** @type {Array<{ code: string, overlaps?: string[] }>} */
   const notes = [];
@@ -641,7 +671,7 @@ function buildCard(ctx, proposal, edited = new Set(), rootDropped = false) {
     return { ok: false, problems };
   }
 
-  const rows = fieldRows(proposal, problem, edited);
+  const rows = fieldRows(proposal, problem, edited, dropped);
   /** @param {string} name */
   const value = (name) => rows.find((r) => r.field === name)?.value;
 
@@ -671,13 +701,15 @@ function buildCard(ctx, proposal, edited = new Set(), rootDropped = false) {
     f.check = checkAt(ctx, f.path, f.text);
     for (const w of f.check.warnings) if (w.code === "automation_key_overlap") notes.push({ code: w.code });
   }
-  notes.push(...labelNotes(ctx, data));
+  unusableCarrier(/** @type {{ language?: unknown, framework?: unknown } | null | undefined} */ (data.stack), value("annotation_map.automation_key"), problem);
+  notes.push(...labelNotes(ctx, data), ...targetEnvNotes(data));
   for (const f of files) if (!(/** @type {InitFileCheck} */ (f.check)).ok) problem("check_file", undefined, { path: f.path, errors: (/** @type {InitFileCheck} */ (f.check)).errors });
 
   const snippet = annotationSnippet(ctx, data);
   const items = cardItems(rows, stacks, proposal.chosen_by).map((i) => (passed.has(/** @type {string} */ (i.field)) ? { ...i, smokePassed: true } : i));
+  const picks = pickedTiers(rows, passed);
   const seal = { items, stacks, files: files.map(({ path, text }) => ({ path, text })) };
-  return { ok: problems.length === 0, seal, items, stacks, files, snippet, notes, problems };
+  return { ok: problems.length === 0, seal, items, picked_tiers: picks, stacks, files, snippet, notes, problems };
 }
 
 // The card's numbered items, in the card's order: the test stack, then each field row (the minting
@@ -687,9 +719,9 @@ function buildCard(ctx, proposal, edited = new Set(), rootDropped = false) {
 //   edits    the answers it takes: `value` (a field), `stack` or `minting`
 //   type     how a `value` is read: "list", "integer" or text
 //   drop     "optional" (it may be dropped), or why not: "required", "default", "stack", "minting"
-//   needs    the answers it must have (those of a question), unless it is dropped where it may be
+//   needs    the answers it must have (those of a question); taking the item accepts a suggested value
 /**
- * @param {Array<{ field: string, value: unknown, evidence: InitEvidence | null }>} rows
+ * @param {Array<{ field: string, value: unknown, evidence: InitEvidence | null, optionalAnswer?: boolean }>} rows
  * @param {InitStackRow[]} stacks
  * @param {string} [chosenBy]
  * @returns {FirstCardItem[]}
@@ -712,11 +744,26 @@ function cardItems(rows, stacks, chosenBy) {
       items.push({ kind: "minting", label: MINTING_LABEL, edits: ["minting"], drop: "minting", question, choice: givenOption(given), options: settledOptions(given), given });
     }
     if (MINTING_FIELDS.includes(f.name) || !row(f.name)) continue;
-    const r = /** @type {{ field: string, value: unknown, evidence: InitEvidence | null }} */ (row(f.name));
+    const r = /** @type {{ field: string, value: unknown, evidence: InitEvidence | null, optionalAnswer?: boolean }} */ (row(f.name));
+    // A Tier the engineer already picked is an answer, not a question: it is a picked Tier, not an item.
+    if (f.picked && r.evidence?.picked === true) continue;
     const drop = f.required ? "required" : f.default !== undefined ? "default" : "optional";
-    items.push({ kind: "field", field: f.name, label: f.label, edits: ["value"], type: f.kind === "string" ? "text" : f.kind, drop, ...(f.default !== undefined && { default: f.default }), question: r.evidence?.asked === true, value: r.value ?? null, evidence: r.evidence });
+    items.push({ kind: "field", field: f.name, label: f.label, edits: ["value"], type: f.kind === "string" ? "text" : f.kind, drop, ...(f.default !== undefined && { default: f.default }), question: r.evidence?.asked === true && r.optionalAnswer !== true, value: r.value ?? null, evidence: r.evidence });
   }
   return items.map((item, i) => ({ n: i + 1, ...item, needs: item.question ? item.edits : [] }));
+}
+
+// The Tier picks the engineer settled in the interview: no item number, no answer, just the setting's
+// label, the model label it maps to and, when one ran, that its smoke test passed.
+/**
+ * @param {Array<{ field: string, value: unknown, evidence: InitEvidence | null }>} rows
+ * @param {Set<string>} passed
+ * @returns {InitPickedTier[]}
+ */
+function pickedTiers(rows, passed) {
+  return rows
+    .filter((r) => FIELD.get(r.field)?.picked === true && r.evidence?.picked === true)
+    .map((r) => ({ label: fieldLabelOf(r.field), value: r.value, ...(passed.has(r.field) && { smoke_passed: true }) }));
 }
 
 // The test stacks the agent found, each `{root, language, framework, count, sample, last_commit?,
@@ -825,21 +872,118 @@ function smokeTested(ctx, field, label, problem) {
   return passed === true;
 }
 
+// A missing meaning, or one that is blank.
+/**
+ * @param {unknown} meaning
+ * @returns {boolean}
+ */
+const meaningBlank = (meaning) => meaning === undefined || (typeof meaning === "string" && meaning.trim() === "");
+
+// Whether the Card asks what the Roles mean: Roles is an asked question, or a list already proposed,
+// and no meaning is given. The tracker holds the names and never the meaning.
+/**
+ * @param {Record<string, { value?: unknown, evidence?: InitEvidence | null }>} fields
+ * @returns {boolean}
+ */
+function rolesNeedMeaning(fields) {
+  const roles = fields.roles;
+  const asked = roles?.evidence?.asked === true;
+  const listed = Array.isArray(roles?.value) && roles.value.length > 0;
+  return (asked || listed) && meaningBlank(fields.role_meaning?.value);
+}
+
+// Whether the final Role list leaves what it means unstated: the one thing a first run refuses. An
+// empty list needs no meaning.
+/**
+ * @param {Record<string, { value?: unknown }>} fields
+ * @returns {boolean}
+ */
+function rolesLackMeaning(fields) {
+  const roles = fields.roles?.value;
+  return Array.isArray(roles) && roles.length > 0 && meaningBlank(fields.role_meaning?.value);
+}
+
+// Whether `project.md` needs a Level-target question: both `targets` and `execute_levels` must
+// carry more than one entry (ADR-0068).
+/**
+ * @param {unknown} targets
+ * @param {unknown} executeLevels
+ * @returns {boolean}
+ */
+const needsLevelTargets = (targets, executeLevels) =>
+  isMap(targets) && Object.keys(targets).length > 1 && isMap(executeLevels) && Object.keys(executeLevels).length > 1;
+
+// Whether target slug `target` pairs unmistakably with level slug `level` on hyphen boundaries.
+/**
+ * @param {string} target
+ * @param {string} level
+ * @returns {boolean}
+ */
+const targetMatchesLevel = (target, level) =>
+  target === level || target.startsWith(`${level}-`) || target.endsWith(`-${level}`) || target.includes(`-${level}-`);
+
+// Suggested `level_targets` map when each executable level maps cleanly and uniquely to one target
+// slug on hyphen boundaries (e.g. `ui` -> `local-ui`, `api` -> `local-api`); otherwise `null`.
+/**
+ * @param {unknown} targets
+ * @param {unknown} executeLevels
+ * @returns {Record<string, string> | null}
+ */
+function suggestLevelTargets(targets, executeLevels) {
+  if (!needsLevelTargets(targets, executeLevels)) return null;
+  const targetNames = Object.keys(/** @type {Record<string, unknown>} */ (targets));
+  const levels = Object.keys(/** @type {Record<string, unknown>} */ (executeLevels));
+  /** @type {Record<string, string>} */
+  const mapping = {};
+  const usedTargets = new Set();
+  for (const level of levels) {
+    const matches = targetNames.filter((t) => targetMatchesLevel(t, level));
+    if (matches.length !== 1 || usedTargets.has(matches[0])) return null;
+    mapping[level] = matches[0];
+    usedTargets.add(matches[0]);
+  }
+  return mapping;
+}
+
 // One row per field of the card: the value and the evidence it came from.
 /**
  * @param {InitProposal} proposal
  * @param {ProblemList["problem"]} problem
  * @param {Set<string>} edited
- * @returns {Array<{ field: string, value: unknown, evidence: InitEvidence | null }>}
+ * @param {Set<string>} [dropped]
+ * @returns {Array<{ field: string, value: unknown, evidence: InitEvidence | null, optionalAnswer?: boolean }>}
  */
-function fieldRows(proposal, problem, edited) {
-  unknownFields(/** @type {Record<string, unknown>} */ (proposal.fields), problem);
-  /** @type {Array<{ field: string, value: unknown, evidence: InitEvidence | null }>} */
+function fieldRows(proposal, problem, edited, dropped = new Set()) {
+  const fields = /** @type {Record<string, { value?: unknown, evidence?: InitEvidence | null }>} */ (proposal.fields);
+  unknownFields(/** @type {Record<string, unknown>} */ (fields), problem);
+  /** @type {Array<{ field: string, value: unknown, evidence: InitEvidence | null, optionalAnswer?: boolean }>} */
   const rows = [];
+  const meaningAsked = rolesNeedMeaning(fields);
+  const listedRoles = Array.isArray(fields.roles?.value) && fields.roles.value.length > 0;
   for (const f of FIELDS) {
-    const given = (/** @type {Record<string, { value?: unknown, evidence?: InitEvidence | null }>} */ (proposal.fields))[f.name];
+    if (dropped.has(f.name)) continue;
+    // What the Roles mean is the one thing no tracker shows: the card asks it whenever Roles is an
+    // asked question or a list is proposed. An asked-but-empty list may stay empty, so its item needs
+    // no answer; a non-empty one does.
+    if (f.name === "role_meaning" && meaningAsked) {
+      rows.push({ field: f.name, value: undefined, evidence: { asked: true }, ...(!listedRoles && { optionalAnswer: true }) });
+      continue;
+    }
+    const given = fields[f.name];
+    if (f.name === "level_targets") {
+      if (given !== undefined && given !== null && given.value !== undefined && !(given.value === null && given.evidence?.asked === true)) {
+        rows.push({ field: f.name, value: given.value, ...evidenceOf(f, given, problem, edited.has(f.name)) });
+        continue;
+      }
+      const targets = rows.find((r) => r.field === "targets")?.value;
+      const executeLevels = rows.find((r) => r.field === "execute_levels")?.value;
+      if (!needsLevelTargets(targets, executeLevels)) continue;
+      rows.push({ field: f.name, value: suggestLevelTargets(targets, executeLevels) ?? undefined, evidence: { asked: true } });
+      continue;
+    }
     if (given === undefined || given === null || given.value === undefined) {
       if (f.default !== undefined) rows.push({ field: f.name, value: f.default, evidence: { default: true } });
+      else if (f.suggested !== undefined) rows.push({ field: f.name, value: f.suggested, evidence: { asked: true } });
       else if (f.required) problem("missing", f.name);
       continue;
     }
@@ -982,9 +1126,11 @@ function projectText(d, date, stacks) {
     ["custom_fields", d.custom_fields, { blockList: true, strings: FIELD_RENDER.project.custom_fields.quoted }],
     ["bug_fields", d.bug_fields, { blockList: FIELD_RENDER.project.bug_fields.blockList }],
     ["concurrency_cap", d.concurrency_cap],
+    ["commit_mode", d.commit_mode],
     ["tiers", d.tiers],
     ["targets", d.targets],
     ["execute_levels", d.execute_levels],
+    ["level_targets", d.level_targets],
     ["test_runner", d.test_runner],
     ["code_host", d.code_host],
   ]);
@@ -1009,6 +1155,32 @@ function labelNotes(ctx, data) {
   const overlaps = categoryOverlaps(ctx.root, data);
   return overlaps.length ? [{ code: "label_repeats_category", overlaps }] : [];
 }
+
+// The project fields that decide whether `test_runner.target_env` can reach another origin.
+/** @typedef {{ targets?: unknown, execute_levels?: unknown, level_targets?: unknown, test_runner?: unknown }} TargetEnvFields */
+
+// Whether `test_runner.target_env` lists more than one variable on a split-origin project (`> 1`
+// target, and `level_targets` is set or asked). Every runner sets each listed variable to the Run's
+// one origin, so listing a variable for another origin overwrites it.
+/**
+ * @param {TargetEnvFields} fields
+ * @returns {boolean}
+ */
+function hasSplitOriginTargetEnv({ targets, execute_levels, level_targets, test_runner }) {
+  if (!isMap(targets) || Object.keys(targets).length <= 1) return false;
+  const split = (isMap(level_targets) && Object.keys(level_targets).length > 0) || needsLevelTargets(targets, execute_levels);
+  if (!split) return false;
+  const env = isMap(test_runner) ? test_runner.target_env : undefined;
+  return Array.isArray(env) && env.length > 1;
+}
+
+// The note for a split-origin `test_runner.target_env` holding more than one variable in any of the
+// given states of the project, or none.
+/**
+ * @param {...TargetEnvFields} states
+ * @returns {Array<{ code: string }>}
+ */
+const targetEnvNotes = (...states) => (states.some(hasSplitOriginTargetEnv) ? [{ code: "target_env_multiple_origins" }] : []);
 
 // The Automation-key carrier's declaration, reported and never written: it ships in the reviewed
 // binding PR. `status` is the stack adapter's (lib/stack.mjs `declaration.state`):
@@ -1037,16 +1209,17 @@ function annotationSnippet(ctx, data) {
 // First-run and maintenance Cards share the sealed lifecycle, with their own builders and writes.
 /**
  * @param {boolean} maintenance
+ * @param {PlatformContext} [platformContext]
  * @returns {CardLifecycle<InitContext, InitProposal, FirstBuildCardResult | MaintenanceBuildCardResult, Record<string, unknown>>}
  */
-function lifecycle(maintenance) {
+function lifecycle(maintenance, platformContext) {
   return cardRun(/** @type {CardAdapter<InitContext, InitProposal, FirstBuildCardResult | MaintenanceBuildCardResult, Record<string, unknown>>} */ ({
     kind: maintenance ? "init-maintenance" : "init", run: { by: "init card", restart: "init card" }, fact,
     build(ctx, proposal) {
       const built = /** @type {FirstBuildCardResult | MaintenanceBuildCardResult} */ (maintenance ? buildMaintenance(ctx, proposal) : buildCard(ctx, proposal));
       return { card: built, seal: built.seal, ...(!built.ok && { refused: refusals(built.problems) }) };
     },
-    data: (ctx, built) => maintenance ? maintenanceCardData({ ...(/** @type {MaintenanceBuildCardResult} */ (built)), notes: withNotes((/** @type {MaintenanceBuildCardResult} */ (built)).notes) }) : firstCardData({ ...(/** @type {FirstBuildCardResult} */ (built)), notes: withNotes((/** @type {FirstBuildCardResult} */ (built)).notes) }, fieldLabelOf),
+    data: (ctx, built) => maintenance ? maintenanceCardData({ ...(/** @type {MaintenanceBuildCardResult} */ (built)), notes: withNotes((/** @type {MaintenanceBuildCardResult} */ (built)).notes, platformContext) }) : firstCardData({ ...(/** @type {FirstBuildCardResult} */ (built)), notes: withNotes((/** @type {FirstBuildCardResult} */ (built)).notes, platformContext) }, fieldLabelOf),
     decisions: (ctx, built, input) => { const decisions = decisionsOf(JSON.stringify(input), (/** @type {FirstBuildCardResult} */ (built)).items, maintenance); return { ...decisions, errors: (/** @type {InitDecisionError[]} */ (decisions.errors)).map(refusalOf) }; },
     apply(ctx, built, decisions, proposal) {
       const out = maintenance ? maintenanceApply(ctx, (/** @type {MaintenanceBuildCardResult} */ (built)), /** @type {InitDecisions} */ (decisions), proposal) : firstApply(ctx, (/** @type {FirstBuildCardResult} */ (built)), /** @type {InitDecisions} */ (decisions), proposal);
@@ -1089,26 +1262,32 @@ const checkError = ({ code, field, line: at, message }) => ({ code, ...(FIELD.ha
 // which it and the UI scout behind `/qa-deep-dive`'s `observe:` drive. Only a card shows it, so
 // neither the digest nor the report holds it.
 /**
+ * @param {PlatformContext} [platformContext]
  * @returns {Array<{ code: string }>}
  */
-const playwrightNotes = () => {
-  if (!onPath("playwright-cli")) return [{ code: "no_playwright_cli" }];
-  return playwrightCliVersion().status === "old" ? [{ code: "old_playwright_cli" }] : [];
+const playwrightNotes = (platformContext = {}) => {
+  const probed = probeOnPath("playwright-cli", platformContext);
+  if (probed.status === "missing") return [{ code: "no_playwright_cli" }];
+  if (probed.status === "refused") return [{ code: "refused_playwright_cli" }];
+  const version = playwrightCliVersion(platformContext.env ?? process.env, platformContext);
+  if (version.status === "refused") return [{ code: "refused_playwright_cli" }];
+  return version.status === "old" ? [{ code: "old_playwright_cli" }] : [];
 };
 /**
  * @param {Array<{ code: string }>} notes
+ * @param {PlatformContext} [platformContext]
  * @returns {Array<{ code: string }>}
  */
-const withNotes = (notes) => [...notes, ...playwrightNotes()];
+const withNotes = (notes, platformContext) => [...notes, ...playwrightNotes(platformContext)];
 
 // The card of the proposal on stdin: the maintenance card when `maintenance`, else the first run's.
 /**
  * @param {string[]} args
- * @param {{ root?: string, stdin?: (() => string) | null, dir?: string }} param1
+ * @param {{ root?: string, stdin?: (() => string) | null, dir?: string, env?: Record<string, string | undefined>, platformContext?: PlatformContext }} param1
  * @param {boolean} maintenance
  * @returns {CommandResult}
  */
-function showCard(args, { root, stdin, dir }, maintenance) {
+function showCard(args, { root, stdin, dir, env, platformContext }, maintenance) {
   if (args.length) return refuse("bad_arguments", { action: "card" });
   // The proposal is read from stdin only with `--stdin`.
   if (!stdin) return refuse("no_proposal");
@@ -1120,7 +1299,8 @@ function showCard(args, { root, stdin, dir }, maintenance) {
   }
   const run = /** @type {InitEitherRunDir} */ (dir === undefined ? newRunDir(undefined, "qa-init-") : openRunDir(dir, { cmd: "init", action: "card", from: ["init smoke", "init card"] }));
   if (run.error) return refuse("run_dir", { reason: run.error });
-  const { exit, ...json } = lifecycle(maintenance).card(load(/** @type {string} */ (root), run.dir), /** @type {string | (() => string)} */ (run.dir ?? run.make), proposal);
+  const platform = platformContext ?? (env ? { env } : undefined);
+  const { exit, ...json } = lifecycle(maintenance, platform).card(load(/** @type {string} */ (root), run.dir), /** @type {string | (() => string)} */ (run.dir ?? run.make), proposal);
   if (!json.ok) delete (/** @type {{ rebuild?: boolean }} */ (json)).rebuild;
   return { exit, json };
 }
@@ -1143,8 +1323,19 @@ function keptCard(args, { root, dir, stdin }, maintenance) {
   return { exit, json: { dir: run.dir, ...(!json.ok && { confirm: false, rebuild: false }), ...json } };
 }
 
+// Whether taken `item` already holds the answer for `field` as the suggested value the card shows:
+// taking the item answers the question with it. A stack or minting choice, and a question with no
+// value, still needs its answer.
+/**
+ * @param {FirstCardItem} item
+ * @param {string} field
+ * @returns {boolean}
+ */
+const suggests = (item, field) => item.kind === "field" && field === "value" && item.value !== null;
+
 // The first-run decisions `d`, applied to the `built` card. Every item is written as the card shows it
-// unless dropped, so an item neither taken nor dropped is open, and a taken question needs its answer.
+// unless dropped, so an item neither taken nor dropped is open, a taken item with a suggested value is
+// answered by taking it, and a taken question with no value needs its answer.
 /**
  * @param {InitContext} ctx
  * @param {FirstBuildCardResult} built
@@ -1155,10 +1346,20 @@ function keptCard(args, { root, dir, stdin }, maintenance) {
 function firstApply(ctx, built, d, input) {
   const errors = [];
   const itemOf = new Map(built.items.map((i) => [i.n, i]));
+  const { proposal, edited } = answered(input, built, d);
+  const finalRoles = proposal.fields?.roles?.value;
+  const noFinalRoles = !Array.isArray(finalRoles) || finalRoles.length === 0;
   for (const n of d.drop) if ((/** @type {FirstCardItem} */ (itemOf.get(n))).drop !== "optional") errors.push({ code: "not_droppable", item: n, why: (/** @type {FirstCardItem} */ (itemOf.get(n))).drop });
   const open = built.items.filter((i) => !d.drop.includes(i.n) && !d.take.includes(i.n)).map((i) => i.n);
   if (open.length) errors.push({ code: "unaddressed", items: open });
-  for (const n of d.take) for (const field of (/** @type {FirstCardItem} */ (itemOf.get(n))).needs) if (!(field in (d.edits[n] ?? {}))) errors.push({ code: "needs_edit", item: n, field });
+  for (const n of d.take) {
+    const item = /** @type {FirstCardItem} */ (itemOf.get(n));
+    for (const field of item.needs) {
+      // The meaning item needs no answer once the Reply leaves the Role list empty.
+      if (item.kind === "field" && item.field === "role_meaning" && noFinalRoles) continue;
+      if (!(field in (d.edits[n] ?? {})) && !suggests(item, field)) errors.push({ code: "needs_edit", item: n, field });
+    }
+  }
   for (const [n, e] of Object.entries(d.edits)) {
     if (e.stack !== undefined && !built.stacks.some((s) => s.root === e.stack)) errors.push({ code: "no_such_stack", item: Number(n), given: e.stack });
     if (e.minting !== undefined && !MINTING.some((o) => o.k === e.minting)) errors.push({ code: "no_such_option", item: Number(n), given: e.minting });
@@ -1166,13 +1367,17 @@ function firstApply(ctx, built, d, input) {
   }
   if (errors.length) return { refused: errors.map(refusalOf) };
 
-  const { proposal, edited } = answered(input, built, d);
   const rootDropped = built.items.some((i) => i.field === "stack.root" && d.drop.includes(i.n));
-  const final = buildCard(ctx, proposal, edited, rootDropped);
+  const dropped = new Set(d.drop.map((n) => /** @type {FirstCardItem} */ (itemOf.get(n)).field).filter((field) => typeof field === "string"));
+  if (!built.items.some((i) => i.field === "level_targets")) dropped.add("level_targets");
+  const final = buildCard(ctx, proposal, edited, rootDropped, dropped);
   if (!final.ok) {
     // Problems the shown card already had come from the repository; any other, from the answers.
     const fromShown = final.problems.every((p) => built.problems.some((q) => isDeepStrictEqual(p, q)));
     return { refused: refusals(final.problems, built.items), cause: fromShown ? "repository" : "answers" };
+  }
+  if (rolesLackMeaning(/** @type {Record<string, { value?: unknown }>} */ (proposal.fields))) {
+    return { refused: refusals([{ code: "role_meaning_missing", field: "role_meaning" }], built.items) };
   }
   const stack = { language: (/** @type {{ value: string }} */ (final.items.find((i) => i.field === "stack.language"))).value, framework: (/** @type {{ value: string }} */ (final.items.find((i) => i.field === "stack.framework"))).value };
   const notes = [...final.notes, { code: "commit_before_persist" }];
@@ -1420,20 +1625,44 @@ function buildMaintenance(ctx, proposal) {
   const baseline = () => (before ??= referrers(ctx, current.text));
 
   unknownFields(/** @type {Record<string, unknown>} */ (proposal.fields), problem);
+  const proposedFields = /** @type {Record<string, { value?: unknown, evidence?: InitEvidence | null }>} */ (proposal.fields);
+  const effectiveTargets = isMap(proposedFields.targets?.value) ? proposedFields.targets.value : data.targets;
+  const effectiveExecuteLevels = isMap(proposedFields.execute_levels?.value) ? proposedFields.execute_levels.value : data.execute_levels;
   /** @type {Array<Omit<MaintenanceCardItem, "n"> & { effect?: { errors: number, unread: number }, detected?: unknown }>} */
   const items = [];
   for (const f of FIELDS) {
     const cur = valueAt(data, f.name);
-    // A setting the file does not hold and nothing proposes (publish setup, labels) is no item.
-    if ((f.publish || f.sparse || LABEL_KEYS.includes(f.name)) && cur === undefined && (!proposal.fields || proposal.fields[f.name] === undefined)) continue;
+    const given = proposedFields[f.name];
+    if (f.name === "level_targets") {
+      const hasValue = isMap(given) && given.value !== undefined && given.value !== null;
+      if (cur === undefined && !needsLevelTargets(effectiveTargets, effectiveExecuteLevels) && !hasValue) continue;
+    } else {
+      // A setting the file does not hold and nothing proposes (publish setup, labels) is no item,
+      // except `role_meaning` on a role-less project so adding Roles in maintenance can name what they mean.
+      const roleless = f.name === "role_meaning" && !(Array.isArray(data.roles) && data.roles.length > 0);
+      if ((f.publish || f.sparse || (LABEL_KEYS.includes(f.name) && !roleless)) && cur === undefined && (!proposal.fields || proposal.fields[f.name] === undefined)) continue;
+    }
     const drop = f.required ? "required" : f.default !== undefined ? "default" : cur === undefined ? "unset" : "optional";
     /** @type {Omit<MaintenanceCardItem, "n"> & { effect?: { errors: number, unread: number }, detected?: unknown }} */
     const item = { kind: "field", field: f.name, label: f.label, edits: f.editable === false ? [] : ["value"], type: f.kind === "string" ? "text" : f.kind, drop, adopt: false, ...(cur !== undefined && { current: cur }) };
-    const given = (/** @type {Record<string, { value?: unknown, evidence?: InitEvidence | null }>} */ (proposal.fields))[f.name];
-    if (isMap(given) && (/** @type {{ value?: unknown }} */ (given)).value !== undefined) {
+    if (f.name === "level_targets") {
+      if (isMap(given) && given.value !== undefined && given.value !== null) {
+        Object.assign(item, { detected: given.value, evidence: evidenceOf(f, given, problem, false).evidence });
+        item.adopt = !isDeepStrictEqual(given.value, cur);
+      } else if (cur === undefined && needsLevelTargets(effectiveTargets, effectiveExecuteLevels)) {
+        // Asked, as the first-run Card asks it: the Reply answers it, adopts the Suggested pairing
+        // when one is clean, or drops it.
+        Object.assign(item, { needs: ["value"], drop: "optional" });
+        const suggested = suggestLevelTargets(effectiveTargets, effectiveExecuteLevels);
+        if (suggested !== null) Object.assign(item, { detected: suggested, evidence: { asked: true }, adopt: true });
+      }
+    } else if (isMap(given) && (/** @type {{ value?: unknown }} */ (given)).value !== undefined) {
       Object.assign(item, { detected: (/** @type {{ value: unknown }} */ (given)).value, evidence: evidenceOf(f, given, problem, false).evidence });
       item.adopt = !isDeepStrictEqual((/** @type {{ value: unknown }} */ (given)).value, cur);
       if (item.adopt) smokeTested(ctx, f.name, /** @type {string} */ ((/** @type {{ value: unknown }} */ (given)).value), problem);
+    } else if (cur === undefined && f.suggested !== undefined) {
+      // A setting the file lacks that the Card suggests (`commit_mode`, ADR-0062): offered to adopt.
+      Object.assign(item, { detected: f.suggested, evidence: { asked: true }, adopt: true });
     }
     if (item.adopt) {
       const text = withField(current, data, f.name, item.detected);
@@ -1447,7 +1676,14 @@ function buildMaintenance(ctx, proposal) {
   const numbered = items.map((item, i) => (/** @type {MaintenanceCardItem} */ ({ n: i + 1, ...item })));
   const checked = checkAt(ctx, path);
   const check = checked.errors;
-  const notes = [...checked.warnings.filter((w) => w.code === "automation_key_overlap").map(({ code }) => ({ code })), ...labelNotes(ctx, data)];
+  const effectiveLevelTargets = isMap(proposedFields.level_targets?.value) ? proposedFields.level_targets.value : data.level_targets;
+  const effectiveRunner = isMap(proposedFields.test_runner?.value) ? proposedFields.test_runner.value : data.test_runner;
+  const proposedState = { targets: effectiveTargets, execute_levels: effectiveExecuteLevels, level_targets: effectiveLevelTargets, test_runner: effectiveRunner };
+  const notes = [
+    ...checked.warnings.filter((w) => w.code === "automation_key_overlap").map(({ code }) => ({ code })),
+    ...targetEnvNotes(data, proposedState),
+    ...labelNotes(ctx, data),
+  ];
   const seal = { items: numbered, check, text: current.text, problems };
   return { ok: problems.length === 0, seal, items: numbered, check: check.map(checkError), notes, problems, current, data };
 }
@@ -1471,6 +1707,10 @@ function maintenanceApply(ctx, built, d, proposal) {
   const errors = [];
   for (const n of d.drop) if ((/** @type {MaintenanceCardItem} */ (itemOf.get(n))).drop !== "optional") errors.push({ code: "not_droppable", item: n, why: (/** @type {MaintenanceCardItem} */ (itemOf.get(n))).drop });
   for (const n of d.take) if (!(/** @type {MaintenanceCardItem} */ (itemOf.get(n))).adopt) errors.push({ code: "nothing_to_adopt", item: n, why: (/** @type {MaintenanceCardItem} */ (itemOf.get(n))).detected === undefined ? "undetected" : "agrees" });
+  // An asked item is answered by a value, an adoption or a drop; left alone, it is refused.
+  for (const i of built.items) {
+    for (const field of i.needs ?? []) if (!d.drop.includes(i.n) && !d.take.includes(i.n) && d.edits[i.n]?.[field] === undefined) errors.push({ code: "needs_edit", item: i.n, field });
+  }
   if (errors.length) return { refused: errors.map(refusalOf) };
   const reply = replyOf(built, d);
   const changes = changesOf(ctx, built, reply);
@@ -1624,6 +1864,17 @@ function filesOf(ctx, built, reply, changes, proposal) {
     const check = checkAt(ctx, f.path, f.text);
     if (!check.ok) problem("check_file", undefined, { path: f.path, errors: check.errors });
   }
+  // A value the engineer picks is refused when the stack cannot write it; one the file already
+  // holds is `scan`'s warning until they settle it, so maintenance never blocks on it.
+  if (changes.some((c) => c.item.field === "annotation_map.automation_key") || changes.some((c) => ["stack.language", "stack.framework"].includes(/** @type {string} */ (c.item.field)))) {
+    unusableCarrier({ language: final("stack.language"), framework: final("stack.framework") }, final("annotation_map.automation_key"), problem);
+  }
+  const hadRoles = Array.isArray(base.roles) && base.roles.length > 0;
+  const hadMeaning = !meaningBlank(base.role_meaning);
+  const nextRoles = final("roles");
+  if ((!hadRoles || hadMeaning) && Array.isArray(nextRoles) && nextRoles.length > 0 && meaningBlank(final("role_meaning"))) {
+    problem("role_meaning_missing", "role_meaning");
+  }
   return { files, heads, next, problems };
 }
 
@@ -1646,7 +1897,12 @@ function writeReply(ctx, built, reply, { files, heads, next }, changes) {
   // Every change at once, from the file as it stands to the one written.
   const project = files.find((f) => f.path === ctx.repoPath("project.md"));
   const warnings = checkAt(ctx, ctx.repoPath("project.md"), project?.text).warnings;
-  const notes = [...warnings.filter((w) => w.code === "automation_key_overlap").map(({ code }) => ({ code })), ...labelNotes(ctx, project ? parse("project.md", project.text).data : built.data)].map(noteOf);
+  const afterData = project ? parse("project.md", project.text).data : built.data;
+  const notes = [
+    ...warnings.filter((w) => w.code === "automation_key_overlap").map(({ code }) => ({ code })),
+    ...targetEnvNotes(afterData),
+    ...labelNotes(ctx, afterData),
+  ].map(noteOf);
   const todo = project ? effectOf(ctx, referrers(ctx, built.current.text), project.text) : none;
   const { final } = reply;
   const renamed = heads.includes("annotation_map") && !isDeepStrictEqual(final("annotation_map.automation_key"), valueAt(built.data, "annotation_map.automation_key"));

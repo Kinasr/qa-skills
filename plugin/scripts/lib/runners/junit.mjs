@@ -23,8 +23,9 @@ import { attemptRules } from "../test-runner.mjs";
  */
 
 /**
- * The class and method a selector names.
- * @typedef {{ pkg: string, classPath: string, method: string, fqcn: string }} JvmTarget
+ * The class and method a selector names. `classPath` is the binary class chain (`Outer$Inner`), as
+ * both tools select a nested class; `outer` is the top-level class's fully qualified name.
+ * @typedef {{ pkg: string, classPath: string, method: string, fqcn: string, outer: string }} JvmTarget
  */
 
 /** @param {string} text @param {string} name @returns {string} */
@@ -99,7 +100,8 @@ function attemptsOf(testcase, id, diagnostics) {
 
 /**
  * The per-instance attempts of one JUnit XML report. A testcase's instance id is
- * `<module>:<classname>#<testcase name>`; the whole name is kept.
+ * `<module>:<classname>#<testcase name>`; the whole name is kept. Surefire names a class-level
+ * setup failure (`@BeforeAll`) `""`, so an empty name with a classname is still an instance.
  * @param {string} text
  * @param {{ module: string }} options
  * @returns {RunnerResult}
@@ -110,7 +112,7 @@ export function parseJUnitReport(text, { module }) {
   /** @type {RunnerResult} */
   const parsed = { instances: {}, diagnostics: [] };
   for (const testcase of cases) {
-    if (!testcase.name) continue;
+    if (!testcase.name && !testcase.classname) continue;
     const id = `${module}:${testcase.classname}#${testcase.name}`;
     parsed.instances[id] = attemptsOf(testcase, id, parsed.diagnostics);
   }
@@ -139,13 +141,15 @@ export function mergeRunnerResult(into, from) {
 export function jvmTarget(selection) {
   const titles = selection.titles ?? [];
   const method = titles.at(-1) ?? "";
-  const classPath = titles.slice(0, -1).join(".");
+  const classes = titles.slice(0, -1);
   const pkg = selection.package ?? "";
-  return { pkg, classPath, method, fqcn: [pkg, classPath].filter(Boolean).join(".") };
+  const qualified = (/** @type {string} */ name) => [pkg, name].filter(Boolean).join(".");
+  const classPath = classes.join("$");
+  return { pkg, classPath, method, fqcn: qualified(classPath), outer: qualified(classes[0] ?? "") };
 }
 
 /**
- * The selection as Gradle's `--tests` takes it: `<pkg>.<Class>.<method>`.
+ * The selection as Gradle's `--tests` takes it: `<pkg>.<Outer$Inner>.<method>`.
  * @param {AutomationSelection} selection
  * @returns {string}
  */
@@ -155,7 +159,7 @@ export function gradleSelector(selection) {
 }
 
 /**
- * The selection as Maven's `-Dtest` takes it: `<pkg>.<Class>#<method>`.
+ * The selection as Maven's `-Dtest` takes it: `<pkg>.<Outer$Inner>#<method>`.
  * @param {AutomationSelection} selection
  * @returns {string}
  */

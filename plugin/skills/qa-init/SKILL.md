@@ -8,8 +8,7 @@ disable-model-invocation: true
 
 `/qa-init [--add-role <name>]...`
 
-Configure `.qa/project.md` on one numbered Card. Write its prose from CLI data; map the engineer's
-free-form Reply to JSON decisions.
+Configure `.qa/project.md` on one numbered Card.
 
 **After the startup check, run `init state`**, on every path. It prints `train`: `train/init.md` and its entries.
 Follow its Practices throughout. It also prints `access`: the **Access note**
@@ -38,17 +37,20 @@ A Practice that contradicts an Invariant is void.
 - **Propose `test_runner`, `code_host` and `stack.root` from evidence; list the support directories
   beside the tests in `module_paths`, under a root that contains them; ask for unknown values.**
 
-- **Evidence, never a guess.** Every detected value names its source, count and sample;
-  ask for values the repo and tracker cannot show.
+- **Evidence, never a guess.** Every detected value names its source, count and sample.
 - **Nothing is written until the engineer replies.** Then `init apply` writes, in one write.
-- **Only `.qa/project.md`.** The Automation-key declaration and the Agent pointer are reported,
+- **Only `.qa/project.md`, and a migration the engineer says yes to.** The Automation-key declaration and the Agent pointer are reported,
   never written.
-- **A dirty working tree is fine.** Say nothing about it. Never stage or commit.
+- **Never run git to stage or commit yourself.** The commit follows the project's Commit mode through
+  `scan.mjs commit` (ADR-0062), never retried with `--no-verify`. A dirty working tree is fine; say nothing about it.
 - **Never ask for a credential.** Ask which connector, CLI or variable carries it; its value stays
   with the engineer.
 - **Never guess an answer.** Ask about ambiguity. Leave anything the Reply does not clearly address
   open; never confirm for them.
 - **Never apply answers given before a rebuild.** Show the new Card and ask again.
+- **A first run ends on one next step**: `/qa-train access` when the target's login has no Access
+  note (`observe:` needs a role-less one), else `/qa-deep-dive <feature-slug> human:<you>` or
+  `file:`/`observe:`.
 - **On maintenance, nothing changes unless the engineer picks it.** A change that would cause
   Integrity errors (knowledge references that no longer resolve) is written only once they
   confirm it. Init never rewrites knowledge to follow a change. There is no `--force`.
@@ -60,6 +62,8 @@ Run from the repository root (`--root` defaults to `./.qa`, which need not exist
 ```
 node <this skill's directory>/../../scripts/scan.mjs init <state|smoke|card|apply|add-role> ...
 ```
+
+Commands that read input take it from a file: write it outside the repository (the run dir or your scratch directory) and pass its absolute path as `--input <file>`. Run each command as one plain `node` line, with no pipe, heredoc, `&&` or `;` chain, variable prefix or `cd`.
 
 Each call prints JSON. The first `init smoke` or `init card` makes the run dir (`dir`); pass it as
 `--dir` to every later call. The CLI checks the card's digest; never carry it in decisions.
@@ -80,18 +84,23 @@ model. Smoke-test each other picked label as
 
 ## 3. Word the card
 
-Pipe the proposal to `init card --stdin [--dir <run-dir>]`.
+Pass the proposal to `init card --input <file> [--dir <run-dir>]`.
 
 - `ok: false`: fix the proposal from the evidence, or ask the engineer, and run `card` again.
 - `ok: true`: read [the shared wording rules](../references/wording-rules.md). Present `card`: the
-  counts, notes, each numbered item's label, value, evidence and allowed answers,
-  `fallback` unnumbered, and each file's `frontmatter` in a fenced block under its path. Mark an
-  item with `needs` as a question; list `stacks` and `options` (an option not `settled` needs the
-  interview). Wait for the engineer's reply.
+  counts, notes, each numbered item's label, value, evidence and allowed answers, each `picked_tiers` line
+  unnumbered with its label and smoke-test result, `fallback` unnumbered, and each file's `frontmatter`
+  fenced under its path. Word `Execution levels` as what its mode does: a `browser` level runs in a browser,
+  an `api` level as direct HTTP calls; never `level → mode`. Mark an item with `needs` as a question on its
+  own line; its Evidence names only where its value came from, or that nothing was found plus any `hint`.
+  When the Card carries `target_env_multiple_origins`, or `target_env` leaves out another origin's variable,
+  name the omitted variables and say that `target_env` sets every listed variable to the Run's origin on
+  every Run, so omitted ones keep the test config's default.
+  List `stacks` and `options` (an option not `settled` needs the interview). Wait for the reply.
 
 ## 4. Apply decisions
 
-Translate only clear answers into JSON on stdin, for example:
+Translate only clear answers into a JSON file, for example:
 
 ```json
 {"take":"all","drop":[10],"edits":{"5":{"value":"jira"}}}
@@ -100,16 +109,17 @@ Translate only clear answers into JSON on stdin, for example:
 `take` is `"all"` only for explicit whole-Card acceptance, otherwise item numbers. `drop` lists items
 left out. `edits` accepts and answers an item: `value` (a string, string array, number, map or list of maps matching
 `type`), `stack` (a root from `stacks`) or `minting` (an option number).
-Unmentioned items stay open. Ask on ambiguity; retain clear decisions across
-clarification turns.
+Taking an item that shows a `value` accepts it; an edit wins. An item with no value needs its answer.
+Retain clear decisions across clarification turns.
 
-Run `init apply --dir <run-dir> --stdin`. If a shared guard returns `text`, relay that procedural
+Run `init apply --dir <run-dir> --input <file>`. If a shared guard returns `text`, relay that procedural
 text intact.
 
-- **`ok: true`**: say what `applied` and `dropped` changed; give `report`: `files`, `commit`
-  intact, notes, and `snippet`, the Automation-key carrier's declaration:
+- **`ok: true`**: say what `applied` and `dropped` changed; give `report`: `files`, notes, and
+  `snippet`, the Automation-key carrier's declaration:
   `missing` carries `text` to copy intact in a `fence` block, `unavailable` carries `message` and
-  `fix`; other statuses need nothing added. Then Close.
+  `fix`; other statuses need nothing added. When `report.commit` is not null, make it as
+  [the commit reference](../references/commit.md) says. Then Close.
 - **`rebuild: true`**: rebuild and show the new Card; obtain fresh answers before applying.
 - **Otherwise** nothing was written. Explain `refusals` from `code`, `line` and data; ask about open
   items. With `cause: repository`, ask them to settle what changed; with `answers`, for different
@@ -118,16 +128,22 @@ text intact.
 ## Add roles
 
 Run `init add-role <name>...` with every name, quoting names with spaces. Describe `added` and
-`already`; copy `commit` intact. After
+`already`. When `commit` is not null, make it as [the commit reference](../references/commit.md) says. After
 `no_project`, `add_role_check_file` or `project_unreadable`, offer the first run or **Maintain an
 existing project.md**, and start the one the engineer picks. Then Close.
 
 ## Maintain an existing project.md
 
+When the preflight found `pending`, offer to run it first: each `migrations` `command` in order,
+as `node <this skill's directory>/../../scripts/scan.mjs <command> [--root <qa-dir>]`, on the
+default branch. Run it only on the engineer's yes, report its `rewritten` files and leave their
+commit to the engineer. A no carries on with the warning.
+
 1. **Detect again.** Read the evidence as in section 1: `fields` holds only what you re-read, with
    its evidence, and any Tier the engineer wants changed, picked as in section 2. Show the card as
    in section 3: `check` errors first, each item's `current` value, and where `adopt` is true the
-   `detected` value with its evidence and `effect`.
+   `detected` value with its evidence and `effect`. Ask each item with `needs`: the Reply answers,
+   adopts or drops it.
 2. **Apply decisions** as in section 4, naming only the items to change (labels: see the reference):
 
    ```json
@@ -137,7 +153,8 @@ existing project.md**, and start the one the engineer picks. Then Close.
    `adopt` takes the detected value. On `confirm: true` nothing was written: show every change's
    `errors`, unread key annotations (`words`) and `described` label counts, wait for the engineer's explicit confirmation,
    then submit the CLI's `decisions`, or revise from their answer. `confirm` lists explicitly
-   confirmed change numbers. Report `todo`, the Integrity errors the write made. Then Close.
+   confirmed change numbers. Report `todo`, the Integrity errors the write made. Then run the commit
+   as section 4 does and Close.
 
 ## Close
 
@@ -145,6 +162,8 @@ However a path ends, give `pointer`. `missing`: say to paste `text` intact, in a
 `file`; with `import`, also to add its `add` line to its `file`. `present`: one line naming `file:line`;
 show `text` only if the engineer asks for the current template.
 
-However a path ends, offer `/qa-train init` if the session taught `/qa-init` something (a
-correction, or an answer it would otherwise ask again), and `/qa-train access` if init had to ask
-how to reach the tracker, or its note was `withheld`. On yes, invoke each.
+However a path ends, offer `/qa-train init` only for what the engineer taught: a correction they
+gave, or a team-specific answer they stated. CLI behaviour, a suspected defect, and your own
+inference or generalisation never qualify; with nothing qualifying, make no offer. Offer
+`/qa-train access` if init had to ask how to reach the tracker, or its note was `withheld`. On yes,
+invoke each.

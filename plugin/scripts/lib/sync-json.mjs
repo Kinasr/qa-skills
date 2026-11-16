@@ -65,7 +65,8 @@ import { accessNoteNamed } from "./access.mjs";
  *   automatable?: boolean,
  *   automates?: string[],
  *   unknown_roles?: string[],
- *   tracker_level?: string | null,
+ *   tracker_level?: string | string[] | null,
+ *   offered_level?: import("./case-fields.mjs").CaseLevel,
  *   intake_needs?: string[],
  *   unlanded_suite?: string | null,
  *   creates_scenario?: { key: string, suite: string } | null,
@@ -107,7 +108,8 @@ import { accessNoteNamed } from "./access.mjs";
  *   tracker_disposition?: "keep" | "retire" | null,
  *   automatable?: boolean,
  *   unknown_roles?: string[],
- *   tracker_level?: string | null,
+ *   tracker_level?: string | string[] | null,
+ *   offered_level?: import("./case-fields.mjs").CaseLevel,
  *   automations?: string[],
  *   mark?: string | null,
  *   attach?: { needs: string[] },
@@ -294,6 +296,7 @@ export function cardData(ctx, card) {
         out.automatable = item.automatable;
         if (/** @type {NonNullable<SyncCardItem["unknown_roles"]>} */ (item.unknown_roles).length) { out.unknown_roles = item.unknown_roles; term("Role"); }
         if (item.tracker_level) out.tracker_level = item.tracker_level;
+        if (item.offered_level !== undefined) out.offered_level = item.offered_level;
         out.automations = item.automates;
       } else if (item.candidates) { out.candidates = /** @type {AttachCandidate[]} */ (item.candidates); out.markdown = /** @type {string[]} */ (item.candidates).map((k) => `- ${label(k, "feature")}`).join("\n"); }
     } else if (item.code === "unlanded_suite") {
@@ -304,7 +307,7 @@ export function cardData(ctx, card) {
     } else if (item.section === "unlanded") {
       term("Unlanded case"); term("Divergence"); term("Tracker intake"); term("Dismissal"); term("Retired key");
       if (item.unlanded_suite) { term("Unlanded Suite"); out.unlanded_suite = label(item.unlanded_suite, "suite"); }
-      out.intake = { needs: item.intake_needs, automatable: item.automatable, unknown_roles: item.unknown_roles, ...(item.tracker_level && { tracker_level: item.tracker_level }) };
+      out.intake = { needs: item.intake_needs, automatable: item.automatable, unknown_roles: item.unknown_roles, ...(item.tracker_level && { tracker_level: item.tracker_level }), ...(item.offered_level !== undefined && { offered_level: item.offered_level }) };
       out.dismiss = { needs: ["by", ...(!item.feature ? ["feature"] : [])] };
       if (item.creates_scenario) out.intake.creates_scenario = { label: label(item.creates_scenario.key, "scenario"), suite: label(item.creates_scenario.suite, "suite") };
     } else if (item.section === "prefix") {
@@ -375,7 +378,7 @@ export const REFUSALS = {
   unknown_action: "The requested sync action is unavailable.",
   apply_takes_no_feature: "Apply uses the Feature recorded in the run dir.",
   too_many_features: "The action accepts at most one Feature key.",
-  apply_needs_stdin: "Apply needs JSON decisions on stdin.",
+  apply_needs_stdin: "Apply needs JSON decisions from --input <file> or stdin.",
   no_feature: "The knowledge layer holds no such Feature.",
   run_scoped_elsewhere: "The requested Feature differs from the run's scope.",
   edit_dropped: "A dropped item also has an answer.",
@@ -462,6 +465,6 @@ export function decisionsOf(text, items) {
   const edits = /** @type {Record<string, Record<string, unknown>>} */ (input.edits ?? {});
   const confirm = /** @type {number[]} */ (input.confirm ?? []);
   const errors = validateEdits(items, take, drop, edits, { confirm: /** @type {never[]} */ (confirm), badValue: (/** @type {SyncCardItem} */ item, /** @type {string} */ field, /** @type {unknown} */ value) =>
-    !( ["bind", "roles"].includes(field) ? Array.isArray(value) && value.every((key) => typeof key === "string") : field === "keep" ? Number.isSafeInteger(value) : typeof value === "string") });
+    !( ["bind", "roles"].includes(field) ? Array.isArray(value) && value.every((key) => typeof key === "string") : field === "level" ? value === null || typeof value === "string" || (Array.isArray(value) && value.every((level) => typeof level === "string")) : field === "keep" ? Number.isSafeInteger(value) : typeof value === "string") });
   return { input, take, drop, edits, confirm, name: /** @type {Record<string, string>} */ (input.name ?? {}), merge: /** @type {Record<string, string>} */ (input.merge ?? {}), errors };
 }

@@ -9,7 +9,9 @@ An Unlanded case is a Divergence with three resolutions. Leave `resolution` unan
 the engineer chooses; accepting the Card alone does not choose a resolution.
 
 - **Tracker intake**: set `resolution` to `intake`. Show `intake`'s defaults, questions and any
-  scenario it creates. Answer its `level`, `roles`, `scenario` and `feature` questions as needed.
+  scenario it creates. Answer its `offered_level`, `roles`, `scenario` and `feature` questions as
+  needed; `offered_level` is a tracker level to bind or decline, and a case with no offer needs no
+  level.
   It transcribes the fetched case unreviewed under the Key its mark holds, with the tracker key
   beside it; a scenario it creates keeps its own marked Key too. `report.intaken` lists each Key,
   `reused` when it came from a mark. A missing tracker summary must be supplied by a person in

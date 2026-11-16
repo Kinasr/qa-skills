@@ -305,7 +305,8 @@ export function showRuleFilterMatches(annotations, filters) {
 
 /**
  * Case filters read the normalized Review, Findings and gap booleans, plus the case's own labels.
- * `selected` is the shared count-click selection; it is disabled only when null.
+ * A Test level filter matches when the level is among the case's bindings, not only when it is the
+ * single one. `selected` is the shared count-click selection; it is disabled only when null.
  * @param {string} feature
  * @param {ShowCaseRow} entry
  * @param {ShowCaseState | undefined} state
@@ -313,7 +314,7 @@ export function showRuleFilterMatches(annotations, filters) {
  * @returns {boolean}
  */
 export function showCaseFilterMatches(feature, entry, state, filters) {
-  if (filters.level && entry.data.level !== filters.level) return false;
+  if (filters.level && !entry.levels.includes(filters.level)) return false;
   if (filters.tag && !showValues(entry.data.tags).includes(filters.tag)) return false;
   for (const [name, value] of Object.entries(filters.custom)) {
     if (value && !showValues(entry.data[name]).includes(value)) return false;

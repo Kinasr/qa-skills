@@ -5,14 +5,15 @@
 /** @import { PrFile } from "./pr-git.mjs" */
 /** @import { CodeHost } from "./knowledge-file.mjs" */
 /** @import { CommandAction, CommandResult } from "./cli.mjs" */
+/** @import { PlatformContext } from "./platform.mjs" */
 /** @import { RefusalFact } from "./refusal.mjs" */
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
 import { join, resolve } from "node:path";
 import { noArguments, requireOption } from "./cli.mjs";
 import { scrubPageText } from "./credentials.mjs";
 import { uncommittedUnder } from "./git.mjs";
 import { within } from "./paths.mjs";
+import { defaultPlatformRunner, spawnNodeCli } from "./platform.mjs";
 import { refusalsFor } from "./refusal.mjs";
 import {
   committerIdentity, commitExists, commitFile, createRef, defaultBaseRef, diffTrees, headCommit,
@@ -209,11 +210,17 @@ export function dirtyPaths(repo, roots) {
 }
 
 /**
+ * Probe whether a code-host CLI (`gh` or `glab`) resolves cleanly and answers `--version`.
  * @param {string} tool
+ * @param {PlatformContext} [context]
  * @returns {boolean}
  */
-function toolAvailable(tool) {
-  return spawnSync(tool, ["--version"], { env: process.env }).status === 0;
+export function toolAvailable(tool, context = {}) {
+  const env = context.env ?? process.env;
+  const resolved = spawnNodeCli({ kind: "path-tool", file: tool, args: ["--version"], options: { env } }, context);
+  if (resolved.refusal) return false;
+  const runner = context.run ?? defaultPlatformRunner;
+  return runner(resolved.file, resolved.args, resolved.options).status === 0;
 }
 
 // The base branch a PR may target: HEAD's upstream under origin, else origin's default, used only
@@ -240,9 +247,10 @@ function resolveBase(repo, commit, paths) {
  * Resolve the mode a Run will use and open its PR state. `requested` is false when neither the
  * engineer nor a Practice asked for a PR, which keeps a standalone run in the working tree.
  * @param {PrOptions} options
+ * @param {PlatformContext} [context]
  * @returns {PrState}
  */
-export function planPr(options) {
+export function planPr(options, context = {}) {
   const branch = `qa/${options.skill}/${options.run}`;
   const tool = options.codeHost?.tool;
   /** @type {PrMode} */
@@ -257,7 +265,7 @@ export function planPr(options) {
     mode = workingTree("no-identity");
   } else if (!tool) {
     mode = branchOnly(branch, "no_code_host");
-  } else if (!toolAvailable(tool)) {
+  } else if (!toolAvailable(tool, context)) {
     mode = branchOnly(branch, "no_tool", tool);
   } else {
     const repo = originSlug(options.repo);

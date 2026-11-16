@@ -32,7 +32,7 @@ test-name patterns, and the support import graph. Read `gate` before proposing:
 On the conversation branch, run `evidence codegen` and read the whole file it returns. Its `train`
 holds:
 
-- `pr`, `trained_stacks`, `codegen_repeats` and `codegen_attempts`, with their defaults when absent;
+- `pr`, `trained_stacks`, `codegen_repeats`, `codegen_attempts` and `approaches`, with their defaults when absent;
 - `conventions`, each with its `stack`, `facet`, `refs` and `signal`;
 - `practices`.
 
@@ -60,6 +60,47 @@ stack before then is refused by `train check`. Practices never name a runner or 
 command: how a generated test is run and proved is the CLI's step, and a Practice covers only how
 the agent works.
 
+## Supported approaches
+
+At the gate, settle which approaches the one stack supports, each Test level it serves and where
+it writes. Only `/qa-train codegen` writes `approaches` in `train/codegen.md` frontmatter:
+
+```yaml
+approaches:
+  - {approach: api, level: api, path: tests/api/**/*.spec.ts}
+  - {approach: mocked-ui, level: ui, path: tests/mocked/*.spec.ts}
+  - {approach: full-ui, level: ui, path: tests/journeys/*.spec.ts}
+```
+
+Declare each supported approach once; omit unsupported ones. `level` is a slug from the project's
+`stack.levels`; mocked UI is an approach, never a Test level. `path` is a repository-relative POSIX
+pattern: `*` stays within one segment, `?` matches one character, and `**` occupies a whole segment
+and reaches zero or more directories. Exact paths work. Absolute paths, parent traversal,
+backslashes and other glob syntax are refused. Use patterns that distinguish levels: an
+Automation's level follows from its file path; an unmatched path or matches at different levels
+leave its level unresolved. Overlapping approaches may agree on one level.
+
+Show approach changes beside the Convention and Practice proposals before writing. Training
+with no `approaches` field keeps legacy eligibility for Layer-free and single-level cases;
+multi-level bindings stay unsupported until approaches are declared. An empty or invalid list declares
+no automation support, so repair it here. An Automation gap at a bound level remains until that
+supported level has an Automation. Unsupported levels are
+reported separately and never counted as covered; a Layer-free case needs any Automation.
+
+## Pyramid threshold Practices
+
+Alongside approaches, settle threshold Practices at the gate. A threshold Practice moves when
+codegen may choose a higher approach for a stated kind of case; it never changes the case's claim
+or declares another capability. Record it in `.qa/train/codegen.md` as a `prc_` entry with
+`human:<name>` sources. Use wording such as "Pyramid threshold: allow full UI for cross-Rule
+journeys after considering API and mocked UI." Show its scope and reason with the proposals.
+
+A threshold Practice can permit full UI for that journey kind when API is supported, and codegen
+cites its `prc_` key in the Run-owned choice. It must never invert the pyramid: API first, mocked
+UI next, full UI only when needed remains the order; a blanket preference for full UI is void.
+The skill instructs this threshold; the CLI validates the declared approach and level, without
+refusing full UI or a blank reason.
+
 ## Derive proposals
 
 Every Convention carries:
@@ -67,7 +108,8 @@ Every Convention carries:
 - a **statement** about the form of the code: placement, naming, structure, fixtures, locators,
   waits, assertions or imports. It names no part of the system under test;
 - **sources**: `human:<name>` for an answer, or `code:<path>#L<line>@<sha7>` when the project's test
-  code is the evidence. `train check` validates the syntax only;
+  code is the evidence. `train check` validates the syntax only; a `code:` source never cites the
+  form the Convention forbids, only the form it requires;
 - one **minimal fenced example**. A **prohibition** ("never …") also carries an **anti-example**,
   marked as the wrong form;
 - **refs** for the support paths it points at, a repository-relative path under `module_paths`. In a

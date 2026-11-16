@@ -11,7 +11,8 @@
 //
 // Sections, in order: Task, The case, The Feature, Sessions, Commands, Rules, Training, The report. A
 // session name, a login state, an Access note key, a `match` prefix or a `.qa/fixtures/` path never
-// reaches it. Its command lines are the ones the Tester hook admits (lib/tester-guard.mjs): a plain
+// reaches it; a Role's `identifiers.user`, when its note has a password source, does (not a secret).
+// Its command lines are the ones the Tester hook admits (lib/tester-guard.mjs): a plain
 // `node <plugin>/scripts/scan.mjs tester do|request …`, each word bare or single-quoted.
 /**
  * @import { CommandAction, CommandResult } from "./cli.mjs"
@@ -22,13 +23,14 @@
  * @import { RefusalResult } from "./refusal.mjs"
  * @import { KeyIndex, TreeFile } from "./qa-index.mjs"
  */
+import { CREDENTIAL_VARIANTS } from "./tester-request.mjs";
 import { realpathSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 import { SCAN_CLI, noArguments, requireOption } from "./cli.mjs";
 import { redactCredentials, shownKey } from "./credentials.mjs";
 import { execution } from "./execute-open.mjs";
 import { executeTraining } from "./execute-training.mjs";
-import { GUARD_STOPS, executionDir, readGuard } from "./execution-guard.mjs";
+import { GUARD_STOPS, REPORT_FILE, executionDir, readGuard } from "./execution-guard.mjs";
 import { REPORT_EXAMPLES } from "./execution-report.mjs";
 import { repositoryOf } from "./git-tree.mjs";
 import { TESTER_REASONS } from "./check-file.mjs";
@@ -117,22 +119,25 @@ const COMMANDS = {
   reload: ["reload", "reload the page"],
   snapshot: ["snapshot", "print the page's snapshot, with the `ref` of each element"],
   screenshot: ["screenshot", "take a screenshot (kept in the run dir)"],
-  click: ["click <ref> [left|right|middle]", "click an element"],
-  dblclick: ["dblclick <ref> [left|right|middle]", "double-click an element"],
-  fill: ["fill <ref> '<text>' [--submit]", "type into a field; `--submit` presses Enter after"],
-  check: ["check <ref>", "tick a checkbox or radio"],
-  uncheck: ["uncheck <ref>", "untick a checkbox"],
-  select: ["select <ref> '<value>'", "choose an option of a select"],
+  click: ["click <ref> [left|right|middle] [--expect='<text>']", "click an element"],
+  dblclick: ["dblclick <ref> [left|right|middle] [--expect='<text>']", "double-click an element"],
+  fill: ["fill <ref> '<text>' [--submit] [--expect='<text>']", "type into a field; `--submit` presses Enter after"],
+  "fill-password": ["fill-password <ref>", "type this Role's password into a password field of the target, without showing it to you; refused unless the Role's Access note has a password source and the element is a password input. It is logged as `<typed>` and counts as an action. Use it only for a sign-in the case asks for"],
+  check: ["check <ref> [--expect='<text>']", "tick a checkbox or radio"],
+  uncheck: ["uncheck <ref> [--expect='<text>']", "untick a checkbox"],
+  select: ["select <ref> '<value>' [--expect='<text>']", "choose an option of a select"],
   hover: ["hover <ref>", "hover over an element"],
-  press: ["press <key>", "press one key, such as `Enter` or `Control+a` (single-quote a key that is not a letter or digit)"],
+  press: ["press <key> [--expect='<text>']", "press one key, such as `Enter` or `Control+a` (single-quote a key that is not a letter or digit)"],
   "tab-list": ["tab-list", "list the open tabs"],
   "tab-select": ["tab-select <n>", "switch to tab n of `tab-list`"],
   "dialog-accept": ["dialog-accept ['<text>']", "accept the open dialog, answering a prompt with the text"],
   "dialog-dismiss": ["dialog-dismiss", "dismiss the open dialog"],
   upload: ["upload <fixture-name>", "attach one of the fixtures listed below to the file input the last snapshot shows"],
   console: ["console", "print the browser console"],
+  route: ["route '<pattern>' [--status=<100..599>] [--body='<text>'] [--content-type=application/json|text/plain]", "mock a response in this Role's session; give at least a status or a body (at most 65,536 UTF-8 bytes), each option once. Use the equals spelling shown; single-quote patterns and bodies, including globs and JSON. A path resolves onto the target origin; a full URL stays there, or on another configured target's origin when Sessions names one. Header options are refused"],
+  unroute: ["unroute ['<pattern>']", "clear that mock (the same pattern, resolved as for route), or all mocks in this Role's session when omitted"],
 };
-const REQUEST = "<METHOD> '<url>' [--query <k>=<v>]… [--header '<k>:<v>']… [--json '<body>']";
+const REQUEST = `<METHOD> '<url>' [--query <k>=<v>]… [--header '<k>:<v>']… [--json '<body>'] [--auth ${CREDENTIAL_VARIANTS.join("|")}]`;
 
 // The Role token of a session: its slug, or `-` for the case without Roles.
 /**
@@ -153,7 +158,7 @@ function taskSection({ pinned, ex, execDir }) {
     "",
     ...list([
       `Tag: ${code(`qa-${pinned.run}`)}. It marks everything you create (see Rules).`,
-      `Report: write ${code(`${execDir}/report.md`)}, in the grammar of The report. It is the only file you write.`,
+      `Report: write ${code(`${execDir}/${REPORT_FILE}`)}, in the grammar of The report. It is the only file you write.`,
       `Reply ${code("DONE")} once the report is written, whatever its result; reply ${code("FAILED: <reason>")} only when you could not write it.`,
     ]),
   ];
@@ -205,12 +210,19 @@ function featureSection({ ex, feature, target }) {
 function sessionsSection({ pinned, guard }) {
   const sessions = guard.sessions.map((s) => {
     const who = s.role === "-" ? "the case has no Roles" : `Role ${s.role}`;
-    return `${who}: pass ${code(tokenOf(s))} as \`<role>\`${s.setup ? ". Marked setup: it only prepares data for a precondition and never acts in a numbered Step" : ""}`;
+    const state = s.role !== "-" && s.acc === null
+      ? ": signed out, with no login; the app's sign-in page is expected, never Blocked `no-access`"
+      : s.role === "-" && s.acc === null ? ": no login" : "";
+    const user = s.role === "-" || s.acc === null ? ""
+      : s.user ? `. To sign in as it, ${code("fill")} the user name ${code(s.user)}`
+        : ". Its note names no user name: a case that signs in as it is Blocked; never guess one";
+    return `${who}: pass ${code(tokenOf(s))} as \`<role>\`${state}${user}${s.setup ? ". Marked setup: it only prepares data for a precondition and never acts in a numbered Step" : ""}`;
   });
   return [
     "## Sessions",
     "",
-    `Target: ${pinned.target.slug}, ${pinned.target.origin}. You stay on that origin. Each session below is already open; a Role's session is signed in as that Role's test account.`,
+    `Target: ${pinned.target.slug}, ${pinned.target.origin}. You stay on that origin. Each session below is already open; a Role's session is signed in as that Role's test account unless it is marked signed out.`,
+    ...(guard.route_origins?.length ? [`A \`route\` may also name, by full URL, another configured target's origin: ${guard.route_origins.join(", ")}. Nothing else leaves the target origin.`] : []),
     "",
     ...list(sessions),
   ];
@@ -255,7 +267,7 @@ function rulesSection({ pinned, ex }) {
   const tag = `qa-${pinned.run}`;
   /** @type {Record<string, string>} */
   const reasons = {
-    "no-access": "the app showed its sign-in page (`at_login: true`) in setup or in a step that neither logs out nor tests login, or the guard stopped you with `no-access`. In setup, `reached: 0`",
+    "no-access": "the app showed its sign-in page (`at_login: true`) in setup or in a step that neither logs out nor tests login, or the guard stopped you with `no-access`, or a default `tester request` marked `auth_rejected: true` shows the account's credential no longer works. A signed-out session is exempt: its sign-in page is expected, so never Block it `no-access` for that. So is the sign-in page you reach by signing a Role out in setup. In setup, `reached: 0`",
     precondition: "a precondition could not be established or checked, or setup failed in any way, a recipe the app rejected and an unexpected `5xx` in setup included. `reached: 0`",
     step: "a step cannot be carried out as written (the element or button it names is not there, a command is refused), an Expected-result clause can only be seen outside the target, or a step would touch an account or shared fixture you may not (see Limits)",
     "ambiguous-actor": "a case with two or more Roles has a step that does not open with `As <Role>, `. `reached` is that step",
@@ -277,9 +289,10 @@ function rulesSection({ pinned, ex }) {
     ...list([
       "The preconditions are the list items under **Preconditions.** of the case, or its non-empty lines when it is not a list; there may be none.",
       "Data a precondition needs that a Role can make or change is established: create a fresh entity and bring it to the state required, with the commands above, in any session you hold. What your Roles cannot create (environment, configuration, seed data) is only checked.",
-      "A precondition that needs a Role you have no session for, or a password, is Blocked `precondition`. Any setup failure is Blocked `precondition`, never Failed, unless a guard stop overrides it.",
+      "A precondition that needs a Role you have no session for is Blocked `precondition`. Any setup failure is Blocked `precondition`, never Failed, unless a guard stop overrides it.",
+      "When a precondition needs a Role signed out, sign that Role out in setup with the app's own sign-out control. The sign-in page it reaches is expected: never Block it `no-access`. Never change the account's credentials, and touch no other session.",
       "Setup spends actions from the same budget as the steps.",
-      "Report each precondition as `{text, status, how?}`, `status` established, checked, unmet or skipped. Every precondition after the first unmet one is skipped.",
+      "Report each precondition as `{text, status, how?}`. `status` is `established` when you made it, `checked` when you saw it hold, `unmet` when you saw it not hold, and `skipped` for those after the first unmet one. A precondition seen not to hold is `unmet`, never `checked`.",
     ]),
     "",
     "Data",
@@ -289,6 +302,14 @@ function rulesSection({ pinned, ex }) {
       "Do not tear anything down. List in `created` each entity you made, in setup or in the steps, by a short label with no secret in it.",
     ]),
     "",
+    "Mocking",
+    ...list([
+      "Mock only a server, network or data-return condition that the case's precondition or step, or Training, states.",
+      "Never mock to get past an unexpected failure. Report an unexpected server error: Failed in a step, Blocked `precondition` in setup.",
+      "Clear a mock with `unroute` before a later step that needs the live endpoint.",
+      "A condition with no endpoint named by the case or Training is Blocked `precondition`.",
+    ]),
+    "",
     "Limits",
     ...list([
       "A step that changes or destroys something acts only on an entity created in this Execution, or one Training marks disposable.",
@@ -296,6 +317,7 @@ function rulesSection({ pinned, ex }) {
       "Outside the steps, only create entities, change your own, and empty the signed-in account's own containers (cart, drafts, saved-for-later, notifications) whole when a precondition needs them empty.",
       `${code("dialog-accept")} only inside a step that states a destructive action, or a setup change to an entity of this Execution. Any other destructive dialog gets ${code("dialog-dismiss")}.`,
       "Never copy a cookie, token, header value, password or any login-state content into the report, a label or an interpretation.",
+      `To sign in as a Role with its correct password, ${code("fill")} the user name or email yourself and use ${code("fill-password")} on the password field; you never see the password. Fill the user name Sessions names for that Role, never one from outside this brief (a demo account the app shows, say); a Role it names none for cannot be signed in, so report Blocked. Never use a show-password control or any way to reveal a password field's text. If a correct-password sign-in fails, do not retry: report that it cannot sign in.`,
     ]),
     "",
     "Stops and retries",
@@ -311,9 +333,11 @@ function rulesSection({ pinned, ex }) {
       "Judge each paragraph of the Expected result on what you saw. The case is Failed only when one paragraph was seen not to hold, and the report names the one clause that failed and quotes its paragraph verbatim.",
       "\"Succeeds\" means a `2xx` unless the Expected result names a status. \"Fails\", \"is rejected\" and \"is denied\" mean a `4xx` whose reason matches any reason the Expected result states, never a `5xx` unless it is named. Do not map a reason to a particular `4xx`. A status the Expected result names must match exactly.",
       "A UI label matches when it names the same action (\"Edit\" and \"Edit Offer\"); record it as an interpretation.",
+      "A raw translation key or an unfilled placeholder shown where the Expected result asks for a message does not satisfy it: that paragraph was seen not to hold. The case is Failed, `**Seen.**` quotes the text shown, and it is never recorded as an interpretation that accepts it.",
+      "A short-lived message the Expected result names (a toast, snackbar, flash or alert): add `--expect='<its text, or a distinctive part>'` to the action that raises it. The wrapper waits a few seconds for that text and answers `expect.seen`; judge the clause from it. `expect.seen: false` is Failed, with `**Seen.**` saying the message did not appear: you got to that Expected result and saw it not hold. Pick text the page does not already show before the action. An answer without `expect` (the action failed, a dialog opened or the browser stopped answering) is judged under the other rules.",
       "An absence (\"no Mark Available Today\") is judged on the surface the step opened.",
       "A clause that can only be seen outside the target is Blocked `step`; never guess it.",
-      "Where the text leaves something open, pick the reading that fits the case and record it as an interpretation: `<where>: <what the text left open> → <what I did>`, `<where>` being `setup`, `step N` or `expected`. One line each, at most 5, none with a secret.",
+      "Where the text leaves something open, pick the reading that fits the case and record it as an interpretation: `<where>: <what the text left open> → <what I did>`, `<where>` being `setup`, `step N`, `after step N` (a decision made once step N had finished, such as after the last step) or `expected`. One line each, at most 5, none with a secret.",
       "After the last step you started, run `console` once, in the session of the Role that acted last, and quote its error-level entries, shortened, in `**Evidence.**`: errors only, never warnings or info messages, never a secret. Skip it when a refusal named `stopped`, when the case was Blocked in setup (`reached: 0`), or when the last trailer shows `used` equal to `cap`: the read counts against the budget, so check the trailer before the call.",
       "Console errors never change the result on their own: one makes the case Failed only when an Expected-result paragraph says the console stays clean.",
     ]),

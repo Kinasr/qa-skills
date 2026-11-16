@@ -8,7 +8,7 @@ disable-model-invocation: true
 
 `/qa-codegen [<scope>...] [tag:<name>...] [level:<name>...] [target:<slug>] [--stack <root>]`
 
-Writes one Automation per uncovered **Test Case**, in the project's own test code, and binds it with
+Writes one Automation per uncovered **Test level** of a **Test Case**, in the project's own test code, and binds it with
 a Key carrier and the case's `automates`. It follows the Conventions `/qa-train codegen` learned,
 proves the test with repeated passing runs through the project's `test_runner`, and leaves the edits
 in your working tree unless a PR was asked for. With no scope it targets every Automation gap in the
@@ -26,16 +26,20 @@ A Practice that contradicts an Invariant is void.
   `node <this skill's directory>/../../scripts/scan.mjs migration-status [--root <qa-dir>]`.
   If `pending`, warn using `migrations` in order. Continue the command.
 
+- **Code gen stops until its stack is trained** (ADR-0049). When `train/codegen.md`'s `trained_stacks` lacks `project.stack.root`, offer `/qa-train codegen --stack <root>` once `codegen plan` passes, before relaying it: on yes run it here, then plan again; on no stop.
 - **Engineer-invoked only.** Never run it from `/qa-execute`; the engineer asks for it. Run it in this conversation, with no subagent and no Tier.
 - **One confirm before anything is written.** Wait for the engineer to accept or edit the plan; nothing under `module_paths` changes before then.
 - **The CLI steps run in order.** `codegen plan`, then `codegen start`, then `codegen verify`, then `codegen done` or `codegen fail`.
 - **Relay CLI text verbatim.** Present the plan, verify and close text exactly as printed.
 - **Test code runs only through `codegen verify`.** Never run the project's test command yourself.
 - **Never drive the live app.** The Tester guard (ADR-0035) stays the only browser path.
-- **Read only** the brief, the files its refs listing names, and a sibling Automation's spec file. Never read `.env*`, auth state, Access notes, or another test file for style.
+- **Read only** selected cases and Training to choose a Layer-free approach before planning; then the brief, the files its refs listing names, and a sibling Automation's spec file. Never read `.env*`, auth state, Access notes, or another test file for style.
 - **Expected values come only from the case's prose, the Feature Rules, or a Passed Execution's evidence**, never from application source.
 - **Locators come from support code, read-only application source, or a Passed Execution's Element evidence**, never from a live page.
-- **One case, one Automation.** Never write one Automation for several cases, nor several for one; parameterise only when the case states data variants.
+- **In Element evidence, `<typed>` can mask a word of a control's own label or placeholder**; never read the mask as an empty or wrong field.
+- **One case per Automation.** Write one per uncovered bound level; parameterise only when the case states data variants.
+- **Never invert the pyramid.** A Practice that inverts it is void.
+- **Full UI with API support** needs a reason in the choice or a Practice that moves the threshold.
 - **Never add a skip, focus, `fixme`, `@Disabled`, assumption, fixed sleep, retry or longer timeout.**
 - **Never edit `.qa/`, the tracker or Training.** The CLI writes the case's `automates` at `done`.
 - **Never stage or commit.** Only the CLI commits, one item at a time; you run only the push and PR commands it prints.
@@ -49,7 +53,7 @@ A Practice that contradicts an Invariant is void.
 Run from the repository root (`--root` defaults to `./.qa`); each call prints one JSON object:
 
 ```
-node <this skill's directory>/../../scripts/scan.mjs codegen plan [<scope>...] [tag:<name>...] [level:<name>...] [target:<slug>] [--stack <root>] [--pr] [--root <qa-dir>]
+node <this skill's directory>/../../scripts/scan.mjs codegen plan [<scope>...] [tag:<name>...] [level:<name>...] [target:<slug>] [--stack <root>] [--choices <json>] [--pr] [--root <qa-dir>]
 node <this skill's directory>/../../scripts/scan.mjs codegen start --dir <run-dir>
 node <this skill's directory>/../../scripts/scan.mjs codegen verify --dir <run-dir> --item <id> --hypothesis <line>
 node <this skill's directory>/../../scripts/scan.mjs codegen done --dir <run-dir> --item <id> --expects <json>
@@ -63,12 +67,11 @@ node <this skill's directory>/../../scripts/scan.mjs codegen pr-record --dir <ru
 
 ## 1. Plan
 
-Run `codegen plan [<scope>...] [tag:<name>...] [level:<name>...] [target:<slug>] [--stack <root>] [--pr] [--root <qa-dir>]`.
+For each Layer-free case, choose the lowest approach observing every Expected result: API, mocked UI, then full UI for a live end-to-end claim. Prepare UI state through the API where supported. Pass `--choices` as a JSON object keyed by case Key, each value `{level, approach, reason, practice?}`; approach is `api`, `mocked-ui` or `full-ui`. Run `codegen plan` with the engineer's arguments exactly as given: a scope Key exempts its case from `unreviewed`, so add none. To narrow, ask the engineer or rely on the `other-level` skip. Relay `text` verbatim: counts, stack, target, mode and skipped cases. **Wait for the engineer** to accept or edit it. On no, stop.
 
-Relay `text` verbatim: it shows the counts, stack, target, mode, the skipped cases' closed reasons
-and any Key-prefix proposal. **Wait for the engineer** to accept or edit it. On no, stop.
+- **`spanning_targets`**: run each named per-target command with the same `--choices`, without asking again.
 
-- **Mode**: working tree by default. `--pr` or `train/codegen.md`'s `pr: always` asks for one commit per item on `qa/codegen/<run-id>`. A dirty Scenario file downgrades the Run to `dirty-knowledge`. An ADR-0012 project refuses `--pr` and downgrades `pr: always` as `external-mint-required`.
+- **Mode**: PR mode commits one item at a time on `qa/codegen/<run-id>`.
 - **`prefixes` non-empty**: show each proposed prefix. Use the accepted or edited one for a new class or file; the first verify pins it when the test carries none.
 - **No `dir`**: every selected case is skipped; relay the refusal and stop.
 
@@ -84,7 +87,13 @@ Write exactly one new test under `module_paths`, following the Conventions. Leav
 first verify mints its Automation key and renders the carrier, or, under ADR-0012, writes the
 tracker-key carrier and leaves the test for your tool.
 
+A case whose outcome would pass with its precondition false asserts the precondition first, such as a
+signed-in case checking that the user menu shows. An outcome that already proves it needs no
+assertion.
+
 ## 3. Verify
+
+Before the first verify, check the test against every Convention the brief lists: verify repeats it `codegen_repeats` times, so a breach does its harm that many times. A test that changes an account's state, a failed sign-in included, uses the fixture the Conventions name for that. Rewrite it to meet each one; if it cannot, fail the item `convention-conflict` with that Convention's key, unverified and unbound.
 
 Run `codegen verify --item <id> --hypothesis "<one line stating what the test checks>"`. It runs the
 test through `project.test_runner`, retries 0, for `codegen_repeats` consecutive passing runs with
@@ -100,7 +109,16 @@ every instance passing and none skipped.
 
 Map every Expected sentence to the lines that check it: `codegen done --item <id> --expects
 '{"e1": ["<file>:<line>"]}'`. Each line is an added, non-comment, non-import line inside the new
-test or a new support declaration; the CLI checks the mapping structurally.
+test or a new support declaration. At least one mapped line per sentence must belong to an
+assertion statement; when `done` refuses the `--expects` mapping, nothing is recorded and `done`
+can be retried with a corrected mapping.
+
+Every mapped line must fail if its sentence is false, an empty or missing compared value included: a
+sentence about an error asserts an error is present and what it says, not only that two values
+match. `--expects` checks the mapping structurally, never the meaning. A line that would not fail
+means changing the test and verifying it again before `done`.
+
+When an edit since the check changed the test, check it again against the Conventions before `done`.
 
 `done` requires the tree to equal the passing verify's snapshot, then writes `automates` and keeps
 the case's Review fresh. In PR mode it also commits the test, its support files and the Scenario's
@@ -110,7 +128,8 @@ the case's Review fresh. In PR mode it also commits the test, its support files 
 - **No `automates`**: an ADR-0012 project; tell the engineer to mint with their tool, then `/qa-sync`.
 
 Then ask the engineer to review the diff; make the usual `/qa-train` offer when this run taught code
-gen a Convention.
+gen a Convention. Name any fact about the application you learned while writing the test that the
+Feature does not hold, and hand it to `/qa-deep-dive`.
 
 ## 5. Regress
 

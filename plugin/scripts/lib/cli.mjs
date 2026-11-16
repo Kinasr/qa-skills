@@ -22,10 +22,15 @@
 // An action may give `parse(argv)` -> `{positional, options}` instead, for a tail that is not options at all
 // (`tester do`'s command words); `options` then holds only the kinds `options` declares.
 //
-// `ctx` is the options as resolved, plus `stdin` (a reader of stdin when `--stdin` was given, else
-// null), `input` (a reader of stdin, always: input is read from it with no flag), `seed`
-// (`QA_SKILLS_MINT_SEED`, which only a test sets) and `env` (the caller's environment).
-import { existsSync, statSync } from "node:fs";
+// An action that declares `stdin: "flag"` also takes `--input <path>`, which the adapter adds:
+// it reads the same bytes from that file, so an agent writes its input to a file and runs one
+// plain command, with no pipe or heredoc. `--stdin` and `--input` together are a usage error.
+//
+// `ctx` is the options as resolved, plus `stdin` (a reader of the action's input when `--stdin` or
+// `--input` was given, else null), `input` (a reader of stdin, always: input is read from it with
+// no flag), `seed` (`QA_SKILLS_MINT_SEED`, which only a test sets) and `env` (the caller's environment).
+/** @import { PlatformContext } from "./platform.mjs" */
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { repositoryOf, resolveRef } from "./git-tree.mjs";
 
@@ -156,10 +161,10 @@ export function orThrow(result) {
 /**
  * @param {CommandRegistry} modes
  * @param {readonly string[]} param1
- * @param {{ env: Record<string, string | undefined>, input: () => string }} param2
+ * @param {{ env: Record<string, string | undefined>, input: () => string, platformContext?: PlatformContext }} param2
  * @returns {CommandResult | Promise<CommandResult>}
  */
-export function runCommand(modes, [mode, ...argv], { env, input }) {
+export function runCommand(modes, [mode, ...argv], { env, input, platformContext }) {
   const command = Object.hasOwn(modes, mode ?? "") ? modes[mode] : null;
   /**
    * @param {CommandResult} param0
@@ -180,7 +185,7 @@ export function runCommand(modes, [mode, ...argv], { env, input }) {
     // argument that is no option; else the action comes first and takes its own.
     /** @type {CommandDefinition | CommandAction} */
     let entry = command;
-    let { positional, options } = command.options ? parseArgs(argv, command.options) : /** @type {{ positional: string[], options: Record<string, unknown> }} */ ({ positional: argv });
+    let { positional, options } = command.options ? parseArgs(argv, withInputFile(command.options)) : /** @type {{ positional: string[], options: Record<string, unknown> }} */ ({ positional: argv });
     if (command.actions) {
       const names = Object.keys(command.actions);
       const action = positional[0];
@@ -188,10 +193,20 @@ export function runCommand(modes, [mode, ...argv], { env, input }) {
       entry = { ...command.actions[action], options: command.options ?? command.actions[action].options };
       positional = positional.slice(1);
     }
-    if (!command.options) ({ positional, options } = entry.parse ? entry.parse(positional) : parseArgs(positional, /** @type {OptionSpec} */ (entry.options)));
+    if (!command.options) ({ positional, options } = entry.parse ? entry.parse(positional) : parseArgs(positional, withInputFile(/** @type {OptionSpec} */ (entry.options))));
     const resolved = resolveOptions(options, /** @type {OptionSpec} */ (entry.options));
+    const file = /** @type {string | undefined} */ (resolved.input);
+    delete resolved.input;
+    if (file !== undefined && resolved.stdin) throw new UsageError("pass --stdin or --input <path>, not both", { code: "stdin_and_input" });
     /** @type {CommandContext} */
-    const ctx = { ...resolved, stdin: resolved.stdin ? input : null, input, seed: env.QA_SKILLS_MINT_SEED, env };
+    const ctx = {
+      ...resolved,
+      stdin: file !== undefined ? inputFile(file) : resolved.stdin ? input : null,
+      input,
+      seed: env.QA_SKILLS_MINT_SEED,
+      env,
+      ...(platformContext && { platformContext }),
+    };
     // A command without actions always has `run`; the registry (R-close) states it per command.
     const result = /** @type {NonNullable<CommandDefinition["run"]>} */ (entry.run)(positional, ctx);
     return typeof (/** @type {Promise<CommandResult> | undefined} */ (result))?.then === "function" ? (/** @type {Promise<CommandResult>} */ (result)).then(done, refused) : done(/** @type {CommandResult} */ (result));
@@ -229,6 +244,31 @@ export function usageOf(mode, command) {
   const forms = (prefix, u) => [u].flat().map((s) => (s ? `${prefix} ${s}` : prefix));
   if (!command.actions) return forms(mode, command.usage);
   return Object.entries(command.actions).flatMap(([name, a]) => forms(`${mode} ${name}`, a.usage));
+}
+
+// `spec` as the command line reads it: with `input: "value"` beside a declared `stdin: "flag"`.
+/**
+ * @param {OptionSpec | undefined} spec
+ * @returns {OptionSpec}
+ */
+export function withInputFile(spec = {}) {
+  return spec.stdin === "flag" && !Object.hasOwn(spec, "input") ? { ...spec, input: "value" } : spec;
+}
+
+// A reader of `--input <path>`'s bytes, the same text `--stdin` would read: a file that cannot be
+// read is a usage error when the action reads it.
+/**
+ * @param {string} path
+ * @returns {() => string}
+ */
+function inputFile(path) {
+  return () => {
+    try {
+      return readFileSync(path, "utf8");
+    } catch (e) {
+      throw new UsageError(`--input ${path} cannot be read: ${/** @type {NodeJS.ErrnoException} */ (e).code ?? /** @type {Error} */ (e).message}`, { code: "input_unreadable", path });
+    }
+  };
 }
 
 // Positional arguments plus `--name value` / `--flag` options, checked against `spec`.

@@ -13,7 +13,8 @@
 //   commitLine(paths, message)     the suggested path-scoped commit for the files written
 //   changedPaths(changeset)        every path a Changeset touches, sorted: what a commit line names
 //
-// Nothing here stages or commits: `commitLine` only words the command the engineer may run (ADR-0024).
+// Nothing here stages or commits: `commitLine` only words the command, which `lib/commit.mjs` makes
+// as the project's Commit mode says (ADR-0062).
 import { chmodSync, existsSync, mkdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, sep } from "node:path";
 

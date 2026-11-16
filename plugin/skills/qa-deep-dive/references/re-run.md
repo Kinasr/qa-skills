@@ -3,9 +3,12 @@
 A re-run updates the Feature in place, changing only what this run settled:
 
 - **Sources**: append the new References, deduplicated. Keep every existing one.
-- **Rules**: edit a statement in place, under the same key. Add new Rules with new keys.
+- **Rules**: edit a statement in its item's first line, under the same key. Append a new Rule at the
+  end of `## Rules`, with a new key.
 - **Deferred**: keep and show the list in amendment mode; reconcile every item only in a full
   inventory, following [the Deferred reference](deferred.md).
+- **Proposed Rules**: keep them in amendment mode unless the engineer pulls one in; a full inventory
+  settles every one, so its draft's `check` shows no `proposed_rules_left`.
 - **Open questions**: remove each one this run answered, in the same file. Keep the rest.
 - **Narrative**: update it where the new References change the picture.
 - **Bookkeeping** (`suite_key`, `watermark`, `finding`, an existing `mirror`, `formerly`) stays byte for byte as
@@ -31,8 +34,8 @@ Retiring needs the engineer's approval, every time:
 
 1. List each case in the Rule's `covered_by` (from `deep-dive feature`) by key, scenario and file,
    and ask.
-2. Only on an explicit yes, delete the Rule's heading and prose and append its key to the
-   frontmatter `retired:` list.
+2. Only on an explicit yes, delete the Rule's item and append its key to the frontmatter `retired:`
+   list.
 3. Tell the engineer that the Scan now reports an Integrity error on each of those cases, since its
    `covers` names a Rule that no longer resolves, until its `covers` is edited.
 
@@ -67,7 +70,7 @@ item without reconciling the list.
 
 ## Reconcile after writing
 
-Once the draft is written, pipe the confirmed forecast into `deep-dive reconcile <key> --stdin`:
+Once the draft is written, pass the confirmed forecast to `deep-dive reconcile <key> --input <file>`:
 `{"changes": [...], "may_change": [...], "unaffected": [...]}` of local Rule keys, and name the change's
 run dir with `--dir <run-dir>`: reconcile records there the forecast of each Rule whose statement was
 edited, and the settlement refuses a statement edit without one. For the widened Rules
@@ -84,3 +87,19 @@ with the engineer:
    The engineer runs `next_feature.command` in a run of its own.
 
 A Rule changed after the forecast reruns `check` and `reconcile`.
+
+## Questions handed off by design
+
+A design Run's `deep-dive resume --dir <run-dir>` returns `design_questions`, each with text,
+implicated Rules and a held case proposal, plus `open_questions` for the walk. Read those Rules;
+the proposal is context for the question, never evidence or an Expected result. Continue the
+existing forecast and interview with the Feature's References. Only the engineer settles intent
+or parks. Park an unanswered design question as a numbered, category-tagged item under the
+Feature's `## Open questions`, retaining its question text and implicated Rule keys. Reuse the
+existing Parked question mechanism; add no Finding kind. A held proposal stays in the design Run,
+never under a Rule or as a Test Case.
+
+When the engineer answers, write the settled Rule through the usual draft/check/write procedure
+and clear only the answered question. At the close also offer `design resume --dir <run-dir>`
+with the original design Run so `/qa-design` can reconsider its held proposal. Other cases were
+usable throughout; the answer does not call for regenerating them.

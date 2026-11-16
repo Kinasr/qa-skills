@@ -215,7 +215,7 @@ export function planMigration(index) {
 /**
  * @typedef {{ level: string, tag?: string }} LevelMapping
  * @typedef {{ code: string, file?: string, key?: string, message: string, errors?: import("./knowledge-file.mjs").EditError[] }} LevelMigrationError
- * @typedef {{ ok: boolean, needed: string[], rewrites: MigrationRewrite[], errors: LevelMigrationError[], execute_levels: { before: Record<string, unknown>, after: Record<string, unknown>, unresolved: { from: string, mode: unknown, levels: string[] }[] }, duplicates: { feature: string | null, level: string | null, keys: string[] }[], created_tags: string[] }} LevelMigrationPlan
+ * @typedef {{ ok: boolean, needed: string[], rewrites: MigrationRewrite[], errors: LevelMigrationError[], execute_levels: { before: Record<string, unknown>, after: Record<string, unknown>, unresolved: { from: string, mode: unknown, levels: string[] }[] }, duplicates: { feature: string | null, level: import("./design-duplicates.mjs").Pass["level"], keys: string[] }[], created_tags: string[] }} LevelMigrationPlan
  */
 
 /**

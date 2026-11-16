@@ -29,6 +29,9 @@
 // login state reads as the repo-relative path the Access note names (after a CLI login, as the file's
 // name in the run dir, which it deletes whatever the report says); the facts as numbered; and,
 // when the report has them, the parts of the request the scout could not reach under `## Not seen`.
+// A signed-out scout's record (ADR-0065) has no login state and no note: its Observation carries
+// `signed_out: true`, and a `state-load` step is refused as outside its brief. A sign-in page is
+// what it was sent to see, so its `FAILED: login:` line is a plain scout failure, never `login_expired`.
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { credentialIn, stripUrls } from "./credentials.mjs";
@@ -83,6 +86,7 @@ import { UI_ACTION_CAP, UI_ALLOWED, UI_NARROW, UI_SCROLL_KEYS, loginSteps } from
  *   steps: string[],
  *   facts: string[],
  *   notSeen: string[],
+ *   signedOut: boolean,
  * }} ObservationInput
  */
 
@@ -102,14 +106,19 @@ export function ingestUi(dir, root) {
   const read = readRunFile(run.dir, "scout-ui.json", { by: BRIEFED_BY, restart: BRIEFED_BY, missing: `no UI scout was briefed in ${run.dir}: run \`${BRIEFED_BY}\` first` });
   if (read.error) return /** @type {{ error: string }} */ (read);
   const record = /** @type {ScoutUiRecord} */ (read.value);
-  if (!["url", "request", "session", "access", "login_state"].every((k) => typeof (/** @type {Record<string, unknown> | null | undefined} */ (record))?.[k] === "string")) {
+  const signedOut = record.signed_out === true;
+  const recorded = (/** @type {Record<string, unknown> | null | undefined} */ (record));
+  const strings = ["url", "request", "session"].every((k) => typeof recorded?.[k] === "string");
+  const access = recorded?.access === null || typeof recorded?.access === "string";
+  const loginState = signedOut ? recorded?.login_state === undefined : typeof recorded?.login_state === "string";
+  if (!strings || !access || !loginState) {
     return { error: `${join(run.dir, "scout-ui.json")} is not the record \`${BRIEFED_BY}\` wrote: start a new run with \`${BRIEFED_BY}\`` };
   }
 
   // A CLI login's state file holds live session cookies and is the CLI's own: deleted whatever
   // the report says. Only a file in the run dir, so a corrupt record never deletes anything else.
-  const cliLogin = record.login === "cli";
-  if (cliLogin && resolve(dirname(record.login_state)) === resolve(run.dir)) rmSync(record.login_state, { force: true });
+  const cliLogin = record.login === "cli" && typeof record.login_state === "string";
+  if (cliLogin && resolve(dirname(/** @type {string} */ (record.login_state))) === resolve(run.dir)) rmSync(/** @type {string} */ (record.login_state), { force: true });
 
   const reportFile = join(run.dir, "scout-ui.report.md");
   if (!existsSync(reportFile)) return refuse("no_report", `the UI scout wrote no report at ${reportFile}: ${AGAIN}`);
@@ -119,11 +128,14 @@ export function ingestUi(dir, root) {
   if (secret) return refuse("credential", `${secret}; an Observation never carries a secret, so ${AGAIN}, and revoke the credential if it is real`);
 
   const report = /** @type {ScoutReport & { loginExpired?: string, failed?: string, problem?: string }} */ (parseReport(text, record.session));
+  if (signedOut && report.loginExpired) {
+    return refuse("scout_failed", `the UI scout was briefed to observe signed out, so a sign-in page is no expired login: ${report.loginExpired}`, { failure: report.loginExpired });
+  }
   if (report.loginExpired && cliLogin) {
     return refuse("login_expired", `the UI scout was asked to log in right after the CLI logged in as \`${record.user}\` for Access note \`${record.access}\`, so the app asks for more than a user name and password: ${report.loginExpired}. Nothing was written: switch the note to a saved login with \`/qa-train access\` (\`via: cli:playwright-cli\` and a \`login_state\`), then observe again`, { failure: report.loginExpired, access: record.access });
   }
   if (report.loginExpired) {
-    return refuse("login_expired", `the UI scout was asked to log in, so the login state saved for Access note \`${record.access}\` has expired: ${report.loginExpired}. Nothing was written: ${loginSteps({ url: record.url, loginState: record.login_state })}; then observe again`, { failure: report.loginExpired, access: record.access });
+    return refuse("login_expired", `the UI scout was asked to log in, so the login state saved for Access note \`${record.access}\` has expired: ${report.loginExpired}. Nothing was written: ${loginSteps({ url: record.url, loginState: /** @type {string} */ (record.login_state) })}; then observe again`, { failure: report.loginExpired, access: record.access });
   }
   if (report.failed) return refuse("scout_failed", `the UI scout failed: ${report.failed}`, { failure: report.failed });
   if (report.problem) return refuse("report_shape", `the scout's report is not in its brief's shape: ${report.problem}; ${AGAIN}`);
@@ -131,7 +143,7 @@ export function ingestUi(dir, root) {
     return refuse("over_cap", `the scout's report lists ${report.steps.length} steps, over the cap of ${UI_ACTION_CAP} commands: a scout that reaches the cap fails rather than report part of what it was asked; narrow the request, then observe again`);
   }
   for (const [i, step] of report.steps.entries()) {
-    const why = prohibited(step);
+    const why = prohibited(step, { signedOut });
     if (why) return refuse("prohibited_command", `step ${i + 1} of the scout's report ${why}, outside the commands its brief allows, so ${AGAIN}`);
   }
 
@@ -147,6 +159,7 @@ export function ingestUi(dir, root) {
     steps: report.steps.map((s) => s.replaceAll(`${repo}${sep}`, "").replaceAll(`${resolve(run.dir)}${sep}`, "")),
     facts: report.facts,
     notSeen: report.notSeen,
+    signedOut,
   });
   const checked = checkFile(parse(qaRel(qa, path), body), rootConfig(qa));
   if (!checked.ok) {
@@ -270,16 +283,19 @@ function stepProblem(step, session) {
 // Why a step falls outside the brief's allow-list (lib/scout-prompt.mjs), or null when it does not.
 // `click` passes as the brief narrows it (a link, a tab, or a combobox opened and closed again with
 // `press Escape`), since the report cannot show what was clicked; `press` only with Escape or a
-// scrolling key. Names the command, never the rest of the step.
+// scrolling key. A signed-out brief lists no `state-load`, so a step that loads one is refused too.
+// Names the command, never the rest of the step.
 const PRESS_KEYS = ["Escape", ...UI_SCROLL_KEYS];
 /**
  * @param {string} step
+ * @param {{ signedOut?: boolean }} [options]
  * @returns {string | null}
  */
-function prohibited(step) {
+function prohibited(step, { signedOut = false } = {}) {
   const words = step.slice(1, -1).trim().split(/\s+/);
   if (words[0] !== "playwright-cli") return `runs \`${words[0]}\`, not playwright-cli`;
   const [cmd, arg] = words.slice(2);
+  if (signedOut && cmd === "state-load") return "runs `state-load`, and this scout was briefed to observe signed out: no login state is loaded";
   if (UI_ALLOWED.includes(cmd) || cmd === "click") return null;
   if (cmd === "press") return PRESS_KEYS.includes(arg) ? null : `runs \`${["press", arg].filter(Boolean).join(" ")}\`, and \`press\` is ${UI_NARROW.press}`;
   return cmd ? `runs \`${cmd}\`` : "runs playwright-cli with no command";
@@ -331,7 +347,7 @@ function mintPath(dir, name) {
  * @param {ObservationInput} input
  * @returns {string}
  */
-function observationText({ date, url, version, request, steps, facts, notSeen }) {
+function observationText({ date, url, version, request, steps, facts, notSeen, signedOut }) {
   return [
     "---",
     "type: observation",
@@ -339,6 +355,7 @@ function observationText({ date, url, version, request, steps, facts, notSeen })
     `url: ${url}`,
     `app_version: ${version === null ? "null" : quote(version)}`,
     `request: ${quote(request)}`,
+    ...(signedOut ? ["signed_out: true"] : []),
     "---",
     "",
     "## Steps",

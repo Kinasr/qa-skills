@@ -74,6 +74,10 @@
 // the context its modules share (`ctx.stack`: `scan` and `/qa-sync`); a command with no shared
 // context (`/qa-init`, `brief`, `/qa-impact`'s report) resolves at its own entry. A resolution is
 // kept per repository, so a stack loads once per process.
+//
+// The carrier names a stack reads and writes are declared beside its descriptor
+// (`stacks/descriptors.mjs`, `stackCarriers`), clear of its parser: `check-file`, `scan` and
+// `/qa-init` judge an `annotation_map` carrier while the adapter cannot load (ADR-0022).
 import { KOTLIN_JUNIT5 } from "./stacks/kotlin-junit5.mjs";
 import { NO_ADAPTER_WORDS } from "./stacks/no-adapter.mjs";
 import { TS_PLAYWRIGHT } from "./stacks/ts-playwright.mjs";

@@ -4,8 +4,9 @@
 // disk, and a bare re-run fills only the files still empty.
 //
 // For each case of the reply it mints the `tc_` Key, writes the Delegate's `automatable`, the
-// level, the roles, `covers` and `generated: {by: delegate:<label>, at}`, with no `sources` and no `review`, then
-// the steps and the Expected-result paragraph, after the file's last line. In every mode the
+// level binding when it has one, the roles, `covers` and `generated: {by: delegate:<label>, at}`, with no
+// `sources`, no `review` and no binding reason, then the steps and the Expected-result paragraph, after
+// the file's last line; the binding reason stays in the Run's written record. In every mode the
 // new cases are appended: a fill's file was empty, an expand's keeps every case it had, and a
 // regenerate's first loses the entries its unit replaces (`replace`: only unreviewed cases with no
 // effective Tracker key, chosen when the brief was built), and their Keys go to the Feature's `retired:`. The whole file goes through `check-file` and
@@ -29,6 +30,8 @@ import { backfill } from "./pin-digest.mjs";
 import { buildIndex, loadWorkingTree, qaRel, rootConfig } from "./qa-index.mjs";
 import { line, role } from "./render.mjs";
 import { localDate } from "./scan.mjs";
+import { refuseUnreadSchema } from "./schema-guard.mjs";
+import { LAYER_FREE_CASE_SCHEMA_VERSION } from "./schema.mjs";
 import { retiredWith, tombstonesOf } from "./tombstones.mjs";
 
 /** @import { EditResult, DesignBrief } from "./design-unit.mjs"; */
@@ -44,10 +47,14 @@ import { retiredWith, tombstonesOf } from "./tombstones.mjs";
  * @typedef {object} FillOutcome
  * @property {"awaiting_rules"} [outcome] - the terminal outcome of a proposal-only reply; absent
  *   on every other reply
+ * @property {import("./design-contract.mjs").DesignQuestion[]} [questions] - held proposals, never durable cases
+ * @property {Record<string, string>} [question_basis] - Rule claims when the brief was made
  * @property {boolean} written - whether the file was written
  * @property {number} cases_written
+ * @property {{ key: string, level: import("./case-fields.mjs").CaseLevel, reason: string, unbound?: boolean }[]} [bindings] - bindings and reasons held only in the Run
  * @property {string[]} keys - the minted Keys of the written cases
  * @property {string[]} [not_automatable] - Keys written `automatable: false`
+ * @property {string[]} [not_manual] - Keys written `manual: false`
  * @property {string[]} [replaced] - the Keys a regenerate's file lost
  * @property {Array<Omit<Override, "summary"> & { key: string }>} [overridden] - the written cases
  *   that repeat a stored case and the engineer stated why they are a distinct pass, by their minted Key
@@ -96,6 +103,7 @@ export function writeFill(unit, accepted, { delegate, written }) {
       result = { written: false, cases_written: 0, keys: [], reason: "io", problems: [/** @type {Error} */ (e).message] };
     }
   }
+  if (accepted.questions?.length) result = { ...result, questions: accepted.questions, question_basis: unit.rule_claims };
   result = /** @type {WrittenRecord} */ ({ scenario: unit.scenario, file: unit.file, ...result });
   try {
     if (written) writeFileSync(written, `${JSON.stringify(result, null, 2)}\n`);
@@ -121,6 +129,8 @@ function fill(unit, accepted, delegate) {
    * @returns {FillOutcome}
    */
   const refused = (reason, problems, duplicates) => ({ written: false, cases_written: 0, keys: [], reason, problems, ...(duplicates && { duplicates }) });
+  const schema = refuseUnreadSchema(unit.root, LAYER_FREE_CASE_SCHEMA_VERSION);
+  if (schema) throw new Error(schema.json.text);
   const current = existsSync(unit.path) ? readFileSync(unit.path, "utf8") : null;
   if (current === null) return refused("missing", [`${unit.file} no longer exists`]);
   if (digest(current) !== unit.digest) return refused("changed", [`${unit.file} changed after its brief was built; it is not written over`]);
@@ -176,11 +186,14 @@ function fill(unit, accepted, delegate) {
   if (text !== current) writeFileSync(unit.path, backfill(unit.root, unit.file, text));
   const droppedLabels = (accepted.dropped_labels ?? []).filter((d) => !dropped.has(d.case)).map(({ case: n, ...d }) => ({ key: minted.keys[place(n)], ...d }));
   const notAutomatable = minted.keys.filter((_, i) => proposals[i].automatable === false);
+  const notManual = minted.keys.filter((_, i) => proposals[i].manual === false);
   return {
     written: true,
     cases_written: entries.length,
     keys: minted.keys,
+    bindings: proposals.flatMap((c, i) => c.level === undefined ? [] : [{ key: minted.keys[i], level: c.level, reason: /** @type {string} */ (c.binding_reason) }]),
     not_automatable: notAutomatable,
+    not_manual: notManual,
     ...(replace.length && { replaced: replace }),
     ...(repeated.length && { duplicates: repeated }),
     ...(droppedLabels.length && { dropped_labels: droppedLabels }),
@@ -254,7 +267,8 @@ function renderCase(key, c, { by, at }) {
   const fields = [
     ["key", key],
     ["automatable", c.automatable],
-    ["level", c.level],
+    ...(c.manual === false ? [/** @type {[string, unknown]} */ (["manual", false])] : []),
+    ...(c.level !== undefined ? [/** @type {[string, unknown]} */ (["level", c.level])] : []),
     ...(c.roles.length ? [/** @type {[string, unknown]} */ (["roles", c.roles])] : []),
     ["covers", c.covers],
     ...(c.relies_on?.length ? [/** @type {[string, unknown]} */ (["relies_on", c.relies_on])] : []),

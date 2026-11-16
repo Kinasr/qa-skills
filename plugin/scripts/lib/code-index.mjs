@@ -50,6 +50,7 @@ import { PATTERN, prefixFits } from "./keys.mjs";
  *   trackerKeys: CodeKey[],
  *   parameterised: boolean,
  *   disabled: boolean,
+ *   end?: number,
  * }} IndexedFunction
  */
 
@@ -105,14 +106,15 @@ import { PATTERN, prefixFits } from "./keys.mjs";
 
 // The code index over every existing module path (a missing one is `scan-integrity`'s error):
 //   files      number of source files read
-//   functions  [{file, line, name, class, package, classes, automationKeys, trackerKeys, parameterised, disabled}]
+//   functions  [{file, line, name, class, package, classes, automationKeys, trackerKeys, parameterised, disabled, end}]
 //   classes    [{file, line, name, path, trackerKeys, keyPrefixes, disabled}]
 // `file` is relative to the repository. `package` is the file's package declaration (empty when it
 // has none), so a JVM runner can select `<pkg>.<Class>.<method>`. `automationKeys` and
 // `trackerKeys` are `[{key, line}]`
 // (the carrier's line), as are `keyPrefixes`, the values of the `automation_key_prefix` carrier
 // (ADR-0013); `classes` is the function's enclosing classes, outermost first. A function is
-// `disabled` when it or an enclosing class is. Only tests are listed (each one an Automation, keyed
+// `disabled` when it or an enclosing class is. `end` is the line closing the function's own body,
+// when the adapter reports one. Only tests are listed (each one an Automation, keyed
 // or not): functions the adapter calls a test, or that carry a mapped role's key.
 //
 // `adapter` is the stack's (lib/stack.mjs), and `patterns` each role's key test (`keyPatterns`): a
@@ -196,6 +198,7 @@ export function indexSource(text, file, annotationMap, adapter, patterns) {
       trackerKeys,
       parameterised: (/** @type {CodeIndexAdapter} */ (adapter)).parameterised(f),
       disabled: (/** @type {CodeIndexAdapter} */ (adapter)).disabled(f) || enclosing.some((c) => c.disabled),
+      ...(typeof f.end === "number" && { end: f.end }),
     });
   }
   const header = adapter.fileKeyPrefix ? { file, keyPrefixes: /** @type {{ keyPrefixes: CodeKey[] }} */ (parsed.header).keyPrefixes } : null;

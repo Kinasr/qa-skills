@@ -79,7 +79,7 @@ export const command = {
     const model = { layout: 'show', stamp: { generated_at: new Date().toISOString(), head: resolveRef(qaRoot, 'HEAD'), dirty: isUncommitted(qaRoot, '.'), root: qaRoot, refresh: `/qa-show${key ? ` ${key}` : ''}` }, migration, schema, features, labels: { ...labelDefinitions(index.project?.data ?? {}), levels: [...config.levels] }, errors: showErrors(null, acquisition), scope: key ?? null };
     const page = writeSnapshot({ root: qaRoot, page: 'show', key, html: renderCardPage(immutableShow(model)) });
     /** @type {ShowCommandOutput} */
-    const json = { ok: !('error' in page), knowledge_page: 'path' in page ? page : null, migration, schema, refusal: 'error' in page ? { code: 'snapshot_write', message: page.error } : null };
+    const json = { ok: !('error' in page), knowledge_page: 'path' in page ? page : null, migration, schema, refusal: 'error' in page ? { code: /** @type {{ refusal?: { code?: string } }} */ (page).refusal?.code ?? 'snapshot_write', message: page.error } : null };
     return { exit: 'error' in page ? 1 : 0, json };
   },
 };

@@ -11,12 +11,21 @@
 //     report order within its `spec.id` and `projectId`;
 //   - an unmatched `--grep` exits 1 with `No tests found` and an unmatched list line exits 0 with
 //     zero suites: both are `no-result`, never a runner error.
+//
+// Paths are Playwright's, not the working directory's: a `--test-list` line and a report's
+// `spec.file` are relative to `config.rootDir`, which is the config's top-level `testDir` when one
+// is set. A list selection therefore asks Playwright for its root first, and the parser reads the
+// root from the report it is given.
 import { spawnSync } from "node:child_process";
-import { readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, relative, resolve, sep } from "node:path";
+import { spawnNodeCli } from "../platform.mjs";
+import { PLAYWRIGHT_RUNNER_LAUNCHER } from "../platform-runner.mjs";
 /**
  * @import { AutomationAttempt, AutomationBlockedReason, AutomationSelection, RunnerResult } from "../test-runner.mjs"
  * @import { TestRunner } from "../knowledge-file.mjs"
+ * @import { PlatformRefusal } from "../platform.mjs"
  */
 
 /**
@@ -52,7 +61,11 @@ import { join, relative, resolve, sep } from "node:path";
 
 /**
  * The JSON reporter's file.
- * @typedef {{ suites: PwSuite[], errors?: { message?: string }[] }} PwReport
+ * @typedef {{
+ *   config?: { rootDir?: string },
+ *   suites: PwSuite[],
+ *   errors?: { message?: string }[],
+ * }} PwReport
  */
 
 /**
@@ -72,11 +85,42 @@ import { join, relative, resolve, sep } from "node:path";
  *   env: Record<string, string | undefined>,
  *   retries: number,
  *   repeats?: number,
+ *   platform?: NodeJS.Platform,
  * }} RunOptions
+ */
+
+/**
+ * The launcher this platform starts, before the adapter appends its own arguments.
+ * @typedef {{ file: string, args: string[] }} Launch
+ */
+
+/**
+ * A launcher the platform module refuses to start.
+ * @typedef {{ refusal: PlatformRefusal }} LaunchRefusal
  */
 
 /** @param {string} text @returns {string} */
 const escapeRegex = (text) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+// Playwright derives its root from its own working directory, which the OS reports with symlinks
+// resolved, while the repository path can keep them: compare both through the same real path.
+/** @param {string} path @returns {string} */
+function canonical(path) {
+  try {
+    return realpathSync(path);
+  } catch {
+    return resolve(path);
+  }
+}
+
+/**
+ * A spec's path relative to a base, in the posix form Playwright's list lines and reports use.
+ * @param {string} base
+ * @param {string} repo
+ * @param {string} file The spec's repository-relative path.
+ * @returns {string}
+ */
+const posixRelative = (base, repo, file) => relative(canonical(base), join(canonical(repo), file)).split(sep).join("/");
 
 /** @param {string} version @param {number} minor @returns {boolean} */
 const atLeast = (version, minor) => {
@@ -88,20 +132,82 @@ const atLeast = (version, minor) => {
 /** @type {Map<string, string>} */
 const versions = new Map();
 
+// Playwright writes its config only inside a JSON report, so the root is asked for with an empty
+// `--list` run: one extra process per Run, not per Automation, and only for a `--test-list` line.
+/** @type {Map<string, string | undefined>} */
+const roots = new Map();
+
+// The probe's single list line names a file no project holds, so the list run only loads the config.
+const ROOT_PROBE_LINE = "qa-skills-root-probe.spec.ts";
+
 /**
- * @param {string[]} launcher
+ * The launcher this platform starts: unchanged on POSIX, and on win32 the project's
+ * `@playwright/test` through Node, a configured `.exe` directly, or a typed refusal for a `.cmd`
+ * (see `platform-runner.mjs`). One resolution per Run serves all three spawns.
+ * @param {readonly string[]} launcher
+ * @param {string} cwd
+ * @param {NodeJS.Platform} platform
+ * @returns {Launch | LaunchRefusal}
+ */
+function runnerLaunch(launcher, cwd, platform) {
+  const resolved = spawnNodeCli(
+    { kind: "playwright-runner", file: launcher[0], args: launcher.slice(1), options: {}, cwd },
+    { platform },
+  );
+  return resolved.refusal ? { refusal: resolved.refusal } : { file: resolved.file, args: resolved.args };
+}
+
+/**
+ * The selector the record shows for a rendered selection.
+ * @param {PwSelection} rendered
+ * @param {AutomationSelection} selection
+ * @returns {string}
+ */
+const selectorOf = (rendered, selection) => (rendered.kind === "grep" ? `@${selection.id}` : rendered.selector);
+
+/**
+ * @param {Launch} launch
  * @param {string} cwd
  * @param {Record<string, string | undefined>} env
  * @returns {string}
  */
-function playwrightVersion(launcher, cwd, env) {
-  const key = `${launcher.join("\0")}\0${cwd}`;
+function playwrightVersion(launch, cwd, env) {
+  const key = `${[launch.file, ...launch.args].join("\0")}\0${cwd}`;
   const known = versions.get(key);
   if (known) return known;
-  const probe = spawnSync(launcher[0], [...launcher.slice(1), "--version"], { cwd, env, encoding: "utf8", shell: false });
+  const probe = spawnSync(launch.file, [...launch.args, "--version"], { cwd, env, encoding: "utf8", shell: false });
   const version = probe.status === 0 ? /\b(\d+\.\d+\.\d+)\b/.exec(probe.stdout ?? "")?.[1] ?? "0.0.0" : "0.0.0";
   versions.set(key, version);
   return version;
+}
+
+/**
+ * Playwright's root directory, the base its `--test-list` lines and report paths are relative to.
+ * @param {Launch} launch
+ * @param {string[]} args The runner's own extra arguments, so a `--config` override is honoured.
+ * @param {string} cwd
+ * @param {Record<string, string | undefined>} env
+ * @returns {string | undefined} The root, or undefined when the probe cannot read one.
+ */
+function playwrightRoot(launch, args, cwd, env) {
+  const key = `${[launch.file, ...launch.args].join("\0")}\0${args.join("\0")}\0${cwd}`;
+  if (roots.has(key)) return roots.get(key);
+  const dir = mkdtempSync(join(tmpdir(), "qa-skills-playwright-root-"));
+  try {
+    const list = join(dir, "test-list.txt");
+    writeFileSync(list, `${ROOT_PROBE_LINE}\n`);
+    const report = join(dir, "report.json");
+    spawnSync(launch.file, [...launch.args, ...args, "--list", "--test-list", list, "--reporter=json"], {
+      cwd, env: { ...env, PLAYWRIGHT_JSON_OUTPUT_FILE: report }, encoding: "utf8", shell: false,
+    });
+    const root = /** @type {PwReport | undefined} */ (JSON.parse(readFileSync(report, "utf8")))?.config?.rootDir;
+    roots.set(key, typeof root === "string" && root.length ? root : undefined);
+  } catch {
+    roots.set(key, undefined);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+  return roots.get(key);
 }
 
 // A literal title line is faithful only when every component is a plain, trimmed title: the list
@@ -112,6 +218,10 @@ const listable = (selection) =>
   selection.literal && selection.titles.length > 0 &&
   selection.titles.every((title) => title.length > 0 && title.trim() === title && !title.includes("›"));
 
+// Whether the selection becomes a `--test-list` line, and so needs Playwright's root before the run.
+/** @param {AutomationSelection} selection @param {string} version @returns {boolean} */
+const selectionsList = (selection, version) => listable(selection) && atLeast(version, 56);
+
 /**
  * The selection as Playwright reads it.
  * @param {AutomationSelection} selection
@@ -120,7 +230,7 @@ const listable = (selection) =>
  * @returns {PwSelection}
  */
 export function playwrightSelection(selection, version, file) {
-  if (listable(selection) && atLeast(version, 56)) return { kind: "list", selector: [file, ...selection.titles].join(" › ") };
+  if (selectionsList(selection, version)) return { kind: "list", selector: [file, ...selection.titles].join(" › ") };
   if (selection.tagged) return { kind: "grep", selector: `@(${escapeRegex(selection.id)})(\\s|$)` };
   return { kind: "line", selector: `${file}:${selection.line}` };
 }
@@ -150,7 +260,7 @@ const noMatch = (errors) => errors.every((error) => /\bNo tests found\b/i.test(e
  * `repeatIndex`.
  * @param {unknown} report
  * @param {AutomationSelection} selection
- * @param {string} cwd Playwright's root directory.
+ * @param {string} cwd The working directory, the root only when the report names none.
  * @param {string} repo The repository the plan's `file` is relative to.
  * @returns {RunnerResult}
  */
@@ -158,7 +268,9 @@ export function parseReport(report, selection, cwd, repo) {
   /** @type {RunnerResult} */
   const parsed = { instances: {}, diagnostics: [] };
   if (!usable(report)) return { instances: {}, reason: "runner-error", diagnostics: ["The runner report is not a Playwright JSON report"] };
-  const file = relative(cwd, join(repo, selection.file)).split(sep).join("/");
+  const named = report.config?.rootDir;
+  const root = typeof named === "string" && named.length ? named : cwd;
+  const file = posixRelative(root, repo, selection.file);
   /** @type {Map<string, number>} */
   const occurrences = new Map();
   /** @param {AutomationBlockedReason} reason */
@@ -169,7 +281,7 @@ export function parseReport(report, selection, cwd, repo) {
   const walk = (suites) => {
     for (const suite of suites) {
       for (const spec of suite.specs ?? []) {
-        if (resolve(cwd, spec.file) !== resolve(cwd, file) || spec.line !== selection.line) continue;
+        if (resolve(root, spec.file) !== resolve(root, file) || spec.line !== selection.line) continue;
         for (const test of spec.tests) {
           const base = `${spec.id}:${test.projectId}`;
           const occurrence = occurrences.get(base) ?? 0;
@@ -215,13 +327,26 @@ export function parseReport(report, selection, cwd, repo) {
  * @param {RunOptions} options
  * @returns {{ parsed: RunnerResult, selector: string }}
  */
-export function runPlaywright({ selection, runner, repo, dir, origin, env, retries, repeats }) {
+export function runPlaywright({ selection, runner, repo, dir, origin, env, retries, repeats, platform = process.platform }) {
   const cwd = join(repo, runner.dir);
-  const launcher = runner.launcher ?? ["npx", "playwright", "test"];
+  const launcher = runner.launcher ?? PLAYWRIGHT_RUNNER_LAUNCHER;
+  const launch = runnerLaunch(launcher, cwd, platform);
+  // A launcher the platform module refuses never starts a process: the Automation is Blocked
+  // `runner-error` with the refusal as its diagnostic, as any other launcher problem is.
+  if ("refusal" in launch) {
+    const file = posixRelative(cwd, repo, selection.file);
+    return {
+      parsed: { instances: {}, reason: "runner-error", diagnostics: [launch.refusal.message] },
+      selector: selectorOf(playwrightSelection(selection, "0.0.0", file), selection),
+    };
+  }
   const inherited = { ...env, ...Object.fromEntries(runner.target_env.map((name) => [name, origin])) };
-  const version = playwrightVersion(launcher, cwd, inherited);
-  const file = relative(cwd, join(repo, selection.file)).split(sep).join("/");
-  const rendered = playwrightSelection(selection, version, file);
+  const version = playwrightVersion(launch, cwd, inherited);
+  const args = runner.args ?? [];
+  // Only a `--test-list` line is rendered from Playwright's root; the location fallback stays
+  // relative to the working directory, where Playwright matches it against absolute paths.
+  const probed = selectionsList(selection, version) ? playwrightRoot(launch, args, cwd, inherited) : undefined;
+  const rendered = playwrightSelection(selection, version, posixRelative(probed ?? cwd, repo, selection.file));
   /** @type {string[]} */
   let filter;
   if (rendered.kind === "list") {
@@ -231,11 +356,11 @@ export function runPlaywright({ selection, runner, repo, dir, origin, env, retri
   } else if (rendered.kind === "grep") filter = ["--grep", rendered.selector];
   else filter = [rendered.selector];
   const reporter = atLeast(version, 63) ? "--add-reporter=json" : "--reporter=json";
-  const args = [
-    ...launcher.slice(1), ...(runner.args ?? []), ...filter, reporter, "--output", join(dir, "artifacts"), `--retries=${retries}`, ...(repeats ? [`--repeat-each=${repeats}`, "--max-failures=1", "--workers=1"] : []),
+  const argv = [
+    ...launch.args, ...args, ...filter, reporter, "--output", join(dir, "artifacts"), `--retries=${retries}`, ...(repeats ? [`--repeat-each=${repeats}`, "--max-failures=1", "--workers=1"] : []),
   ];
   const reportPath = join(dir, "report.json");
-  const child = spawnSync(launcher[0], args, { cwd, env: { ...inherited, PLAYWRIGHT_JSON_OUTPUT_FILE: reportPath }, encoding: "utf8", shell: false });
+  const child = spawnSync(launch.file, argv, { cwd, env: { ...inherited, PLAYWRIGHT_JSON_OUTPUT_FILE: reportPath }, encoding: "utf8", shell: false });
   /** @type {RunnerResult} */
   let parsed;
   try {
@@ -248,5 +373,5 @@ export function runPlaywright({ selection, runner, repo, dir, origin, env, retri
   parsed.diagnostics.push(...[child.stdout ?? "", child.stderr ?? ""].map((text) => text.trim()).filter(Boolean));
   // The record names the tag it ran. The end-bounded pattern is argv-only: the record keeps the
   // plain tag, and an ambiguous record selector would be worse than a narrower one.
-  return { parsed, selector: rendered.kind === "grep" ? `@${selection.id}` : rendered.selector };
+  return { parsed, selector: selectorOf(rendered, selection) };
 }

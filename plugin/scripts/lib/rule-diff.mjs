@@ -94,29 +94,22 @@ export function rulesChangedAcross(then, now) {
   });
 }
 
-// The elaboration of one stripped Rule entry: its lines after the heading and the field block at
-// the head of its body, trimmed. Field lines are only skipped in the contiguous block `readFields`
-// recognises, so prose that begins with the same words stays elaboration.
-/**
- * @param {string} text
- * @returns {string}
- */
-function elaborationOf(text) {
-  const lines = text.replace(/\r\n/g, "\n").split("\n");
-  let at = 1;
-  while (at < lines.length && !lines[at].trim()) at++;
-  while (at < lines.length && /^(?:Waived|Depends on):\s*/.test(lines[at])) at++;
-  return lines.slice(at).join("\n").trim();
-}
-
+// The parsed parts of one Rule entry: the statement, the elaboration it exposes, its Waiver and
+// its Dependencies. The elaboration comes from the parsed entry, dedented by the item's content
+// indent, so a list-form `Waived:` or `Depends on:` line is never read as elaboration.
 /**
  * @param {ParsedRule} rule
- * @param {string} text
+ * @returns {{
+ *   statement: string,
+ *   elaboration: string,
+ *   waiver: string | null,
+ *   depends_on: string[],
+ * }}
  */
-function parts(rule, text) {
+function parts(rule) {
   return {
     statement: rule.statement,
-    elaboration: elaborationOf(text),
+    elaboration: rule.elaboration,
     waiver: rule.waiver,
     depends_on: (readDependsOn(rule)?.refs ?? []).map(formatRuleRef),
   };
@@ -138,8 +131,8 @@ const sameRefs = (a, b) => a.length === b.length && a.every((ref, i) => ref === 
  */
 export function ruleEdit(before, after, textBefore, textAfter) {
   if (!ruleChanged(textBefore, textAfter)) return null;
-  const was = parts(before, textBefore);
-  const now = parts(after, textAfter);
+  const was = parts(before);
+  const now = parts(after);
   /** @type {RuleEditKind[]} */
   const kinds = [];
   /** @type {RuleEdit["changes"]} */

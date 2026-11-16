@@ -10,6 +10,7 @@ prints `{ok: false, ...}` and never writes. A usage error exits 2.
 
 ```
 node plugin/scripts/scan.mjs check-file <path> [--stdin] [--root <qa-dir>]
+node plugin/scripts/scan.mjs commit --stdin [--confirmed] [--root <qa-dir>]
 node plugin/scripts/scan.mjs mint <tc|ts|su|aut|rule|boundary|bg> [--count <n>] [--root <qa-dir>] [--feature <key>] [--prefix <P>]
 node plugin/scripts/scan.mjs migrate-keys [--levels [--map-level <from=level+tag,...>]] [--root <qa-dir>]
 node plugin/scripts/scan.mjs migration-status [--root <qa-dir>]
@@ -47,7 +48,10 @@ node plugin/scripts/scan.mjs design agree <scope> --stdin [--root <qa-dir>]
 node plugin/scripts/scan.mjs design split <feature> --stdin [--dir <run-dir>] [--root <qa-dir>]
 node plugin/scripts/scan.mjs design override --stdin [--dir <run-dir>]
 node plugin/scripts/scan.mjs design plan <feature> [<scenario>] [--expand | --regenerate] [--dir <run-dir>] [--root <qa-dir>]
+node plugin/scripts/scan.mjs design unbind --dir <run-dir> <case-key>
+node plugin/scripts/scan.mjs design resume --dir <run-dir> [--root <qa-dir>]
 node plugin/scripts/scan.mjs design report --dir <run-dir>
+node plugin/scripts/scan.mjs design keep --dir <run-dir> --stdin
 node plugin/scripts/scan.mjs design walk --dir <run-dir> [--by human:<name>] [--case <key>]
 node plugin/scripts/scan.mjs design triage --dir <run-dir> --stdin [--case <key>]
 node plugin/scripts/scan.mjs design checkpoint --dir <run-dir>
@@ -68,25 +72,27 @@ node plugin/scripts/scan.mjs init add-role <name>... [--root <qa-dir>]
 node plugin/scripts/scan.mjs train evidence [<target>] [<scenario-key>] [--diff <commit-ish>] [--stack <root>] [--from-code] [--relearn] [--facet <facet>[,<facet>]] [--root <qa-dir>]
 node plugin/scripts/scan.mjs train check [<target>] --stdin [--root <qa-dir>]
 node plugin/scripts/scan.mjs train check categories [--stdin] [--root <qa-dir>]
-node plugin/scripts/scan.mjs scout brief ui <url> <request> [--dir <run-dir>] [--root <qa-dir>]
+node plugin/scripts/scan.mjs train auth-ignore <line> [--root <qa-dir>]
+node plugin/scripts/scan.mjs scout brief ui <url> <request> [--signed-out] [--dir <run-dir>] [--root <qa-dir>]
 node plugin/scripts/scan.mjs scout brief tracker --dir <run-dir> [--root <qa-dir>]
 node plugin/scripts/scan.mjs scout brief publisher --dir <run-dir> [--root <qa-dir>]
 node plugin/scripts/scan.mjs scout ingest --dir <run-dir> [--root <qa-dir>]
 node plugin/scripts/scan.mjs scout login-steps <url> <login_state> [--root <qa-dir>]
 node plugin/scripts/scan.mjs scout password-steps <via> [--root <qa-dir>]
+node plugin/scripts/scan.mjs scout header-steps <header_via> [--root <qa-dir>]
 node plugin/scripts/scan.mjs execute plan [<scope>...] [tag:<name>...] [level:<name>...] [target:<slug>] [--root <qa-dir>]
-node plugin/scripts/scan.mjs execute confirm --dir <run-dir>
+node plugin/scripts/scan.mjs execute confirm --dir <run-dir>... [--stdin]
 node plugin/scripts/scan.mjs execute open --dir <run-dir> --execution <id> [--root <qa-dir>]
 node plugin/scripts/scan.mjs execute close --dir <run-dir> --execution <id>
 node plugin/scripts/scan.mjs execute brief --dir <run-dir> --execution <id> [--root <qa-dir>]
 node plugin/scripts/scan.mjs execute ingest --dir <run-dir> [--root <qa-dir>]
 node plugin/scripts/scan.mjs execute next --dir <run-dir> [--root <qa-dir>]
 node plugin/scripts/scan.mjs execute resume --dir <run-dir> --note <acc> [--skip]
-node plugin/scripts/scan.mjs execute record --dir <run-dir> --execution <id> --status ok|failed|timeout|refused|quota
+node plugin/scripts/scan.mjs execute record --dir <run-dir> --execution <id> --status ok|failed|timeout|refused|quota [--reason-file <path>]
 node plugin/scripts/scan.mjs execute automation --dir <run-dir> [--root <qa-dir>]
 node plugin/scripts/scan.mjs execute follow-ups --dir <run-dir> [--root <qa-dir>]
 node plugin/scripts/scan.mjs execute summary --dir <run-dir> [--root <qa-dir>]
-node plugin/scripts/scan.mjs codegen plan [<scope>...] [tag:<name>...] [level:<name>...] [target:<slug>] [--stack <root>] [--pr] [--root <qa-dir>]
+node plugin/scripts/scan.mjs codegen plan [<scope>...] [tag:<name>...] [level:<name>...] [target:<slug>] [--stack <root>] [--choices <json>] [--pr] [--root <qa-dir>]
 node plugin/scripts/scan.mjs codegen start --dir <run-dir>
 node plugin/scripts/scan.mjs codegen verify --dir <run-dir> --item <id> --hypothesis <line>
 node plugin/scripts/scan.mjs codegen done --dir <run-dir> --item <id> --expects <json>
@@ -98,7 +104,7 @@ node plugin/scripts/scan.mjs bug read --run <run-dir> --item <item> or --case <c
 node plugin/scripts/scan.mjs bug write --run <run-dir> --item <item> or --case <case-key> [--cause <cause>] --summary <line> [--description <lines>] [--root <qa-dir>]
 node plugin/scripts/scan.mjs bug discard <bg_key>... [--root <qa-dir>]
 node plugin/scripts/scan.mjs tester do <execution-id> <role> <command> [<arg>…] --dir <run-dir>
-node plugin/scripts/scan.mjs tester request <execution-id> <role> <METHOD> <url> [--query k=v]… [--header Name:value]… [--json <body>] --dir <run-dir>
+node plugin/scripts/scan.mjs tester request <execution-id> <role> <METHOD> <url> [--query k=v]… [--header Name:value]… [--json <body>] [--auth absent|invalid|expired] --dir <run-dir>
 node plugin/scripts/scan.mjs codefix plan [<Automation-or-Case key>…] [target:<slug>] [--pr] [--flaky] [--dir <run-dir>] [--root <qa-dir>]
 node plugin/scripts/scan.mjs codefix start --dir <run-dir> --item <id> [--root <qa-dir>]
 node plugin/scripts/scan.mjs codefix verify --dir <run-dir> --item <id> --hypothesis <text> [--root <qa-dir>]
@@ -115,6 +121,14 @@ node plugin/scripts/scan.mjs codefix pr-record --dir <run-dir> (--url <url> | --
 `--root` names the `.qa/` directory (default `./.qa`). A `.qa/` whose `project.md` declares a
 newer `schema_version` than this CLI reads, or a malformed one, is refused by every command that
 writes into the repository, writing nothing; `scan` runs on, warning of a newer one.
+
+Every action that takes `--stdin` also takes `--input <path>`, which reads the same bytes from a
+file; the two are never given together. The skills and the briefs the CLI writes use `--input`: the
+agent writes the input to a file outside the repository, then runs one plain
+`node <plugin>/scripts/scan.mjs <mode> ... --input <path>` line, with absolute paths and no pipe,
+heredoc, `&&` or `;` chain, variable prefix or `cd`. So the one allow rule `Bash(node:*)` covers
+every call the skills make to the CLI. `npm run lint:skills` fails a skill that shows one of those
+forms, or `--stdin`.
 
 `--dir` names a run directory. The commands that make one (`init card`, `design split`, `design override` and
 `design plan`, `impact plan`, and the `sync` and `publish` `scope` steps) make a fresh OS temp dir
@@ -140,7 +154,7 @@ a rerun on a migrated `.qa/` reports `changed: false`. **To recover an interrupt
 
 After committing the Key migration, run `migrate-keys --levels` to reach schema 4. It copies a
 Scenario's level onto cases lacking one, preserves case overrides, and removes the Scenario level.
-Every case then requires one project level. An unknown legacy level refuses with
+At schema 4, every case requires one project level. An unknown legacy level refuses with
 `level_mapping_required`, listing the missing mappings, execution-mode changes and potential
 new duplicate cases; nothing is written. Supply `--map-level e2e=ui+e2e` (comma-separated for
 several mappings) to choose a project level and a Tag. The Tag is declared with an empty meaning
@@ -150,7 +164,31 @@ so ask the engineer for a meaning with `/qa-init` maintenance. A Scenario whose 
 refuses with `level_rewrite_failed`, naming the file and the edit `errors`. Verified fresh
 Reviews and Dismissals receive a carried digest and `migrated: 4`, retaining their original commit,
 author and date. Stale and unverifiable pins stay untouched; the JSON `pins` lists each outcome.
-Only this migration carries pins across a rewrite. Review and commit its changes separately.
+Only this migration and the schema 6 Rule-list step carry pins across a rewrite. Review and commit their changes separately.
+
+After reaching schema 4, `migrate-keys` advances to schema 5 by changing only the version marker:
+it rewrites no case and re-pins no Review or Dismissal. A case may omit `level` (a Layer-free
+case), name one project level slug, or name a non-empty list of distinct `stack.levels` members.
+Unknown, duplicate, empty or non-slug bindings are shape errors at the file-write check. Claim
+comparisons and digests treat a one-item list as its slug and sort longer lists; removing or
+changing a binding still changes the claim. Below schema 4, a case with no level continues to
+inherit its Scenario's level. An install that reads only schema 4 refuses schema 5 through the
+existing version guard.
+
+The next plain `migrate-keys` at schema 5 performs the schema 6 step: it rewrites every heading-form
+Rule and Boundary into a numbered list item under `## Rules` or `## Boundaries`, word for word,
+numbering from 1 in file order per section and indenting fields and elaboration to the item's
+content. Features already in list form are left alone. A heading outside its section refuses with
+`rule_outside_section`, naming the file and line, rather than moving text. Prose between a section
+heading and its first entry refuses with `prose_in_section`, naming the file and line: move that
+prose above the section heading or into a Rule's elaboration, then run the migration again. Every
+result is checked before anything is written. Comparisons read a neutral canonical form of each
+entry, so the stored digests change once: the step recomputes each Feature's `coverage_digest`,
+re-pins every fresh Watermark to its new digest, and re-pins every fresh Review and Dismissal to the
+new digest with `migrated: 6`; a pin that was already Stale stays as it was. The JSON `pins` lists
+each outcome.
+New projects start at schema 6 and write the list form. At schema 6, `check` reports a Rule or
+Boundary still written as a `###` heading and names `migrate-keys` as the fix.
 
 Writers declare a minimum schema and refuse below it with `schema_migration_required`, naming
 the first migration to run. Design and execution require schema 4; Feature writers retain
@@ -169,10 +207,20 @@ warn using the ordered `migrations` when pending and continue their command.
 `scan` is the global relational pass. Its JSON holds the Key index (`index`, with the code
 index's `automations` when code binding ran), every result in `results` labelled by `kind`
 (`integrity_error`, `unknown_key`, `outcome_gap`, `divergence`, `review_overdue`,
-`train_warning`, `binding_proposal`) with a `code` naming the check, `counts` per kind, and
-`run_health` for what the run could not do (such as `no scanner; code binding skipped`). It never
-writes and always exits 0; only a usage error exits 2. Each concern is a pass module
+`case_warning`, `train_warning`, `config_warning`, `binding_proposal`) with a `code` naming the
+check, `counts` per kind, and `run_health` for what the run could not do (such as `no scanner; code
+binding skipped`). `config_warning` `module_path_absent` names a `module_paths` entry that does not
+exist yet, which `/qa-codegen` creates; one that exists but is no directory is the
+`missing_module_path` Integrity error.
+It never writes and always exits 0; only a usage error exits 2. Each concern is a pass module
 (`plugin/scripts/lib/scan-*.mjs`) registered in `plugin/scripts/lib/scan.mjs`.
+
+`case_warning` reports Permissions drift: `partial_permission_binding` names the Test Case, its
+`missing_levels` and a message when the case covers a Rule the Feature's covered `permissions`
+Coverage line names, but its binding omits some level in `execute_levels`. A Layer-free case raises
+it with every executable level missing when two or more are executable. A case bound to every
+executable level, one covering no Permissions Rule, and a Layer-free case with one executable level
+raise none.
 
 Beside `results` it publishes two link reports, neither a Finding, so no entry of `counts` holds
 them. `uncited_cases` lists each case whose `covers` is empty, whatever its `relies_on` holds
@@ -240,7 +288,9 @@ The code index is a source scan of `module_paths` (ADR-0005). Each test stack is
 `plugin/scripts/lib/stacks/`, chosen by `project.stack` (`plugin/scripts/lib/stack.mjs`, ADR-0022): Kotlin/JUnit 5
 (`stack.language: kotlin`, a `stack.framework` naming JUnit 5) and TypeScript/Playwright Test
 (`stack.language` TypeScript or JavaScript, a `stack.framework` naming Playwright), which parses with the
-repository's own `typescript` (ADR-0023). Each reads its Key carriers' names from `annotation_map`.
+repository's own `typescript` (ADR-0023). Each reads its Key carriers' names from `annotation_map`,
+and declares the carrier forms it reads and writes beside its descriptor, clear of its parser, so
+`/qa-init` refuses and `scan` warns on an Automation-key carrier the stack cannot write.
 A result located in the code carries `function: {file, line, class, name}` or
 `class: {file, line, name, path}`, with `file` relative to the repository, instead of a `.qa/`
 `file`.
@@ -352,6 +402,11 @@ Card's prose and closing report and maps the engineer's free-form Reply to JSON 
 - in the code, the Automation-key annotations and any import or declaration they need;
 - in `.qa/`, `automates`, mirrors and intake cases and scenarios with permanent Keys and `tracker:` fields.
 
+Tracker intake accepts a case with no level: it is written Layer-free, with no `level` key. A
+tracker level it finds is offered as `offered_level` and needs an explicit `level` answer (the value,
+or `""` to decline) rather than being applied silently; a tracker level outside `project.stack.levels`
+is shown as `tracker_level` and never binds.
+
 Every `.qa/` file goes through `check-file` first. `sync` writes all or
 nothing, renamed files included (`writeAll`, `plugin/scripts/lib/changeset.mjs`), and never stages or commits. Each card section is a module
 registered in `plugin/scripts/lib/sync.mjs`; `plugin/scripts/lib/sync-json.mjs` supplies their Card data.
@@ -388,7 +443,14 @@ Updates show each field's tracker and new values and require confirmation when t
 from the Mirror. Their writes name the case by `tracker_key` and exclude status, automation status,
 issue type and marker; results are `{n,key}` or `{n,key,error}`. Successful updates refresh the
 owned Mirrored values. Prose Mirrors are optional lists of lines (or `null`), alongside optional
-`level` and `scenario` values; older Mirrors remain valid.
+`level` (a slug or a list) and `scenario` values; older Mirrors remain valid.
+
+A published `level` follows the case's claim. A Layer-free case writes none: a create omits the
+field and an update clears a level the tracker still holds. One binding writes its slug. A list
+writes several values only when the payload's `level_destinations` names one multiple-valued
+`level` field; otherwise the case is skipped with `level_list_unsupported`. Mirror comparison uses
+the canonical claim form, so a one-item list, a reordered list and a slug of the same binding never
+differ.
 
 ## Impact
 
@@ -473,6 +535,48 @@ refusals: [{code, line, ...}]}`. `walk`, `triage`, `checkpoint`, `rule-fix`, `pa
 `design` actions on the settle engine (lib/settle-walk.mjs), over the run dir `impact plan` made.
 `impact` no longer has them: each of those names is an `unknown_action` under it.
 
+`design agree` accepts scenarios without `levels`; `design state` asks no level question.
+The filler writes Layer-free cases by default. A binding is one project level slug or a non-empty
+list of distinct project slugs and requires `binding_reason` in the reply. Visual layout and
+payload contract claims bind to their layers; a denial binds to every level in `execute_levels`.
+Case writing requires schema 5. Steps state the actor's action and outcome; a button, selector,
+HTTP method or endpoint is named only when the covered Rule claims that detail.
+
+Design fills atomic coverage per Rule and interaction or journey coverage across Rules, grouped by
+manual pass. A filler can return `questions` beside its writable `cases`: each has `text`, implicated
+`rules`, and `held_case` (`summary`, `covers`, optional `preconditions` and `steps`). The held proposal
+has no invented Expected result and is not written as a Test Case. A question-only reply is
+`awaiting_rules`; a mixed reply writes its settled cases. Questions and the brief's Rule claims stay
+in the Run's written record.
+
+`design report --dir <run-dir>` returns `questions` and `question_handoff`, and writes the Run's
+`design-questions.json`. `deep-dive resume --dir <run-dir>` reads this handoff as `design_questions`
+and `open_questions`; deep-dive parks unanswered questions in the Feature's existing Open questions
+section. `design resume --dir <run-dir>` returns `held_cases`: `waiting` while Rule claims are
+unchanged or the question remains parked, otherwise `ready` with the proposal and a scoped `rerun`.
+Ready means reconsider against the new Rules, never assume an answer. Use a fresh agreement and
+Run, carrying the proposal in the agreement remarks; expand a populated scenario and fill an empty
+one. No new Finding kind is introduced.
+
+`check-reply design` also reads `check_gaps`: each `{case, needs}` names one of the reply's own
+cases by its summary and what checking its Expected result needs of the test environment. A
+malformed entry is `bad_check_gap`; one naming no case of the reply is `unknown_check_case`.
+`design report` returns them as `check_gaps` `[{scenario, label, key, case, needs}]`, `key` null
+when the Run wrote no such case, with `check_handoff` `/qa-train design`. They are never proposed
+Rules: the behaviour is already a Rule's, and only how to check it is Training's.
+
+`design report --dir <run-dir>` lists `bindings`: each written bound case's `key`, `scenario`,
+`file`, canonical `level` and `reason`. Reasons live only in the Run's `<scenario>.written.json`,
+never on the case. Cases are written to the working tree as replies arrive. `case_warnings` lists
+each written case the scan's `partial_permission_binding` warns about: its `key`, `scenario`, `file`
+and `missing_levels`, so binding review shows it before Review. Before a case is kept
+by commit or Review, `design unbind --dir <run-dir> <case-key>` removes its `level` and records
+`unbound: true` beside its original binding and reason in the Run. Repeating it is safe. It refuses
+a case the Run did not write, a missing or ambiguous case, a committed or reviewed case, unreadable
+repository history, or an edit that fails file checking; refusals change nothing.
+`missing_levels` contains `agreed_level_without_cases` only for levels explicitly named in the
+agreement; omitting levels creates no such obligation.
+
 `design` briefs and reports carry the project's labels (ADR-0045). `brief design` adds `labels`
 `{tags, retiredTags, customFields}` and the brief text lists only the Tags that have a meaning and each
 Custom field's description and active values. `check-reply design` reads a case's `tags` and each Custom
@@ -493,13 +597,15 @@ is retired, so it is not given to a new case).
 of Tag to its one-line meaning, which may be empty), `retired_tags` (a list) and `custom_fields` (type
 `records`: a list of `{name, description, values, multiple, required}`, written as a block list). They are
 asked like `stack.levels`, as `{"value": <suggestion>, "evidence": {"asked": true}}`; `{"default": true}`
-is refused with `no_evidence`. On maintenance a label setting is an item when the file holds it or the
-proposal names it. A Tag or Custom-field value is retired (moved to `retired_tags` or the field's
-`retired`), never removed, renamed or reused: removing one is refused with `label_removed`, naming it. An
-edit to a Tag's meaning, a Custom field's description or `role_meaning` returns `confirm: true` with each
-change's `described` `[{kind, name, cases}]`, where `cases` counts the cases that carry it, and writes only
-when the decisions list the change in `confirm`. A Custom-field value that repeats a Coverage category
-key adds the note `label_repeats_category` (with `overlaps`), never a refusal.
+is refused with `no_evidence`. A non-empty `roles` with no `role_meaning` makes the Card ask what the
+Roles mean, and a first run refuses it with `role_meaning_missing`, naming the setting. On maintenance a
+label setting is an item when the file holds it or the proposal names it. A Tag or Custom-field value is
+retired (moved to `retired_tags` or the field's `retired`), never removed, renamed or reused: removing one
+is refused with `label_removed`, naming it. An edit to a Tag's meaning, a Custom field's description or
+`role_meaning` returns `confirm: true` with each change's `described` `[{kind, name, cases}]`, where `cases`
+counts the cases that carry it, and writes only when the decisions list the change in `confirm`. A
+Custom-field value that repeats a Coverage category key adds the note `label_repeats_category` (with
+`overlaps`), never a refusal.
 
 `impact entry [<feature> [<ref>...]] [--persist] [--review [<feature>]] [--target <ref>]` is the front door of
 `/qa-impact` (lib/impact-entry.mjs); it writes nothing. A Feature key, with any references after it, prints `{ok, route: "quick",
@@ -536,7 +642,7 @@ Rule added, edited or retired in the working tree against HEAD in any Feature (t
 confirmed, a downstream one included) and `stale_cases` the distinct cases the Scan's
 `history.stale_obligations` owes over the working tree, the downstream walk's cases among them. The
 limit is 10 or a Practice of `train/impact.md` reading "Quick path threshold: <n>" (the last one wins,
-`source` names it); the quick path stops when `total` is more than the limit. Then it writes
+`source` names it); the quick path stops when `total` is more than the limit. Below it, `changeset` `{paths, commit}` is Checkpoint 1's commit: the knowledge files differing from HEAD, for `commit --stdin` (ADR-0062); over it, `{paths: [], commit: null}`. Then it writes
 `<dir>/handoff.json`, `{v: 1, references, edits: [{feature, rule, band}], open_questions, written}`
 (`band` is the forecast band of an edit in `<feature>`, null outside the forecast, and `downstream` in
 another Feature; `written` the knowledge files differing from HEAD), prints its path as `handoff` and a
@@ -590,6 +696,22 @@ A retired Tag already on a case remains valid; a request for one refuses, as doe
 undeclared Tag or Test level, with the valid values listed. Blank names, whitespace and
 extra colons in filter values refuse. Repeated tokens are harmless.
 
+`execute plan` expands a Test Case bound to several Test levels into one Execution per executable
+level, in canonical binding order; each Execution keeps its own `level`, the case's full
+`bound_levels`, its `selected_levels` and the bound `omitted_levels`, so narrowing a Run never loses
+the binding. One Run may therefore hold several Executions of one case, each with its own result.
+
+A Layer-free case expands into one Execution. Without a `level:` filter, if its bound Automations
+resolve through scan's `index.automations[id].level` to exactly one level in `execute_levels`, it
+runs there with that level's Automations. Passing Automations need no Tester; failed ones send that
+level to a Tester. Otherwise (none, all unresolved, several levels, or a non-executable level), it
+uses the plan's default: the one `execute_levels` entry whose mode is `browser`, or the level a
+`train/execute.md` Practice names with `level`. Unresolved Automations retain the sole-selected-level
+fallback. Only cases needing the default can refuse `no_default_level` when zero or several
+browser-mode levels and no Practice resolve it. A `level:<name>` filter
+runs every Layer-free case there, narrows a multi-level case to that level, and excludes a case
+bound only elsewhere as a filter exclusion, reported apart from the eligibility skips.
+
 The Integrity gate checks every file contributing live cases to the base scope before
 filtering. If none of the requested Test levels is in `execute_levels`, the request refuses;
 in mixed requests, matching cases at other levels stay `level` skips and the confirm names
@@ -606,23 +728,37 @@ Historical selection values are checked for shape, never against current project
 project setup, missing targets or execution levels, a repository without a resolving commit, and
 an empty or unknown scope before it plans anything. It needs `playwright-cli` 0.1.22 or newer,
 the floor the code enforces, and refuses a missing, older or unreadable version. Its confirm prints
-the selection, each case's Role to Access note mapping, blocked and skipped cases and the Run
-directory, and the ingest command to run when the Run is over. `execute automation` runs each
+the selection, each case's bound, selected, executed and omitted Test levels, every filter
+exclusion, each case's Role to Access note mapping, blocked and skipped cases and the Run
+directory, and the ingest command to run when the Run is over. On a host whose Tester guard cannot be verified
+(one that fails host admission for any check but the floor; Claude Code below the floor is refused
+`host_unverified` with an upgrade message instead) the plan carries `unguarded` and its confirm says so; `execute confirm` then refuses
+`unguarded_unacknowledged` unless `--stdin` carries the engineer's `{"acknowledge": "unguarded"}`,
+and refuses `card_changed` when the plan or the host changed since the Card was shown (ADR-0057). `execute automation` runs each
 selected case's Automations once through the project's `test_runner`, with `automation_retries` from
 `train/execute.md`, one invocation per `<run>/automation/<n>/`, and writes their per-instance
 attempts to `<run>/automation.json`; `execute next` starts a Tester Execution only for a case whose
 aggregate Automation result is Failed or that has no Automation, and `execute ingest` records the
-Automation results and any `execution_skipped` reason in the same case block; `execute open` opens
+Automation results and any `execution_skipped` reason in the same case block. `execute record`
+settles one attempt, and its optional `--reason-file <path>` is a file holding the Tester's reply,
+which it reads and removes; a record with no report shows that reply as its Why. `execute open` opens
 the application
 session for one Execution through the guarded `tester` wrapper, re-checking the host version first
-(see the [Claude Code row](https://github.com/Kinasr/qa-skills/blob/v0.3.6/docs/support.md#claude-code));
+(see the [Claude Code row](https://github.com/Kinasr/qa-skills/blob/v0.14.1/docs/support.md#claude-code));
 `tester do` and `tester request` are that wrapper's two commands, scrubbed by
 `plugin/scripts/lib/credentials.mjs`. `execute ingest` writes one Execution record at
 `.qa/executions/<date>-<run-id>.md` — outside the knowledge layer, uncommitted, and never
-rewritten — and removes the Run's kept login states. `execute follow-ups` reads the frozen plan and
+rewritten — with one block per case and Test level; `level` and `bound_levels` keep that
+identity, while `selected_levels`, `omitted_levels` and the record front's `excluded` show what
+the selection did, and a selected case that never started is named in the front's `not_run` with
+no block, so its previous result stays the latest; two blocks of one case at different levels
+never collide. It removes the Run's kept
+login states and prints the Run's Case outcomes: Failed if any level failed, else Blocked, else
+Incomplete when a bound level did not run, else Passed. `execute follow-ups` reads the frozen plan and
 that record and is the only writer of `<run>/follow-ups.json`: one fix item per Automation that
 needs code fixed (a Failed Automation whose covered cases all passed their Execution, or a Flaky
-one) and one bug item per case whose Execution failed. It is idempotent, takes the working tree's
+one) and one bug item per case whose Case outcome failed, listing every failing level. It is
+idempotent, takes the working tree's
 dirty paths on the first call, and returns the one resume command: `/qa-codefix --run <dir>` while fix
 work remains, otherwise `/qa-bug --run <dir>`. `execute summary` is read-only and untruncated: over
 `follow-ups.json` it reports what the fixes did, where they are, the drafts awaiting publish and what
@@ -631,19 +767,34 @@ still needs resuming, and returns `{text, publish}` with `text` null for an empt
 slug and every section from the pinned case and the scrubbed record, scrubs again, writes the one
 file at `.qa/bugs/<bg_key>-<slug>.md`, lists any attachable screenshots by that Key in
 `follow-ups.json`, and marks the item `done`. `bug read --case <key>` drafts without a Run: it selects
-the case's latest failed Execution from `.qa/executions/` and refuses a case that is not live or
-whose latest result did not fail; `--cause` selects the standalone fix-hand-off route, which writes
+the case's latest failed Case outcome from `.qa/executions/` — one Run, Application target and
+claim digest, across every level — and refuses a case that is not live or
+whose latest outcome did not fail; `--cause` selects the standalone fix-hand-off route, which writes
 no `record` and needs none. `bug write --case <key>` writes that draft without a follow-up work list.
 `bug discard` deletes named drafts, refusing a published one. The storage and lifecycle of every
 store a Run creates is in
-[docs/support.md](https://github.com/Kinasr/qa-skills/blob/v0.3.6/docs/support.md#storage-and-lifecycle).
+[docs/support.md](https://github.com/Kinasr/qa-skills/blob/v0.14.1/docs/support.md#storage-and-lifecycle).
 
 
 ## Code generation
 
 `codegen plan` is `/qa-codegen`'s plan step (`plugin/scripts/lib/codegen.mjs`): it refuses an
-untrained stack, an unresolved Convention `ref`, a missing `test_runner`, and the same scope and
+unresolved Convention `ref`, a missing `test_runner`, and the same scope and
 Integrity refusals execute makes, then writes one item per eligible case to `<run>/codegen.json`.
+`train check codegen --stdin` accepts an `approaches` frontmatter list in `train/codegen.md`:
+each entry has `approach` (`api`, `mocked-ui` or `full-ui`), a project `level`, and a
+repository-relative `path` pattern. Only `/qa-train codegen` writes it. Patterns support `*`,
+`?` and whole-segment `**`. Scan reports each Automation's path-derived `level` in
+`index.automations`; no match or ambiguous levels produce `null`.
+
+An Automation gap closes for a Layer-free case with any Automation; a bound case needs one at
+every supported Test level. Codegen reports unsupported bindings separately in `unsupported`
+(`[{key, levels}]`), including a `no_eligible_cases` refusal. `/qa-next` reports missing supported
+levels as `automation_gap` with `missing_levels`, and unsupported bindings separately as
+`automation_unsupported` with `unsupported_levels`, routed to `/qa-train codegen`. Unsupported
+levels never count as covered. Declared approaches set automation support;
+Training with no `approaches` field keeps its previous eligibility, at any schema, until declared.
+
 `codegen start` snapshots the item's `module_paths` and writes its brief. `codegen verify` runs the
 new test through the project's `test_runner` with retries 0, `codegen_repeats` times, and mints and
 renders the Automation key at the first verify. `codegen done` checks the passing verify's snapshot
@@ -651,8 +802,8 @@ and the Expected-to-line mapping, then writes the case's `automates`; with `--pr
 also commits the test, its support files and the Scenario's `automates` together. `codegen regress`
 rechecks the Automations a done item's touched files hold and rolls a regressing item back with its
 Scenario file; `codegen fail` keeps the unverified work as a scrubbed `draft.patch`, restores the
-item and records one closed reason. `pr-prepare` and `pr-record` are the shared PR plumbing, with the
-branch's regress checked first. A dirty Scenario file downgrades the Run to the working tree, and an
+item and records one closed reason. `pr-prepare` and `pr-record` are the shared PR plumbing; the skill runs
+`codegen regress` before `pr-prepare` (ADR-0057). A dirty Scenario file downgrades the Run to the working tree, and an
 ADR-0012 project runs there only. A verify writes only under the run dir, never an Execution record.
 
 ## Knowledge page

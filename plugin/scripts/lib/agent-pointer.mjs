@@ -18,8 +18,10 @@ export const AGENT_POINTER = `## QA knowledge (qa-skills)
 
 This repo's test knowledge lives in \`.qa/\`, managed by the qa-skills commands. Don't change \`.qa/\`
 unless the engineer or a \`/qa-skills:qa-*\` command asks; if a manual repair is needed, show it to
-the engineer. Don't run these commands yourself: keep doing the user's task, and when it touches
-what they cover, say this repo uses qa-skills and recommend the command for the user to run.
+the engineer. Don't start these commands on your own: keep doing the user's task, and when it
+touches what they cover, say this repo uses qa-skills and recommend the command for the user to run.
+Running one is fine when the engineer asks for it, or when a running \`/qa-skills:qa-*\` command
+names it as the next step.
 
 - Small change to a feature's expected behaviour → \`/qa-skills:qa-impact\`
 - New feature, or a big requirement change → \`/qa-skills:qa-deep-dive\`, then \`/qa-skills:qa-design\`

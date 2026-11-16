@@ -1,6 +1,7 @@
 // @ts-check
 // /qa-next: a read-only projection of scan facts, never another scanner.
 import { basename, posix, resolve } from "node:path";
+import { automationCoverage } from "./automation-coverage.mjs";
 import { command as scan } from "./scan.mjs";
 import { impactCheckDue, needsJudgement } from "./scan-history.mjs";
 import { command as migrationStatus } from "./migration-status.mjs";
@@ -11,10 +12,11 @@ import { keyLabel, labelOf, summaries } from "./labels.mjs";
 import { ACCESS_TRAIN_KEY, CODEGEN_TRAIN_KEY, DESIGN_TRAIN_KEY, SCHEMA_VERSION, TRAIN_KEYS, canonicalTrainKey, isSharedTrainKey } from "./schema.mjs";
 import { trainFile, trainFor } from "./training.mjs";
 import { readTrackerReference } from "./keys.mjs";
-import { caseFields, caseLevel, caseSteps, sameOwnedFields, stepActor } from "./case-fields.mjs";
-import { latestExecutionResults, resultHint } from "./execution-results.mjs";
+import { caseFields, caseLevels, caseSteps, sameOwnedFields, stepActor } from "./case-fields.mjs";
+import { latestCaseOutcomes, resultHint } from "./execution-results.mjs";
 import { parkedQuestions } from "./parked-questions.mjs";
 import { parseDeferred } from "./deferred.mjs";
+import { parseProposedRules } from "./proposed-rules.mjs";
 import { coverageDue } from "./coverage.mjs";
 import { effectiveCategories } from "./categories.mjs";
 import { canPublishLabels, publishedLabels, labelsDiffer } from "./publish-labels.mjs";
@@ -89,6 +91,8 @@ import { digests } from "./pin-digest.mjs";
  * @property {number} [version]
  * @property {number} [supported]
  * @property {NextRoute[]} [optional_routes]
+ * @property {string[]} [missing_levels]
+ * @property {string[]} [unsupported_levels]
  * @property {string} [reference]
 }
 
@@ -135,7 +139,7 @@ import { digests } from "./pin-digest.mjs";
 /**
  * A Next step, as the projection builds it: the page contract's step, with the signal it answers
  * and the priority that orders it.
- * @typedef {NextStep & { signal: string, priority: number }} NextStepRow
+ * @typedef {NextStep & { signal: string, priority: number, missing_levels?: string[], unsupported_levels?: string[] }} NextStepRow
  */
 
 /**
@@ -190,8 +194,8 @@ import { digests } from "./pin-digest.mjs";
  */
 
 /**
- * One Execution result, as the projection offers it: what it says, which case it belongs to, and
- * where it was run.
+ * One Case outcome, as the projection offers it: what one Run says about the case across its
+ * levels, which case it belongs to, and where it was run.
  * @typedef {{
  *   kind: string,
  *   key: string,
@@ -209,8 +213,8 @@ import { digests } from "./pin-digest.mjs";
  */
 
 /**
- * A Feature's latest Execution results, as the projection offers them: how many passed, and the
- * rows that did not.
+ * A Feature's latest Case outcomes, as the projection offers them: how many passed, and the rows
+ * that did not.
  * @typedef {{
  *   passed: { count: number, out_of_date: number },
  *   results: NextExecutionRow[],
@@ -270,9 +274,10 @@ export const NEXT_LEGEND = [
   { kind: "binding", emoji: "🔗", label: "binding" },
   { kind: "automation_gap", emoji: "🤖", label: "Automation gap" },
   { kind: "unknown", emoji: "❔", label: "unknown" },
-  // Execution results: information rows, never Next step kinds.
+  // Case outcomes: information rows, never Next step kinds.
   { kind: "failed", emoji: "❌", label: "Failed" },
   { kind: "blocked", emoji: "⛔", label: "Blocked" },
+  { kind: "incomplete", emoji: "◐", label: "Incomplete" },
   { kind: "information", emoji: "ℹ️", label: "information" },
   { kind: "nothing_pending", emoji: "✅", label: "nothing pending" },
   { kind: "start_here", emoji: "👉", label: "start here" },
@@ -282,6 +287,7 @@ export const NEXT_LEGEND = [
 /** @type {Record<string, { rank: number, kinds: string[] }>} */
 const PRIORITY = {
   missing_project: { rank: 0, kinds: ["blocking"] },
+  migration: { rank: 5, kinds: ["blocking"] },
   integrity: { rank: 10, kinds: ["blocking"] },
   conflict: { rank: 20, kinds: ["at_risk"] },
   overreach: { rank: 25, kinds: ["at_risk"] },
@@ -325,6 +331,25 @@ const syncRoute = (r) => {
  * @returns {NextRoute}
  */
 const migrationRoute = () => ({ type: "manual", text: "run migrate-keys on the default branch" });
+// A pending schema migration (`migration-status`) as the first step: each command in the order the
+// engineer runs them, a run of one command named once, and where it runs. Declarations alone, with
+// no schema boundary pending, are `migrate-keys`'s to fix.
+/**
+ * @param {MigrationStatus} migration
+ * @returns {NextStepRow | null}
+ */
+function migrationStep(migration) {
+  if (!migration.pending) return null;
+  const commands = (migration.migrations.length ? migration.migrations.map((m) => m.command) : ["migrate-keys"])
+    .filter((command, i, all) => i === 0 || all[i - 1] !== command);
+  return {
+    kind: "blocking", signal: "migration_pending", feature: null, keys: [], locations: [],
+    labels: { signal: "Schema migration pending", detail: null, feature: null, keys: [] },
+    prerequisites: [],
+    route: { type: "manual", text: `run ${commands.map((c) => `\`scan.mjs ${c}\``).join(", then ")}, on the default branch` },
+    priority: PRIORITY.migration.rank,
+  };
+}
 /**
  * @param {NextScanResult} r
  * @returns {NextRoute}
@@ -380,6 +405,7 @@ const SIGNALS = [
   { source: "knowledge", code: "uncited_case", kind: "missing_knowledge", priority: "knowledge", label: "no `covers`: link it to a Rule", route: settleRoute },
   { source: "knowledge", code: "empty_scenario", kind: "missing_knowledge", priority: "knowledge", label: "Empty Test Scenario", route: (r) => commandRoute("/qa-design", /** @type {string} */ (r.feature), /** @type {string} */ (r.key)) },
   { source: "knowledge", code: "deferred_functionality", kind: "missing_knowledge", priority: "knowledge", label: "Deferred functionality", route: (r) => commandRoute("/qa-deep-dive", /** @type {string} */ (r.feature), /** @type {string} */ (r.reference)) },
+  { source: "knowledge", code: "proposed_rule", kind: "missing_knowledge", priority: "knowledge", label: "Proposed Rule", route: (r) => commandRoute("/qa-deep-dive", /** @type {string} */ (r.feature)) },
   { source: "knowledge", code: "coverage_due", kind: "missing_knowledge", priority: "coverage", label: "Coverage due", route: (r) => commandRoute("/qa-deep-dive", /** @type {string} */ (r.feature)) },
   { source: "integrity_error", code: "missing_project", kind: "blocking", priority: "missing_project", label: "Project setup is missing", route: () => commandRoute("/qa-init") },
   { source: "integrity_error", code: "duplicate_automation_key", kind: "blocking", priority: "integrity", label: "Duplicate Automation key", route: syncRoute },
@@ -415,7 +441,8 @@ const SIGNALS = [
   { source: "train_warning", code: "legacy_shadowed", kind: "at_risk", priority: "training", label: "Training file shadowed by its renamed file", route: (r) => ({ type: "manual", text: r.message }) },
   { source: "train_warning", code: "possible_credential", kind: "at_risk", priority: "training", label: "Possible credential in Training", route: (r) => ({ type: "manual", text: `remove the credential by hand at ${r.file}:${r.line}` }) },
   { source: "train_warning", kind: "at_risk", priority: "training", label: "Training needs attention", route: (r) => commandRoute("/qa-train", /** @type {string} */ (canonicalTrainKey(basename(/** @type {string} */ (r.file), ".md")))) },
-  { source: "automation_state", code: "automation_gap", kind: "automation_gap", priority: "automation", label: "Automation gap: no Automation found", route: automationGapRoute },
+  { source: "automation_state", code: "automation_gap", kind: "automation_gap", priority: "automation", label: "Automation gap", route: automationGapRoute },
+  { source: "automation_state", code: "automation_unsupported", kind: "unknown", priority: "automation", label: "Unsupported automation levels", route: () => commandRoute("/qa-train", "codegen") },
   { source: "automation_state", code: "automation_unknown", kind: "unknown", priority: "automation", label: "Automation evidence unavailable", route: (r) => ({ type: "manual", text: `address the unavailable code evidence: ${r.message}` }) },
 ];
 
@@ -459,21 +486,43 @@ function crossFeatureBindings(proposals, facts, index) {
 function automationStates(facts, index, proposals) {
   const unavailable = !facts.index.automations;
   const proposed = new Set(proposals.flatMap(bindingKeys));
+  const config = projectConfig(index.project);
+  const train = trainFile(index, CODEGEN_TRAIN_KEY);
+  const automations = new Map(Object.entries(facts.index.automations ?? {}));
   /** @type {NextScanResult[]} */
   const results = [];
   for (const [scenario, { feature }] of Object.entries(facts.index.scenarios)) {
     const file = index.scenarios.get(scenario)?.[0]?.file;
     const cases = (file?.cases ?? []).filter((c) => typeof c.key === "string" &&
-      (c.data.automatable ?? true) === true && !(/** @type {unknown[]} */ (c.data.automates ?? [])).length && !proposed.has(c.key));
-    if (!cases.length) continue;
-    results.push({
-      kind: "automation_state", code: unavailable ? "automation_unknown" : "automation_gap", feature, scenario,
-      keys: cases.map((c) => c.key).sort(),
-      locations: cases.map((c) => ({ file: /** @type {ParsedFile} */ (file).rel, line: c.line })),
-      ...(unavailable && { message: facts.run_health.map((h) => h.message).join("; ") }),
-    });
+      (c.data.automatable ?? true) === true && !proposed.has(c.key));
+    for (const c of cases) {
+      const coverage = automationCoverage(c.data, /** @type {ParsedFile} */ (file).data, config, train, automations);
+      const place = { feature, scenario, keys: [c.key], locations: [{ file: /** @type {ParsedFile} */ (file).rel, line: c.line }] };
+      if (coverage.unsupported.length) results.push({
+        ...place, kind: "automation_state", code: "automation_unsupported", unsupported_levels: coverage.unsupported,
+        message: `The stack cannot automate these Test levels: ${coverage.unsupported.join(", ")}.`,
+      });
+      if (!coverage.gap) continue;
+      results.push({
+        ...place, kind: "automation_state", code: unavailable ? "automation_unknown" : "automation_gap",
+        missing_levels: coverage.missing,
+        ...(unavailable ? { message: facts.run_health.map((h) => h.message).join("; ") } :
+          { message: coverage.missing.length ? `Automation gap at Test levels: ${coverage.missing.join(", ")}.` : "Automation gap: no Automation found." }),
+      });
+    }
   }
-  return results;
+  // Keep one Next step for cases with the same missing/unsupported levels in a Scenario.
+  /** @type {Map<string, NextScanResult>} */
+  const grouped = new Map();
+  for (const result of results) {
+    const key = JSON.stringify([result.scenario, result.code, result.missing_levels, result.unsupported_levels]);
+    const prior = grouped.get(key);
+    if (prior) {
+      prior.keys = [...(prior.keys ?? []), ...(result.keys ?? [])].sort();
+      prior.locations = [...(prior.locations ?? []), ...(result.locations ?? [])];
+    } else grouped.set(key, result);
+  }
+  return [...grouped.values()];
 }
 
 /**
@@ -577,7 +626,8 @@ function executableSteps(facts, index) {
   if (!levels) return [];
   return Object.keys(facts.index.cases).flatMap((key) => {
     const { file, entry, feature, scenario, line } = /** @type {NextCase} */ (/** @type {CaseDecl[]} */ (index.cases.get(key))[0]);
-    if (!Object.hasOwn(levels, /** @type {string} */ (caseLevel(entry.data, file.data, schemaVersion)))) return [];
+    const bound = caseLevels(entry.data, file.data, schemaVersion);
+    if (bound.length ? !bound.some((level) => Object.hasOwn(levels, level)) : Object.keys(levels).length === 0) return [];
     const steps = caseSteps(/** @type {CaseFieldEntry} */ (entry));
     const roles = /** @type {string[]} */ (entry.data.roles ?? []);
     const code = !steps.length ? "no_steps" : roles.length >= 2 && steps.some((s) => !roles.includes(/** @type {string} */ (stepActor(s)))) ? "unnamed_actor" : null;
@@ -585,8 +635,8 @@ function executableSteps(facts, index) {
   });
 }
 
-// Each Feature's latest Execution results, or null when it has none. Failed rows come before
-// Blocked, then by key; Passed shows as a count.
+// Each Feature's latest Case outcomes, or null when it has none. Failed rows come before
+// Blocked, then Incomplete, then by key; Passed shows as a count.
 /**
  * @param {ParsedFile[]} files
  * @param {KeyIndex} index
@@ -597,14 +647,17 @@ function executableSteps(facts, index) {
 function executionsByFeature(files, index, names, root) {
   /** @type {Map<string | null | undefined, ExecutionResult[]>} */
   const byFeature = new Map();
-  for (const result of latestExecutionResults(files, index).values()) {
+  for (const result of latestCaseOutcomes(files, index).values()) {
     if (!byFeature.has(result.feature)) byFeature.set(result.feature, []);
     /** @type {ExecutionResult[]} */ (byFeature.get(result.feature)).push(result);
   }
+  const order = { failed: 0, blocked: 1, incomplete: 2 };
   return new Map([...byFeature].map(([feature, all]) => {
     const passed = all.filter((r) => r.result === "passed");
     const rows = all.filter((r) => r.result !== "passed").sort((a, b) =>
-      (a.result === b.result ? 0 : a.result === "failed" ? -1 : 1) || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+      (/** @type {Record<string, number>} */ (order)[/** @type {string} */ (a.result)] ?? 3) -
+        (/** @type {Record<string, number>} */ (order)[/** @type {string} */ (b.result)] ?? 3) ||
+      (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
     return /** @type {[string | null | undefined, NextExecutions]} */ ([feature, {
       passed: { count: passed.length, out_of_date: passed.filter((r) => r.out_of_date).length },
       results: rows.map((r) => ({
@@ -638,6 +691,8 @@ function nextStep(result, context) {
   return {
     kind: row.kind, signal: result.code, feature: result.feature ?? null, keys,
     ...(result.code === "codegen_upkeep" && { stack: result.stack }),
+    ...(result.missing_levels && { missing_levels: result.missing_levels }),
+    ...(result.unsupported_levels && { unsupported_levels: result.unsupported_levels }),
     ...(result.scenario && { scenario: result.scenario }),
     ...(result.count !== undefined && { count: result.count }),
     ...(result.optional_routes && { optional_routes: result.optional_routes }),
@@ -795,6 +850,10 @@ function knowledgeSteps(context, feature) {
       file: file.rel, line: item.line, reference: item.reference,
       message: `${item.functionality}: ${item.reason}. From: ${item.reference}${item.place === null ? "" : `, ${item.place}`}`,
     });
+    // A kept Proposed Rule (ADR-0067) waits on the deep dive that settles it, one step each.
+    for (const item of parseProposedRules(file.text)) results.push({
+      kind: "knowledge", code: "proposed_rule", feature: key, file: file.rel, line: item.line, message: item.statement,
+    });
     const questions = parkedQuestions(file);
     if (questions.length) results.push({
       kind: "knowledge", code: "parked_questions", feature: key, key,
@@ -893,6 +952,8 @@ export const command = {
     const ordinary = results.filter((r) => !upkeep.includes(r));
     const grouped = [...groups.values()].map((group) => ({ ...group[0], code: "codegen_upkeep", count: group.length, keys: [...new Set(group.map((r) => r.key).filter((key) => typeof key === "string"))], locations: group.map((r) => ({ file: r.file, line: r.line })), message: `${group.length} codegen Training warnings for stack ${group[0].stack}` }));
     const signalSteps = /** @type {NextStepRow[]} */ ([...ordinary, ...grouped].map((r) => nextStep(r, context)).filter(Boolean));
+    const migration = /** @type {MigrationStatus} */ (/** @type {CommandResult} */ (/** @type {NonNullable<CommandDefinition["run"]>} */ (migrationStatus.run)([], /** @type {CommandContext} */ ({ root }))).json);
+    const migrationFirst = migrationStep(migration);
     const next_steps = [
       ...downstreamImpactSteps(facts, context),
       ...signalSteps,
@@ -916,14 +977,15 @@ export const command = {
       root: /** @type {string} */ (root),
       feature: facts.feature,
       global: {
-        migration: /** @type {MigrationStatus} */ (/** @type {CommandResult} */ (/** @type {NonNullable<CommandDefinition["run"]>} */ (migrationStatus.run)([], /** @type {CommandContext} */ ({ root }))).json),
+        migration,
         schema: /** @type {NextSchemaState} */ (newer ?? { code: "current", version, supported: SCHEMA_VERSION }),
         run_health: facts.run_health,
         training: trainingStatus(index),
       },
       features,
       next_steps,
-      start_here: pendingSteps[0] ?? null,
+      // A pending migration comes before any step: the steps stay listed as they are.
+      start_here: (pendingSteps[0]?.signal === "missing_project" ? null : migrationFirst) ?? pendingSteps[0] ?? null,
     };
     // The projection's own output is the view the page reads: the page contract (lib/page.d.mts)
     // names the fields the rendered document shows, and the projection writes exactly those, so

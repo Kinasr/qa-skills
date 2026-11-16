@@ -18,6 +18,11 @@ One addressable statement of required behaviour within a Feature. What a Test Ca
 statement carries the whole claim; any elaboration beneath it explains, and never adds a claim.
 _Avoid_: requirement, behaviour, acceptance criterion
 
+**Draft Rule**:
+A bulk-table proposal from a Reference's constraint that becomes a Rule only on the engineer's
+confirmation.
+_Avoid_: Rule, requirement, accepted constraint
+
 **Test Case**:
 One manual pass: the claims about how the system under test should behave that a tester checks from
 one setup in one run of steps, identified by its own key and carrying its own provenance and review
@@ -47,19 +52,40 @@ Execution result nor a Verdict.
 _Avoid_: test status, execution result, verdict
 
 **Automation gap**:
-A Test Case that can be automated but has no Automation. A case that cannot be automated is
-never a gap.
+A Test Case that can be automated but has no Automation, or, for a case bound to several Test
+levels, lacks one at a level its stack can automate. A case that cannot be automated is never a
+gap.
 _Avoid_: missing test, uncovered case
 
+**Manual case**:
+A Test Case a Tester can perform: one session per Role, no token shown, the Application target's
+origin only, and no system outside it. A case needing more carries `manual: false`, and then only its
+Automations check it; a Test Case with no `manual` is one a Tester can run. Distinct from
+`automatable`, which says whether test code can check the case at all.
+_Avoid_: automation-only case, unexecutable case, non-manual case
+
 **Test Scenario**:
-A named group of Test Cases that share a subject, and the unit one knowledge file holds.
+A named group of Test Cases that share a subject, and the unit one knowledge file holds. A subject
+may be one Rule's partitions, a user journey, or a cluster of Rules that interact.
 _Avoid_: test class, test group, suite
 
 **Test level**:
 The layer through which a Test Case exercises the system, such as UI or API, chosen from the
-project's own list. One per Test Case and part of its claim; a Test Scenario carries none. Never a
-Coverage category.
+project's own list. A Test Case carries one or several only when its claim is bound to those
+layers, such as a visual layout, a payload contract, or a denial that must hold on every layer;
+otherwise it is a Layer-free case. Part of the claim when present; a Test Scenario carries none.
+Never a Coverage category, and never a way of automating, such as a mocked UI.
 _Avoid_: test type, layer, tier
+
+**Execution mode**:
+How a Test level is driven when its Test Cases run: through a browser, or by direct HTTP calls.
+The project pairs each executable Test level with one mode, and two levels may share a mode.
+_Avoid_: execution type, runner, wiring
+
+**Layer-free case**:
+A Test Case with no Test level: its claim is stated from the actor's side and holds on any one
+layer that reaches it, so the layer is chosen when it is executed or automated.
+_Avoid_: unleveled case, any-level case, generic case
 
 **Functionality**:
 A user-visible capability of a Feature, named as a verb phrase. The deep dive's working unit, and
@@ -130,6 +156,13 @@ Cleared by the run that answers it. A Feature's Parked questions may be Publishe
 References, where answers are gathered; they still come back only through a run that answers them.
 _Avoid_: todo, open issue, backlog, open question (the heading of the section that holds them)
 
+**Proposed Rule**:
+A behaviour that designing a Feature's Test Cases showed no Rule states, which the engineer chose to
+keep in the Feature for a deep dive to settle. Held as prose, never as a Rule, so no Test Case can
+cover or contradict it. Unlike a Parked question, nobody has been asked it yet. Cleared by the deep
+dive that makes it a Rule, finds a Rule already states it, rejects it or parks it.
+_Avoid_: design gap, missing Rule, suggested Rule
+
 **Deferred functionality**:
 A whole Functionality that belongs to a Feature but that the engineer chose to leave out of the
 deep dive for now, recorded with its reason and the Reference it came from. Held in the Feature as
@@ -144,6 +177,7 @@ One addressable statement in a Feature that a named piece of behaviour is not th
 the Feature it belongs to when one exists. Never a Rule: it claims nothing about how the system
 behaves, only where knowledge about it lives. Makes explicit an edge the reach of the Feature's
 Rules would otherwise leave implied.
+"Boundary test cases" means atomic cases over a limits Rule's stated edges, not a Boundary.
 _Avoid_: out of scope, exclusion, non-goal
 
 **Waiver**:
@@ -210,8 +244,18 @@ _Avoid_: rule, instruction, preference, setting
 
 **Invariant**:
 A statement a command makes about its own work that no Training can change, such as writing the
-tracker only through Publish.
+tracker only through Publish. Every Invariant is either Enforced or Instructed.
 _Avoid_: rule, guardrail, constraint
+
+**Enforced Invariant**:
+An Invariant held by the framework's code, which the model cannot get past. One is enforced only
+when no human would catch its breach before it became durable or left the repo.
+_Avoid_: hard rule, gate, guardrail
+
+**Instructed Invariant**:
+An Invariant stated as one line in a command's skill and followed by the model as an instruction,
+because a human reviews what a breach would produce.
+_Avoid_: soft rule, guideline, prompt rule
 
 **Facet**:
 One part of the shape of generated test code that a Convention settles for a stack, such as its
@@ -238,13 +282,40 @@ _Avoid_: attachment, sample file
 
 **Access note**:
 How to reach one kind of Reference that sits behind a login — its host, its auth method, which
-environment variable, git-ignored file or connector carries the credential, non-secret identifiers,
+Auth file key, environment variable, git-ignored file or connector carries the credential, non-secret identifiers,
 and where a person gets the credential. Never the credential itself. Matched to the tracker and URL
 References a run fetches, and to the page an Observation is taken from, never pointed at by hand.
-For the application under test, either a saved login state or a user and password the CLI logs in
-with (ADR-0019). A note may name the Role it logs in as; one with no Role is the default for its
-prefix, and serves only Test Cases that carry no Role. One note is one test account.
+For the application under test, a saved login state or a user and password the CLI logs in with
+(ADR-0019), a Header credential (ADR-0058), a login together with a Header credential, or, tagged
+with a Role, `via: none` to log in as nobody: a Test Case carrying that Role opens with no login
+(ADR-0063). A note may name the Role it logs in as; one with no Role is the default for its prefix,
+and serves only Test Cases that carry no Role. One note with a login is one test account; a no-login
+note is no account at all.
 _Avoid_: credentials, secrets, connection, environment, auto-login
+
+**Auth file**:
+One engineer's own, never-committed file of every test-account secret a project's Access notes name,
+one key each; two notes may share a key. Filled in by hand from the Auth template, once per clone,
+and shared by all its worktrees: a worktree's own Auth file wins for the keys it sets (ADR-0060).
+_Avoid_: secrets file, password file, .env
+
+**Auth template**:
+The committed copy of the Auth file with every value blank, listing each key the Access notes need,
+the accounts it belongs to and where to get its secret. Written by the CLI, never by hand.
+_Avoid_: auth example, sample env
+
+**Header credential**:
+A static token or key the CLI adds as one named request header to a Tester's HTTP requests, read
+from where its Access note says and never shown to the Tester. Never obtained by the framework:
+the engineer supplies it.
+_Avoid_: auth profile, bearer, API key (alone), token
+
+**Credential variant**:
+A deliberately wrong credential a Tester's request is sent with, to see the application refuse it:
+`absent` (no credential at all), `invalid` (a value the CLI makes up) or `expired` (an expired one
+the engineer supplies). Named in the case's steps; a wrong Role is never a Credential variant, but
+a Test Case run as another Role.
+_Avoid_: negative auth (alone), bad token, auth mode
 
 ### Change impact
 
@@ -358,10 +429,18 @@ no Test Case is certified unjudged, and it never writes a Rule.
 _Avoid_: resolution, cleanup, triage (one step of the walk)
 
 **Checkpoint**:
-A commit the engineer makes at a fixed point in a change's run, which the run waits for: the first
-after the Rule edits, so the Stale cases they raise are stored against a commit; the second once
-settlement is done and the cases are written, which advances the Watermark.
+A commit at a fixed point in a change's run, made as the Commit mode says, which the run waits for:
+the first after the Rule edits, so the Stale cases they raise are stored against a commit; the
+second once settlement is done and the cases are written, which advances the Watermark.
 _Avoid_: save point, snapshot
+
+**Commit mode**:
+How a command treats the commit of the files it wrote, chosen once for the whole project. `print`
+gives the engineer the commit to make themselves, and is what a project that never chose has. `ask`
+asks at that point and makes the commit on a yes. `auto` makes it without asking, except on the
+default branch, with no branch checked out, or where the default branch cannot be told, where it
+asks instead. It never reaches the commits of a test-code pull request (ADR-0062).
+_Avoid_: auto commit, commit flag, commit option
 
 **Uncited case**:
 A Test Case that names no Rule it covers, whatever its Reliance holds, so no change to its own
@@ -569,15 +648,32 @@ what happened against its Expected-result paragraphs. Not a Scout, which explore
 follows steps, and not a Delegate, since it judges no knowledge.
 _Avoid_: executor, runner, agent, UI scout
 
+**Target**:
+One entry of the project's `targets` map: the slug that names an Application target, with the exact
+origin a Run reaches it at. Commands and Cards name the slug; an origin is never a name.
+_Avoid_: environment, host, base URL
+
+**Level target**:
+The Target a project names as serving one Test level, such as the API origin for `api` cases. A
+level the project names none for is served by its first Target.
+_Avoid_: level origin, API target
+
 **Application target**:
 A named, non-production deployment of the application under test, from the project's own list, that
 Executions and Automation runs are pointed at. Never a commit.
-_Avoid_: environment, host, target (alone)
+_Avoid_: environment, host
 
 **Execution**:
-One Tester's pass over one Test Case in the live application, invoked through `/qa-execute`. Never
-the running of an Automation, which is the test code's own job.
+One Tester's pass over one Test Case at one Test level in the live application, invoked through
+`/qa-execute`; a case run at several levels has one Execution per level. Never the running of an
+Automation, which is the test code's own job.
 _Avoid_: run (a Run is one command invocation), test run, replay
+
+**Unguarded Run**:
+A `/qa-execute` Run on a host whose Tester guard cannot be verified, other than Claude Code below
+its supported floor. It starts only after the engineer explicitly acknowledges, on the pre-run Card,
+that the Run proceeds without a verified guard.
+_Avoid_: unsafe mode, guard bypass, no-guard run
 
 **Execution result**:
 The outcome of one Execution: Passed, Failed, or Blocked. Failed only when an Expected-result
@@ -593,6 +689,12 @@ edited afterwards. Held beside the knowledge, never in it: no Feature cites it a
 whether the knowledge changed ever sees it. It never carries a secret.
 _Avoid_: report, log, test run
 
+**Case outcome**:
+What one Run says about one Test Case across the levels it ran at: Failed if any level failed,
+else Blocked if any was blocked, else Passed; Incomplete when a level the case is bound to was not
+run. Derived from the Execution and Automation results, never recorded on its own.
+_Avoid_: case result, case status, overall result
+
 **Fix item**:
 One failing or flaky Automation handed to `/qa-codefix` to repair, from a completed `/qa-execute`
 Run or the engineer's own request. It ends done, failed with its reason, or handed off when the
@@ -606,7 +708,8 @@ that link and is never edited again. Beside the knowledge, never in it. It never
 _Avoid_: bug report, defect, issue, ticket
 
 **Run**:
-One invocation of a `/qa-*` command, named by a random id minted at its start.
+One invocation of a `/qa-*` command, named by a random id minted at its start. A `/qa-execute`
+whose selection spans several targets makes one Run per target.
 _Avoid_: session (the agent conversation, which spans many Runs), job, pass
 
 ### Engineer interaction
@@ -616,6 +719,12 @@ The whole set of changes a command proposes, shown to the engineer in full befor
 written, with prose written by the model from CLI-supplied data (ADR-0024). Every item that needs
 an answer carries its question; nothing takes effect until the engineer's Reply is accepted.
 _Avoid_: form, prompt, preview, dry run
+
+**Suggested answer**:
+A value a Card shows for a question before the engineer answers it, offered because the evidence
+shows nothing better. Taking the item, by `take all` or by number, answers the question with that
+value; an edit replaces it. A question that shows no value needs an answer.
+_Avoid_: default (a value the framework writes without asking), guess, prefill
 
 **Reply**:
 The engineer's free-form answer to a Card, or to one case of a triage walk, mapped by the model
@@ -650,6 +759,6 @@ _Avoid_: report, dashboard, Card page
 **Knowledge page**:
 The knowledge layer as it stands, for one Feature or for all of them, shown as a read-only page on
 the engineer's own machine: Rules, Test Scenarios and Test Cases with their labels, Coverage,
-Parked questions, Deferred functionality, gaps and open Findings. A snapshot, never a Card page:
-it proposes no change and takes no Reply, and it holds no Next steps.
+Parked questions, Proposed Rules, Deferred functionality, gaps and open Findings. A snapshot,
+never a Card page: it proposes no change and takes no Reply, and it holds no Next steps.
 _Avoid_: report, dashboard, coverage report, test plan, Card page, Next steps page

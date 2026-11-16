@@ -38,8 +38,8 @@ What a Convention adds to the shared proposal shape (SKILL.md §1):
   dictated one has `human:<name>` alone);
 - it carries at least one **minimal fenced example** of the facet it governs (a summary line, a
   step snippet, a permutation list), never a whole Test Case. A **prohibition** ("never …") carries
-  an **anti-example**, marked as the wrong form. A formatting convention carries a worked example or
-  a before/after pair.
+  an **anti-example**, marked as the wrong form, and no source cites that wrong form. A formatting
+  convention carries a worked example or a before/after pair.
 
 ## The Statability Test
 
@@ -60,17 +60,20 @@ belong in the test code rather than in Training.
 
 Every run that writes `train/design.md`, a conversation run included, reads every Convention, old
 and proposed, together: look for pairs that contradict each other, overlap or have drifted, and
-apply the Statability Test to every old Convention again. Flag old ones too, not only the new ones.
-Each is a coherence finding for the gate.
+apply the Statability Test to every old Convention again. Also refuse any Convention that chooses a
+Test level or execution speed: point to `/qa-train execute` for a Layer-free case's execution level
+and `/qa-train codegen` for an Automation's level or speed. Re-check old Conventions for these too;
+flag each at the gate for revision or removal, naming its target. Every old Convention is read
+against these checks, not only the new ones, and each finding is a coherence finding for the gate.
 
-## Settling `statability` hits
+## Settling `statability` hits and `missing_anti_example` warnings
 
 `check` lists each mechanical hit on every Convention (a tracker key, status code, role name, `.qa/`
-key, Rule term or endpoint path in its statement or rationale), with its `status`:
+key, Rule term or endpoint path in its statement or rationale), with its `status`, and warns `missing_anti_example` when a prohibition carries no anti-example:
 
-- **`added` or `edited`**: treat the hit as a refusal, unless the engineer confirms it names
+- **`added` or `edited`**: add the missing anti-example, and treat a `statability` hit as a refusal, unless the engineer confirms it names
   nothing in the system (for example, a length limit that reads as a status code). Then check
   again.
 - **`unchanged`**: if the gate did not already settle it, put it to the engineer as a coherence
-  finding (reword it, or remove it and hand it to `/qa-deep-dive`), and never block this run's
+  finding (add the anti-example, reword it, or remove it and hand it to `/qa-deep-dive`), and never block this run's
   write on it.

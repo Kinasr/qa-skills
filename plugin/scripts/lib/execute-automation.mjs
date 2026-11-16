@@ -105,7 +105,7 @@ function run(args, { dir, root, env }) {
     } else {
       const output = join(runDir, "automation", String(invocation++));
       mkdirSync(output, { recursive: true });
-      outcome = runSelection({ selection, runner: plan.runner, repo: plan.repo, dir: output, origin: pinned.target.origin, env, retries });
+      outcome = runSelection({ selection, runner: plan.runner, root: /** @type {string} */ (root), repo: plan.repo, dir: output, origin: pinned.target.origin, env, retries });
     }
     state.automation.push(automationResult(selection, outcome.parsed, outcome.selector, Boolean(plan?.runner && plan.runner.target_env.length === 0)));
     writeFileSync(join(runDir, "automation.json"), `${JSON.stringify(state, null, 2)}\n`);

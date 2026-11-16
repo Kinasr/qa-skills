@@ -18,7 +18,7 @@
  * @import { LabelDefinitions } from "./case-labels.mjs"
  * @import { CaseSectionKind } from "./case-sections.mjs"
  * @import { MintRecipe } from "./keys.mjs"
- * @import { MarkdownElement, MarkdownFenceElement, MarkdownHeadingElement } from "./markdown.mjs"
+ * @import { MarkdownElement, MarkdownFenceElement, MarkdownHeadingElement, MarkdownItemElement } from "./markdown.mjs"
  * @import { TrainEntryDescriptor } from "./schema.mjs"
  */
 import { posix } from "node:path";
@@ -30,7 +30,7 @@ import { automationKeyPattern, compileKeyPattern, parseMintRecipe } from "./keys
 import { keyedHeading, splitFile } from "./markdown.mjs";
 import { block, line, role, token } from "./render.mjs";
 import { GRADLE_DEFAULT_TASK } from "./runners/gradle.mjs";
-import { FIELD_RENDER, isSchemaVersion, KNOWN, TRAIN_ENTRIES, trainEntry } from "./schema.mjs";
+import { FIELD_RENDER, isCommitMode, isSchemaVersion, KNOWN, TRAIN_ENTRIES, trainEntry } from "./schema.mjs";
 
 export { checkFile, checkExecution } from "./check-file.mjs";
 
@@ -77,7 +77,10 @@ export const RULE_FIELDS = ["Waived", "Depends on"];
  */
 
 /**
- * One rule entry of a Feature file.
+ * One rule entry of a Feature file: a `### rule_<key>: <statement>` heading or a
+ * `<n>. **rule_<key>**: <statement>` list item (ADR-0061). `form` says which; `indent` is the
+ * item's content indent, and 0 for a heading. `line` is the heading or item line, and `end` its
+ * last line.
  * @typedef {{
  *   key: string,
  *   statement: string,
@@ -88,11 +91,13 @@ export const RULE_FIELDS = ["Waived", "Depends on"];
  *   waiver: string | null,
  *   waiverLine: number | null,
  *   elaboration: string,
+ *   form: "heading" | "item",
+ *   indent: number,
  * }} ParsedRule
  */
 
 /**
- * One Boundary entry of a Feature file (ADR-0039).
+ * One Boundary entry of a Feature file (ADR-0039), in either form as a Rule.
  * @typedef {{
  *   key: string,
  *   statement: string,
@@ -100,7 +105,24 @@ export const RULE_FIELDS = ["Waived", "Depends on"];
  *   line: number,
  *   end: number,
  *   elaboration: string,
+ *   form: "heading" | "item",
+ *   indent: number,
  * }} ParsedBoundary
+ */
+
+/**
+ * One numbered list item of a Feature whose first line reads as `<n>. **<key>**: <statement>`,
+ * wherever it sits: an entry only under `## Rules` or `## Boundaries`, but kept here so `check`
+ * and the deep dive can report one elsewhere. `section` is the nearest `##` heading's title (or
+ * null); `end` is the item's last line.
+ * @typedef {{
+ *   key: string,
+ *   statement: string,
+ *   line: number,
+ *   end: number,
+ *   indent: number,
+ *   section: string | null,
+ * }} ParsedListItem
  */
 
 /**
@@ -147,6 +169,7 @@ export const RULE_FIELDS = ["Waived", "Depends on"];
  *   executions: ParsedEntry[],
  *   rules: ParsedRule[],
  *   boundaries: ParsedBoundary[],
+ *   items?: ParsedListItem[],
  *   conventions?: ParsedEntry[],
  *   practices?: ParsedEntry[],
  *   access_notes?: ParsedEntry[],
@@ -286,6 +309,7 @@ export const RULE_FIELDS = ["Waived", "Depends on"];
  *   tiers: Record<string, string>,
  *   targets?: Record<string, string>,
  *   execute_levels: Record<string, string>,
+ *   level_targets?: Record<string, string>,
  *   allowedHosts: string[] | null,
  *   modulePaths: string[],
  *   stack: { language: string, framework: string, root: string } | null,
@@ -293,6 +317,7 @@ export const RULE_FIELDS = ["Waived", "Depends on"];
  *   code_host?: CodeHost,
  *   bug_publish?: BugPublishConfig,
  *   annotationMap: Record<string, string[]>,
+ *   commitMode: import("./schema.mjs").CommitMode,
  *   [key: string]: unknown,
  * }} ProjectConfig
  */
@@ -309,10 +334,13 @@ export const RULE_FIELDS = ["Waived", "Depends on"];
 //   fences       every fenced block `{lang, line, end}`, `end` its closing fence line
 //   problems     what the schema cannot read, `{code, line, message}`: a git conflict marker, an
 //                unclosed frontmatter or fence, a YAML error in the frontmatter or an entry's block
-//   rules        a Feature's `### rule_<key>: <statement>` entries `{key, statement, line, end,
-//                fields, fieldsEnd, waiver, waiverLine, elaboration}`: its field block, Waiver,
-//                and the remaining text
-//   boundaries   a Feature's `### boundary_<key>: <statement>` entries, with owner and elaboration
+//   rules        a Feature's Rule entries `{key, statement, line, end, fields, fieldsEnd, waiver,
+//                waiverLine, elaboration, form, indent}`, written as a `### rule_<key>: <statement>`
+//                heading or a `<n>. **rule_<key>**: <statement>` list item (ADR-0061): its field
+//                block, Waiver, and the remaining text
+//   boundaries   a Feature's Boundary entries, in either form, with owner and elaboration
+//   items        a Feature's numbered list items whose first line is `<n>. **<key>**: <statement>`,
+//                wherever they sit, so `check` and the deep dive can report one out of place
 //   cases        a scenario's Test Cases (see `parseEntry`), `summary` their heading text
 //   executions   an Execution record's entries (same shape as `cases`, with result fields)
 //   conventions, practices, access_notes   a train file's entries, `statement` their heading text
@@ -344,6 +372,7 @@ export function parse(rel, text) {
     executions: [],
     rules: [],
     boundaries: [],
+    items: [],
     ...Object.fromEntries(TRAIN_ENTRIES.map((e) => [e.list, []])),
   };
   if (!doc.frontmatter) return file;
@@ -357,9 +386,12 @@ export function parse(rel, text) {
 
   const lines = text.replace(/\r\n/g, "\n").split("\n");
   const { elements } = doc;
+  // A list entry ends at the next top-level item or heading; a heading entry keeps ending at the
+  // next H3, as it always has.
+  const breaks = elements.flatMap((e) => (e.kind === "heading" || (e.kind === "item" && e.indent === 0) ? [e.line] : []));
   elements.forEach((e, i) => {
     if (e.kind === "fence") file.fences.push({ lang: e.lang, line: e.line, end: e.endLine });
-    else file.sections.push({ level: e.level, title: e.text, line: e.line, end: sectionEnd(elements, i, e.level, lines) });
+    else if (e.kind === "heading") file.sections.push({ level: e.level, title: e.text, line: e.line, end: sectionEnd(elements, i, e.level, lines) });
   });
   const h1 = elements.find((e) => e.kind === "heading" && e.level === 1);
   if (h1) file.h1 = { line: h1.line, ...(keyedHeading(h1.text) ?? { key: null, text: h1.text }) };
@@ -368,18 +400,42 @@ export function parse(rel, text) {
     file.intro = lines.slice(h1.line, next ? next.line - 1 : lines.length).join("\n").trim();
   }
 
+  // The nearest `##` heading's title, for the item's section; a heading of level 1 ends it.
+  /** @type {string | null} */
+  let section = null;
   elements.forEach((e, i) => {
+    if (e.kind === "item") {
+      if (file.type !== "feature" || e.indent !== 0) return;
+      // A numbered line inside a heading-form entry's range is that entry's elaboration, never a
+      // list item: a heading Rule may quote a numbered list, and it belongs to the Rule.
+      if (file.rules.some((rule) => rule.form === "heading" && e.line >= rule.line && e.line <= rule.end) ||
+        file.boundaries.some((boundary) => boundary.form === "heading" && e.line >= boundary.line && e.line <= boundary.end)) return;
+      const h = itemHeading(e.text);
+      if (!h) return;
+      const end = itemEnd(e, lines, breaks);
+      /** @type {ParsedListItem} */
+      const item = { key: h.key, statement: h.text, line: e.line, end, indent: e.contentIndent, section };
+      /** @type {ParsedListItem[]} */ (file.items).push(item);
+      if (section === "Rules" && h.key.startsWith("rule_")) {
+        const fields = readFields(lines, e.line, end, e.contentIndent);
+        file.rules.push({ key: h.key, statement: h.text, line: e.line, end, ...fields, elaboration: readElaboration(lines, e.line, end, e.contentIndent, fields.fieldsEnd), form: "item", indent: e.contentIndent });
+      } else if (section === "Boundaries" && h.key.startsWith("boundary_")) {
+        const body = boundaryBody(lines, e.line, end, e.contentIndent);
+        file.boundaries.push({ key: h.key, statement: h.text, line: e.line, end, owner: body.owner, elaboration: body.elaboration, form: "item", indent: e.contentIndent });
+      }
+      return;
+    }
     if (e.kind !== "heading") return;
+    if (e.level <= 2) section = e.level === 2 ? e.text : null;
     const h = keyedHeading(e.text);
     if (file.type === "feature" && e.level === 3 && h && e.text.startsWith("rule_")) {
       const end = sectionEnd(elements, i, 3, lines);
       const fields = readFields(lines, e.line, end);
-      file.rules.push({ key: h.key, statement: h.text, line: e.line, end, ...fields, elaboration: lines.slice(fields.fieldsEnd ?? e.line, end).join("\n").trim() });
+      file.rules.push({ key: h.key, statement: h.text, line: e.line, end, ...fields, elaboration: readElaboration(lines, e.line, end, 0, fields.fieldsEnd), form: "heading", indent: 0 });
     } else if (file.type === "feature" && e.level === 3 && h && e.text.startsWith("boundary_")) {
       const end = sectionEnd(elements, i, 3, lines);
-      const first = lines.findIndex((line, index) => index >= e.line && index < end && line.trim());
-      const owner = first === -1 ? null : /^Owner:\s*(.*)$/.exec(lines[first]);
-      file.boundaries.push({ key: h.key, statement: h.text, owner: owner ? owner[1].trim() : null, line: e.line, end, elaboration: lines.slice(owner ? first + 1 : e.line, end).join("\n").trim() });
+      const body = boundaryBody(lines, e.line, end, 0);
+      file.boundaries.push({ key: h.key, statement: h.text, owner: body.owner, line: e.line, end, elaboration: body.elaboration, form: "heading", indent: 0 });
     } else if (file.type === "scenario" && e.level === 3 && h) {
       file.cases.push(parseEntry(file, h, /** @type {MarkdownHeadingElement} */ (e), elements, i, lines));
     } else if (file.type === "execution" && e.level === 3 && h) {
@@ -392,6 +448,32 @@ export function parse(rel, text) {
     }
   });
   return file;
+}
+
+// A Rule or Boundary as the numbered list item a Feature writes (ADR-0061): `<n>. **<key>**:
+// <statement>`, its field lines directly beneath, and its elaboration after a blank line, both at
+// the item's content indent. The number is never identity: the caller numbers the list.
+/**
+ * @param {{
+ *   number: number,
+ *   key: string,
+ *   statement: string,
+ *   fields?: readonly { name: string, value: string }[],
+ *   elaboration?: string,
+ *   indent?: number,
+ * }} item
+ * @returns {string}
+ */
+export function ruleItem({ number, key, statement, fields = [], elaboration = "", indent = String(number).length + 2 }) {
+  const pad = " ".repeat(indent);
+  const lines = [`${number}. **${key}**: ${statement}`];
+  for (const field of fields) lines.push(`${pad}${field.name}:${field.value ? ` ${field.value}` : ""}`);
+  const body = elaboration.replace(/\r\n?/g, "\n").trimEnd();
+  if (body) {
+    lines.push("");
+    for (const text of body.split("\n")) lines.push(text.trim() ? `${pad}${text}` : "");
+  }
+  return lines.join("\n");
 }
 
 // Whether a file's frontmatter could be read: no parse problem sits on one of its lines. An
@@ -430,17 +512,18 @@ const RULE_FIELD = new Map(RULE_FIELDS.map((name) => [name, new RegExp(`^${name}
 // Rule is left without a Test Case, never what the system must do.
 /**
  * @param {string[]} lines
- * @param {number} from the Rule's heading line
+ * @param {number} from the Rule's heading or item line
  * @param {number} to the Rule's last line
+ * @param {number} [indent] the item's content indent, 0 for a heading
  * @returns {{ fields: RuleField[], fieldsEnd: number | null, waiver: string | null, waiverLine: number | null }}
  */
-function readFields(lines, from, to) {
+function readFields(lines, from, to, indent = 0) {
   /** @type {RuleField[]} */
   const fields = [];
   let l = from + 1;
   while (l <= to && !lines[l - 1].trim()) l++;
   for (; l <= to; l++) {
-    const field = fieldOf(lines[l - 1]);
+    const field = fieldOf(dedent(lines[l - 1], indent));
     if (!field) break;
     fields.push({ ...field, line: l });
   }
@@ -451,6 +534,81 @@ function readFields(lines, from, to) {
     waiver: waiver ? waiver.value : null,
     waiverLine: waiver ? waiver.line : null,
   };
+}
+
+// An entry's elaboration: its body after any field block, every line dedented by the item's
+// content indent, trimmed. A heading's indent is 0, so both forms expose the same text.
+/**
+ * @param {string[]} lines
+ * @param {number} from the Rule's heading or item line
+ * @param {number} to the Rule's last line
+ * @param {number} indent
+ * @param {number | null} fieldsEnd
+ * @returns {string}
+ */
+function readElaboration(lines, from, to, indent, fieldsEnd) {
+  return lines.slice(fieldsEnd ?? from, to).map((text) => dedent(text, indent)).join("\n").trim();
+}
+
+// A Boundary's owner, its first non-blank body line when it reads `Owner: <feature|none>`, and its
+// elaboration after it. A heading's indent is 0.
+/**
+ * @param {string[]} lines
+ * @param {number} from the Boundary's heading or item line
+ * @param {number} to the Boundary's last line
+ * @param {number} indent
+ * @returns {{ owner: string | null, elaboration: string }}
+ */
+function boundaryBody(lines, from, to, indent) {
+  const first = lines.findIndex((line, index) => index >= from && index < to && line.trim());
+  const owner = first === -1 ? null : /^Owner:\s*(.*)$/.exec(dedent(lines[first], indent));
+  return {
+    owner: owner ? owner[1].trim() : null,
+    elaboration: lines.slice(owner ? first + 1 : from, to).map((text) => dedent(text, indent)).join("\n").trim(),
+  };
+}
+
+// A line with the item's content indent removed. A blank line stays blank, so the elaboration's
+// internal blank lines are kept.
+/**
+ * @param {string} text
+ * @param {number} indent
+ * @returns {string}
+ */
+function dedent(text, indent) {
+  if (!text.trim()) return "";
+  let i = 0;
+  while (i < indent && text[i] === " ") i++;
+  return text.slice(i);
+}
+
+// The key and statement of an item's first line, `<n>. **<key>**: <statement>`, or null.
+/**
+ * @param {string} text
+ * @returns {{ key: string, text: string } | null}
+ */
+function itemHeading(text) {
+  const m = text.match(/^\*\*([^*\s]+)\*\*: +(.*\S.*)$/);
+  return m ? { key: m[1], text: m[2] } : null;
+}
+
+// The item's last line: the line before the next top-level item or heading, or the file's last
+// line, less any unindented non-blank line, which ends the entry and belongs to no entry.
+/**
+ * @param {MarkdownItemElement} item
+ * @param {string[]} lines
+ * @param {number[]} breaks
+ * @returns {number}
+ */
+function itemEnd(item, lines, breaks) {
+  const next = breaks.find((line) => line > item.line);
+  const end = next === undefined ? lines.length : next - 1;
+  for (let l = item.line + 1; l <= end; l++) {
+    const text = lines[l - 1];
+    if (!text.trim()) continue;
+    if ((/^ */.exec(text)?.[0].length ?? 0) < item.contentIndent) return l - 1;
+  }
+  return end;
 }
 
 // The field a line carries, if it is one: its name and its trimmed value.
@@ -708,6 +866,7 @@ export function projectConfig(project) {
     tiers: isMap(d.tiers) ? /** @type {Record<string, string>} */ (d.tiers) : {},
     targets: isMap(d.targets) ? /** @type {Record<string, string>} */ (d.targets) : undefined,
     execute_levels: /** @type {Record<string, string>} */ (isMap(d.execute_levels) ? d.execute_levels : undefined),
+    level_targets: isMap(d.level_targets) ? /** @type {Record<string, string>} */ (d.level_targets) : undefined,
     // The hosts `observe:` may look at, lower-cased: null when `scout.allowed_hosts` is absent,
     // no restriction; `[]` when `observe:` is off, as it is while the value is not a list.
     allowedHosts: isMap(d.scout) && d.scout.allowed_hosts !== undefined ? list(d.scout.allowed_hosts).map((h) => h.toLowerCase()) : null,
@@ -717,6 +876,9 @@ export function projectConfig(project) {
     bug_publish: hasBugPublishTracker(project) ? /** @type {BugPublishConfig} */ ({ issue_type: tracker.bug_type, link_type: tracker.bug_link_type, direction: tracker.bug_link_direction, fields: d.bug_fields ?? [] }) : undefined,
     stack: isMap(d.stack) ? /** @type {{ language: string, framework: string, root: string }} */ ({ language: d.stack.language, framework: d.stack.framework, root: d.stack.root ?? "." }) : null,
     annotationMap: isMap(d.annotation_map) ? /** @type {Record<string, string[]>} */ (d.annotation_map) : {},
+    // How a command treats the commit of the files it wrote (ADR-0062). A missing or invalid value
+    // is `print`, so an invalid `commit_mode` never makes a command commit; check-file reports it.
+    commitMode: isCommitMode(d.commit_mode) ? d.commit_mode : "print",
   };
 }
 

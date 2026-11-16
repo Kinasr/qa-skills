@@ -9,15 +9,18 @@
 //       `sync card` reads in place. Refuses a dir `sync scope` did not make, and a project with no
 //       tracker.
 //
-//   brief ui <url> <request> [--dir <run-dir>]
+//   brief ui <url> <request> [--signed-out] [--dir <run-dir>]
 //       The UI scout's brief for one `observe:` input (lib/scout-prompt.mjs `uiBrief`), with the
 //       Access note matching <url> and `train/deep-dive.md`'s Practices inlined. A note with a saved
 //       login (`via: cli:playwright-cli`) names the login-state file; a CLI login (ADR-0019;
 //       `identifiers.user`, the password in `env:NAME` or a `file:`) has it log in first
-//       (lib/scout-login.mjs), saving the login state into the run dir. Refuses, writing nothing,
-//       when `project.md`'s `scout.allowed_hosts` bars <url>'s host (checked first), no note
-//       matches, the note is neither, the login-state or password file is missing or one git would
-//       track, the password's variable is unset, or the login fails.
+//       (lib/scout-login.mjs), saving the login state into the run dir. `--signed-out` asks for the
+//       page as a signed-out visitor sees it (ADR-0065): no login is made and no login state is
+//       loaded, so the host only has to be one an Access note reaches, Role-tagged included, and
+//       `login_secret_missing` and `login_failed` cannot occur. Refuses, writing nothing, when
+//       `project.md`'s `scout.allowed_hosts` bars <url>'s host (checked first), no note matches,
+//       the note is neither (an ordinary input only), the login-state or password file is missing or
+//       one git would track, the password's variable is unset, or the login fails.
 //
 //   ingest --dir <run-dir>
 //       Checks the report a UI scout wrote into the run dir and writes it as an Observation at
@@ -39,16 +42,22 @@
 //       for `/qa-train access` to show at its gate. Prints `{ok, steps}`, and for a file its absolute
 //       path from the repository root as `password_file`. Reads no note. Writes nothing.
 //
+//   header-steps <header_via>
+//       The CLI-written setup steps for an API key or token held in `env:NAME` (lib/scout-prompt.mjs
+//       `headerSteps`), for `/qa-train access` to show at its gate. Prints `{ok, steps}`. Reads no
+//       note. Writes nothing.
+//
 // One Scout per run dir (for `ui` a fresh OS temp dir by default; ADR-0024's convention,
 // lib/run-dir.mjs; for `tracker`, sync's own run dir, where a new brief replaces the last). A
 // `brief <scout>` call writes, and prints the absolute path of:
 //
 //   scout-<scout>.brief.md   `brief_file`: the brief, which the Scout is told to read
 //   scout-<scout>.json       the input the brief was written for (for `ui`: `url`, `request`, the
-//                            Access note's key, the login-state file's absolute path, for a CLI
-//                            login `login: "cli"` and the `user`, the session and `output_file`),
-//                            which a later `scout` call reads back; what it
-//                            checks the output against is lib/scout-prompt.mjs's, never a copy
+//                            Access note's key and the login-state file's absolute path, or
+//                            `signed_out: true` with neither, for a CLI login `login: "cli"` and the
+//                            `user`, the session and `output_file`), which a later `scout` call reads
+//                            back; what it checks the output against is lib/scout-prompt.mjs's, never
+//                            a copy
 //
 // and prints `output_file`, the one file the Scout writes (ADR-0018). For `ui` it is
 // `scout-ui.report.md` in the run dir, which `scout ingest` reads back. Every refusal prints
@@ -56,8 +65,9 @@
 import { existsSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { accessFor, rolesCoveringIn } from "./access.mjs";
-import { cliLoginUser, PASSWORD_VIA } from "./access-note.mjs";
+import { accessFor, noteReaches, rolesCoveringIn } from "./access.mjs";
+import { cliLoginUser, credentialSource, HEADER_VIA, PASSWORD_VIA } from "./access-note.mjs";
+import { authHome, checkoutRoots, resolveAuthKey, resolveCredential } from "./credential-source.mjs";
 import { orThrow, SCAN_CLI, UsageError, usageOf } from "./cli.mjs";
 import { rootConfig } from "./qa-index.mjs";
 import { newRunDir } from "./run-dir.mjs";
@@ -65,8 +75,10 @@ import { subagentModel, tierOf } from "./tiers.mjs";
 import { refuseUnreadSchema } from "./schema-guard.mjs";
 import { ANY_SCHEMA_VERSION, DEEP_DIVE_TRAIN_KEY, PUBLISH_TRAIN_KEY, SYNC_TRAIN_KEY } from "./schema.mjs";
 import { ingestUi, refuse } from "./scout-ingest.mjs";
+/** @import { PlatformContext } from "./platform.mjs" */
 import { logIn } from "./scout-login.mjs";
-import { loginSteps, passwordSteps, trackerBrief, uiBrief } from "./scout-prompt.mjs";
+import { checkDirPrivacy } from "./platform-privacy.mjs";
+import { headerSteps, loginSteps, passwordSteps, trackerBrief, uiBrief } from "./scout-prompt.mjs";
 import { isSyncRunDir, command as sync } from "./sync.mjs";
 import { practicesText } from "./training.mjs";
 import { publisherBrief, isPublishRunDir, command as publish } from "./publish.mjs";
@@ -100,15 +112,17 @@ import { publisherBrief, isPublishRunDir, command as publish } from "./publish.m
  */
 
 /**
- * `scout-ui.json`, the UI scout's record, written by `brief ui` and read by `ingest`.
+ * `scout-ui.json`, the UI scout's record, written by `brief ui` and read by `ingest`. A signed-out
+ * brief records `signed_out: true`, no `login_state` and no Access note (`access: null`).
  * @typedef {{
  *   scout: "ui",
  *   url: string,
  *   request: string,
- *   access: string,
- *   login_state: string,
+ *   access: string | null,
+ *   login_state?: string,
  *   login?: "cli",
  *   user?: string,
+ *   signed_out?: true,
  *   session: string,
  *   output_file: string,
  * }} ScoutUiRecord
@@ -146,7 +160,7 @@ import { publisherBrief, isPublishRunDir, command as publish } from "./publish.m
 
 /**
  * Where a password `via` keeps it.
- * @typedef {{ name?: string, file?: string }} PasswordPlace
+ * @typedef {{ name?: string, key?: string, file?: string }} PasswordPlace
  */
 
 /**
@@ -165,22 +179,31 @@ import { publisherBrief, isPublishRunDir, command as publish } from "./publish.m
 // Every scout action's synopsis, which each usage error ends with.
 const usage = () => usageOf("scout", command).join(" | ");
 
+// `--signed-out` belongs to `brief ui` alone; another action refuses it rather than ignore it.
+/**
+ * @param {CommandContext} ctx
+ * @returns {void}
+ */
+function noSignedOut(ctx) {
+  if (ctx["signed-out"] === true) throw new UsageError(`--signed-out is for \`scout brief ui\`; ${usage()}`);
+}
+
 // The `via` an app's Access note names: the UI scout reaches the app through playwright-cli alone.
 const PLAYWRIGHT_VIA = "cli:playwright-cli";
 // The key of the Access note's `identifiers` that names the login-state file, repo-relative.
 const LOGIN_STATE = "login_state";
 
 // The command line's `scout <action>` (scripts/scan.mjs): each prints `{json, exit}`. Every action
-// takes the same options, which may come before it.
+// takes the same options, which may come before it; `--signed-out` is `brief ui`'s alone.
 /** @type {OptionSpec} */
-const OPTIONS = { root: "qa-dir", dir: "value" };
+const OPTIONS = { root: "qa-dir", dir: "value", "signed-out": "flag" };
 
 /** @type {CommandDefinition} */
 export const command = {
   options: OPTIONS,
   actions: {
     brief: {
-      usage: ["ui <url> <request> [--dir <run-dir>] [--root <qa-dir>]", "tracker --dir <run-dir> [--root <qa-dir>]", "publisher --dir <run-dir> [--root <qa-dir>]"],
+      usage: ["ui <url> <request> [--signed-out] [--dir <run-dir>] [--root <qa-dir>]", "tracker --dir <run-dir> [--root <qa-dir>]", "publisher --dir <run-dir> [--root <qa-dir>]"],
       /**
        * @param {string[]} params
        * @param {CommandContext} ctx
@@ -188,6 +211,7 @@ export const command = {
        */
       run([kind, ...args], ctx) {
         if (!Object.hasOwn(BRIEFS, kind ?? "")) throw new UsageError(`scout brief takes a scout: ${Object.keys(BRIEFS).join(", ")}; ${usage()}`);
+        if (kind !== "ui") noSignedOut(ctx);
         const result = BRIEFS[/** @type {string} */ (kind)](args, /** @type {ScoutCommandContext} */ (ctx));
         return { exit: result.exit, json: { action: "brief", scout: kind, ...result.json } };
       },
@@ -199,7 +223,9 @@ export const command = {
        * @param {ScoutCommandContext} ctx
        * @returns {CommandResult}
        */
-      run(args, { root, dir }) {
+      run(args, ctx) {
+        noSignedOut(ctx);
+        const { root, dir } = ctx;
         if (args.length !== 0) throw new UsageError(`scout ingest takes no arguments, only --dir <run-dir>; ${usage()}`);
         const newer = refuseUnreadSchema(root, ANY_SCHEMA_VERSION);
         if (newer) return newer;
@@ -214,7 +240,9 @@ export const command = {
        * @param {ScoutCommandContext} ctx
        * @returns {CommandResult}
        */
-      run(args, { root }) {
+      run(args, ctx) {
+        noSignedOut(ctx);
+        const { root } = ctx;
         if (args.length !== 2) throw new UsageError(`scout login-steps takes exactly a <url> and a <login_state>; ${usage()}`);
         const [url, named] = args;
         if (!isWebUrl(url)) throw new UsageError(`\`${url}\` is not an http or https URL`);
@@ -222,7 +250,7 @@ export const command = {
         const target = Object.values(rootConfig(root).targets ?? {}).includes(new URL(url).origin);
         const barred = target ? null : hostRefusal(root, url);
         if (barred) return { exit: barred.exit, json: { action: "login-steps", ...barred.json } };
-        const login_state = repoPath(root, named);
+        const login_state = loginStatePlaces(root, named).save;
         return { exit: 0, json: { action: "login-steps", ok: true, login_state, steps: loginSteps({ url, loginState: login_state }) } };
       },
     },
@@ -233,10 +261,24 @@ export const command = {
        * @param {ScoutCommandContext} ctx
        * @returns {CommandResult}
        */
-      run(args, { root }) {
-        if (args.length !== 1 || !PASSWORD_VIA.test(args[0])) throw new UsageError(`scout password-steps takes exactly a <via>, \`env:NAME\` or \`file:<path>\`; ${usage()}`);
+      run(args, ctx) {
+        noSignedOut(ctx);
+        const { root } = ctx;
+        if (args.length !== 1 || !PASSWORD_VIA.test(args[0])) throw new UsageError(`scout password-steps takes exactly a <via>, \`auth:KEY\`, \`env:NAME\` or \`file:<path>\`; ${usage()}`);
         const place = passwordPlace(root, args[0]);
         return { exit: 0, json: { action: "password-steps", ok: true, ...(place.file && { password_file: place.file }), steps: passwordSteps(place) } };
+      },
+    },
+    "header-steps": {
+      usage: "<header_via> [--root <qa-dir>]",
+      /**
+       * @param {string[]} args
+       * @returns {CommandResult}
+       */
+      run(args, ctx) {
+        noSignedOut(ctx);
+        if (args.length !== 1 || !HEADER_VIA.test(args[0])) throw new UsageError(`scout header-steps takes exactly a <header_via>, auth:KEY or env:NAME; ${usage()}`);
+        return { exit: 0, json: { action: "header-steps", ok: true, steps: headerSteps(credentialSource(args[0])) } };
       },
     },
   },
@@ -263,10 +305,12 @@ const BRIEFS = {
   },
   /**
    * @param {string[]} args
-   * @param {ScoutCommandContext} options
+   * @param {ScoutCommandContext} ctx
    * @returns {CommandResult}
    */
-  ui(args, { root, dir }) {
+  ui(args, ctx) {
+    const { root, dir, "signed-out": signedOut, env } = ctx;
+    const platformContext = /** @type {PlatformContext | undefined} */ (ctx.platformContext);
     if (args.length !== 2) throw new UsageError(`scout brief ui takes exactly a <url> and a <request>; ${usage()}`);
     const [url, request] = args;
     if (!isWebUrl(url)) throw new UsageError(`\`${url}\` is not an http or https URL`);
@@ -279,35 +323,62 @@ const BRIEFS = {
       return refuse("dir_has_scout", `${run.dir} already holds a UI scout's brief: one UI scout per run dir, so name a fresh --dir`);
     }
 
-    // observe: reads the role-less note only; the lookup URI is normalised as a Reference's is.
+    // observe: reads the role-less note only, unless the input asks for a signed-out page, which
+    // reads no note at all but still needs one reaching the host. The lookup URI is normalised as a
+    // Reference's is.
+    const observeSignedOut = signedOut === true;
     const uri = `url:${new URL(url).href}`;
-    const note = /** @type {ScoutAccessNote | null} */ (accessFor(root, [uri], { passwordFiles: true })[uri]);
-    if (!note) {
-      const roles = rolesCoveringIn(root, uri, { passwordFiles: true });
-      if (roles.length) return refuse("no_access_note", `no role-less Access note matches ${url}, only Role-tagged ones (${roles.join(", ")}), and observe: reads a role-less note only: add a role-less note with its own test account for the app with \`/qa-train access\`, or drop \`role\` from the note of the account observe: should use`, { roles });
-      return refuse("no_access_note", `no Access note matches ${url}: teach how to reach the app with \`/qa-train access\` (a \`url:\` prefix covering it, \`via: ${PLAYWRIGHT_VIA}\` and the login-state file)`);
+    /** @type {ScoutAccessNote | null} */
+    let note = null;
+    /** @type {ScoutLogin | null} */
+    let login = null;
+    if (observeSignedOut) {
+      if (!noteReaches(root, uri)) {
+        return refuse("no_access_note", `no Access note matches ${url}: teach how to reach the app with \`/qa-train access\` (a \`url:\` prefix covering it, by any note the app is reached through)`);
+      }
+    } else {
+      note = /** @type {ScoutAccessNote | null} */ (accessFor(root, [uri], { passwordFiles: true })[uri]);
+      if (!note) {
+        const roles = rolesCoveringIn(root, uri, { passwordFiles: true });
+        if (roles.length) return refuse("no_access_note", `no role-less Access note matches ${url}, only Role-tagged ones (${roles.join(", ")}), and observe: reads a role-less note only: add a role-less note with its own test account for the app with \`/qa-train access\`, drop \`role\` from the note of the account observe: should use, or observe it signed out with \`observe:signed-out\``, { roles });
+        return refuse("no_access_note", `no Access note matches ${url}: teach how to reach the app with \`/qa-train access\` (a \`url:\` prefix covering it, \`via: ${PLAYWRIGHT_VIA}\` and the login-state file)`);
+      }
+      if (note.withheld) return refuse("note_withheld", `the Access note matching ${url} holds what looks like a credential, so it is not passed to a Scout: fix \`train/access.md\` with \`/qa-train access\``);
+      login = loginFor(root, note, url, platformContext);
+      if (login.refusal) return login.refusal;
     }
-    if (note.withheld) return refuse("note_withheld", `the Access note matching ${url} holds what looks like a credential, so it is not passed to a Scout: fix \`train/access.md\` with \`/qa-train access\``);
-    const login = loginFor(root, note, url);
-    if (login.refusal) return login.refusal;
 
     const made = (/** @type {{ make: () => string }} */ (run)).make();
-    const session = basename(made).replace(/[^A-Za-z0-9_-]/g, "-");
-    const reached = login.reach(made, session);
-    if (reached.refusal) {
-      // A run dir this brief made holds nothing worth keeping; one named by --dir that already existed is left.
+    const madePrivacy = checkDirPrivacy(made, { env });
+    if (!madePrivacy.ok) {
       if (!run.exists) rmSync(made, { recursive: true, force: true });
-      return reached.refusal;
+      return refuse(madePrivacy.refusal.code, madePrivacy.refusal.message, { ...(madePrivacy.refusal.command && { command: madePrivacy.refusal.command }) });
     }
-    const loginState = reached.state;
+    const session = basename(made).replace(/[^A-Za-z0-9_-]/g, "-");
+    /** @type {string | null} */
+    let loginState = null;
+    if (login) {
+      const reached = login.reach(made, session);
+      if (reached.refusal) {
+        // A run dir this brief made holds nothing worth keeping; one named by --dir that already existed is left.
+        if (!run.exists) rmSync(made, { recursive: true, force: true });
+        return reached.refusal;
+      }
+      loginState = reached.state;
+    }
     const brief_file = join(made, "scout-ui.brief.md");
     const output_file = join(made, "scout-ui.report.md");
     const practices = practicesText(root, DEEP_DIVE_TRAIN_KEY);
-    writeFileSync(brief_file, uiBrief({ dir: made, session, url, request, output: output_file, loginState, note, practices }));
+    // `playwright-cli open --config` reads it: the snapshots land in the run dir with no `cd`.
+    const config = join(made, "playwright-cli.json");
+    writeFileSync(config, `${JSON.stringify({ outputDir: made }, null, 2)}\n`);
+    writeFileSync(brief_file, uiBrief({ dir: made, config, session, url, request, output: output_file, loginState, note, practices, signedOut: observeSignedOut }));
     /** @type {ScoutUiRecord} */
-    const record = { scout: "ui", url, request, access: note.key, login_state: loginState, ...login.record, session, output_file };
+    const record = observeSignedOut
+      ? { scout: "ui", url, request, access: null, signed_out: true, session, output_file }
+      : { scout: "ui", url, request, access: /** @type {ScoutAccessNote} */ (note).key, login_state: /** @type {string} */ (loginState), .../** @type {ScoutLogin} */ (login).record, session, output_file };
     writeFileSync(join(made, "scout-ui.json"), `${JSON.stringify(record, null, 2)}\n`);
-    return { exit: 0, json: { ok: true, dir: made, brief_file, output_file, access: note.key, ...modelOf(root, "ui scout") } };
+    return { exit: 0, json: { ok: true, dir: made, brief_file, output_file, access: observeSignedOut ? null : /** @type {ScoutAccessNote} */ (note).key, ...(observeSignedOut && { signed_out: true }), ...modelOf(root, "ui scout") } };
   },
 
   // `/qa-sync`'s tracker scout: briefed in sync's own run dir, it writes `sync scope`'s
@@ -330,13 +401,13 @@ const BRIEFS = {
     const scoped = /** @type {{ exit: number, json: { ok?: boolean, refusals?: { reason?: string, line?: string }[], text: string, payload_file: string, access: ScoutAccessNote | null, [field: string]: unknown } }} */ (
       (publishing ? publish : sync).actions.scope.run([], { root, dir: runDir }));
     if (scoped.json.ok === false) throw new UsageError(scoped.json.refusals?.[0]?.reason ?? scoped.json.refusals?.[0]?.line ?? scoped.json.text);
-    const { payload_file, tracker, fields, label_destinations, mark_field, mark_search, scenarios, suites, cases, suite_items, suite_search, marked_cases, marked_scenarios, marked_suites, stories, bug_metadata, bug_statuses, access } = scoped.json;
+    const { payload_file, tracker, fields, label_destinations, level_destinations, mark_field, mark_search, scenarios, suites, cases, suite_items, suite_search, marked_cases, marked_scenarios, marked_suites, stories, bug_metadata, bug_statuses, access } = scoped.json;
     if (!tracker) return refuse("no_tracker", "`project.md` configures no tracker, so there is nothing for a tracker scout to fetch");
 
     const brief_file = join(runDir, "scout-tracker.brief.md");
     const prose = `node ${SCAN_CLI} ${publishing ? "publish" : "sync"} scope --dir ${runDir} --root ${resolve(root)}`;
     const practices = practicesText(root, publishing ? PUBLISH_TRAIN_KEY : SYNC_TRAIN_KEY);
-    writeFileSync(brief_file, trackerBrief({ output: payload_file, scope: /** @type {import("./scout-prompt.mjs").TrackerScope} */ ({ fields, label_destinations, mark_field, mark_search, scenarios, suites, cases, suite_items, suite_search, marked_cases, marked_scenarios, marked_suites, stories, bug_metadata, bug_statuses }), prose, note: access, practices, publishing }));
+    writeFileSync(brief_file, trackerBrief({ output: payload_file, scope: /** @type {import("./scout-prompt.mjs").TrackerScope} */ ({ fields, label_destinations, level_destinations, mark_field, mark_search, scenarios, suites, cases, suite_items, suite_search, marked_cases, marked_scenarios, marked_suites, stories, bug_metadata, bug_statuses }), prose, note: access, practices, publishing }));
     /** @type {ScoutTrackerRecord} */
     const record = { scout: "tracker", access: access?.key ?? null, output_file: /** @type {string} */ (payload_file) };
     writeFileSync(join(runDir, "scout-tracker.json"), `${JSON.stringify(record, null, 2)}\n`);
@@ -384,9 +455,10 @@ function modelOf(root, agent) {
  * @param {string} root
  * @param {ScoutAccessNote} note
  * @param {string} url
+ * @param {PlatformContext} [platformContext]
  * @returns {ScoutLogin}
  */
-export function loginFor(root, note, url) {
+export function loginFor(root, note, url, platformContext) {
   const user = cliLoginUser(note);
   if (user) {
     const secret = readSecret(root, note);
@@ -397,9 +469,9 @@ export function loginFor(root, note, url) {
      * @returns {ScoutReach}
      */
     const reach = (dir, session) => {
-      /** @type {{ state: string, reason?: undefined, error?: undefined, unreachable?: undefined } | { reason: string, error: string, unreachable?: boolean, state?: undefined }} */
-      const login = logIn({ dir, session, url, password: secret.password, identifiers: note.identifiers });
-      return login.reason ? { refusal: refuse(login.reason, `Access note \`${note.key}\`: ${login.error}`, { access: note.key }), ...(login.unreachable && { unreachable: true }) } : { state: /** @type {string} */ (login.state) };
+      /** @type {{ state: string, reason?: undefined, error?: undefined, check?: undefined, unreachable?: undefined } | { reason: string, error: string, check?: string, unreachable?: boolean, state?: undefined }} */
+      const login = logIn({ dir, session, url, password: secret.password, identifiers: note.identifiers, platformContext });
+      return login.reason ? { refusal: refuse(login.reason, `Access note \`${note.key}\`: ${login.error}`, { access: note.key, ...(login.check && { check: login.check }) }), ...(login.unreachable && { unreachable: true }) } : { state: /** @type {string} */ (login.state) };
     };
     return { reach, record: { login: "cli", user } };
   }
@@ -410,8 +482,9 @@ export function loginFor(root, note, url) {
   if (typeof named !== "string" || !named) {
     return { refusal: refuse("no_login_state", `Access note \`${note.key}\` names no login-state file: add \`${LOGIN_STATE}\` to its \`identifiers\`, a git-ignored path such as \`.qa/.auth/app.json\`, with \`/qa-train access\``) };
   }
-  const loginState = repoPath(root, named);
-  if (!existsSync(loginState)) {
+  const { found, save } = loginStatePlaces(root, named);
+  const loginState = found ?? save;
+  if (!found) {
     return { refusal: refuse("login_state_missing", `the login-state file \`${named}\` that Access note \`${note.key}\` names does not exist: ${loginSteps({ url, loginState })}`) };
   }
   const tracked = trackedRefusal(loginState, { reason: "login_state", what: "the login-state file", holding: "its session cookies" });
@@ -427,13 +500,19 @@ export function loginFor(root, note, url) {
  * @param {ScoutAccessNote} note
  * @returns {ScoutSecret}
  */
-function readSecret(root, note) {
+export function readSecret(root, note) {
   /** @param {string} where @param {string} steps @returns {ScoutSecret} */
   const missing = (where, steps) => ({ refusal: refuse("login_secret_missing", `Access note \`${note.key}\` logs in with the password in ${where}: ${steps}${from(note)}`, { access: note.key }) });
-  const { name, file } = passwordPlace(root, /** @type {string} */ (note.via));
+  const { name, key, file } = passwordPlace(root, /** @type {string} */ (note.via));
+  if (key) {
+    const { value: password, refusal } = resolveAuthKey(root, key);
+    if (refusal) return { refusal: refuse(refusal.code, refusal.message, { gitignore_line: refusal.gitignore_line }) };
+    return password ? { password } : missing(`the key \`${key}\` of ${authHome(root)}, where no password is set`, passwordSteps({ key }));
+  }
   if (name) {
-    const password = process.env[name];
-    return password ? { password } : missing(`the environment variable \`${name}\`, which is not set in the environment this agent was started from`, passwordSteps({ name }));
+    const { value: password, refusal } = resolveCredential(root, name);
+    if (refusal) return { refusal: refuse(refusal.code, refusal.message, { gitignore_line: refusal.gitignore_line }) };
+    return password ? { password } : missing(`the environment variable \`${name}\` or the repo root's \`.env\`, where no password is set`, passwordSteps({ name }));
   }
   const named = /** @type {string} */ (note.via).slice("file:".length);
   if (!existsSync(/** @type {string} */ (file))) return missing(`the file \`${named}\`, which does not exist`, passwordSteps({ file }));
@@ -443,14 +522,15 @@ function readSecret(root, note) {
   return password ? { password } : missing(`the file \`${named}\`, which is empty`, passwordSteps({ file }));
 }
 
-// Where a password `via` (`PASSWORD_VIA`) keeps it: `{name}`, an environment variable's, or `{file}`,
-// the absolute path of a repo-relative file.
+// Where a password `via` (`PASSWORD_VIA`) keeps it: `{name}`, an environment variable's, `{key}`, an
+// Auth-file key's (ADR-0060), or `{file}`, the absolute path of a repo-relative file.
 /**
  * @param {string} root
  * @param {string} via
  * @returns {PasswordPlace}
  */
 function passwordPlace(root, via) {
+  if (via.startsWith("auth:")) return { key: via.slice("auth:".length) };
   return via.startsWith("env:") ? { name: via.slice("env:".length) } : { file: repoPath(root, via.slice("file:".length)) };
 }
 
@@ -477,6 +557,19 @@ function trackedRefusal(abs, { reason, what, holding }) {
  * @returns {string}
  */
 const from = (note) => (typeof note.credential_from === "string" && note.credential_from ? ` (the password: ${note.credential_from})` : "");
+
+// Where a note's repo-relative `login_state` is (ADR-0060): `found`, the first existing file, the
+// current checkout's before the main checkout's, or null; and `save`, where a saved login goes, the
+// main checkout's when there is one, so a single save serves every worktree.
+/**
+ * @param {string} root
+ * @param {string} named
+ * @returns {{ found: string | null, save: string }}
+ */
+function loginStatePlaces(root, named) {
+  const places = checkoutRoots(root).map((c) => resolve(dirname(c.root), named));
+  return { found: places.find((p) => existsSync(p)) ?? null, save: places[places.length - 1] };
+}
 
 // The absolute path of a repo-relative path an Access note names (a login-state or password file):
 // under the repository's root, the directory that holds `root` (`.qa/`).

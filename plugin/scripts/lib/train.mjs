@@ -1,7 +1,7 @@
 // @ts-check
 // `train`: the deterministic half of `/qa-train`. The skill
 // derives Conventions, Practices and Access notes, classifies them and holds the gate with the
-// engineer; everything here only reads.
+// engineer; everything here only reads, but `auth-ignore`.
 //
 //   evidence [design] <scenario-key>              an exemplar scenario, Bookkeeping-stripped
 //   evidence [design] --diff <commit-ish> [<key>] the scenario changes since <commit-ish>: the
@@ -12,6 +12,9 @@
 //   evidence codegen --from-code [<path>...]      the bounded test-code sample, corpus and gate
 //     [--relearn [--facet <facet>...]]
 //   check [<target>] --stdin                      a drafted train file, before the skill writes it
+//   auth-ignore <line>                            appends one ignore line `check access` offered to
+//                                                 the repository's `.gitignore` (lib/gitignore-line.mjs),
+//                                                 the one write here
 //
 // A target is one of the closed list `check-file` keeps (`TRAIN_KEYS`), and a first argument on
 // that list is always the target, never a scenario key. No target means `design`, so every v1
@@ -38,6 +41,8 @@ import { UsageError } from "./cli.mjs";
 import { filesUnder } from "./code-source.mjs";
 import { codegenSample } from "./codegen-sample.mjs";
 import { credentialIn, secretsIn, shownKey, WITHHELD } from "./credentials.mjs";
+import { AUTH_FILE, AUTH_TEMPLATE, credentialSourceProblems, credentialSourceWarnings } from "./credential-source.mjs";
+import { authKeysNeeded, authTemplate } from "./auth-template.mjs";
 import { isMap } from "./dialect.mjs";
 import { latestAutomationResults, latestExecutionResults } from "./execution-results.mjs";
 import { executeIntegrity, executeOutcomeClaims, executeTraining, fixtureExists } from "./execute-training.mjs";
@@ -49,6 +54,7 @@ import { buildIndex, loadWorkingTree, rootConfig } from "./qa-index.mjs";
 import { scan } from "./scan.mjs";
 import { escape, namesOfTheSystem, WHAT as SCAN_WHAT } from "./scan-train.mjs";
 import { repoPath as namedRepoPath } from "./scout.mjs";
+import { appendIgnoreLine, GITIGNORE, ignoreLineProblem } from "./gitignore-line.mjs";
 import { fixTraining } from "./fix-training.mjs";
 import { trainFile } from "./training.mjs";
 import { ACCESS_TRAIN_KEY, BUG_TRAIN_KEY, CODEGEN_FACETS, CODEGEN_TRAIN_KEY, DESIGN_TRAIN_KEY, EXECUTE_TRAIN_KEY, CODEFIX_TRAIN_KEY, KNOWN, TRAIN_KEYS, canonicalTrainKey, isSharedTrainKey } from "./schema.mjs";
@@ -263,7 +269,7 @@ export const command = {
         const { named, args } = splitTarget(given);
         const target = named ?? DESIGN_TRAIN_KEY;
         if (args.length !== 0) throw new UsageError(`train check takes at most a <target>: the draft is always train/<target>.md, here train/${target}.md`);
-        if (!stdin) throw new UsageError("train check reads the drafted train file from --stdin");
+        if (!stdin) throw new UsageError("train check reads the drafted train file from --input <file> or --stdin");
         const ctx = load(/** @type {string} */ (root));
         checkStack(target, /** @type {string | undefined} */ (stack), ctx);
         const checked = checkDraft(ctx, stdin(), target);
@@ -276,9 +282,24 @@ export const command = {
           ok,
           // Only a draft `ok` carries the report: the gate offers its lines, and a draft that failed
           // is rewritten before anything is offered.
-          ...(target === ACCESS_TRAIN_KEY && ok ? { access_files: accessFiles(ctx, /** @type {TrainEntry[]} */ (draft)) } : {}),
+          ...(target === ACCESS_TRAIN_KEY && ok ? { access_files: accessFiles(ctx, /** @type {TrainEntry[]} */ (draft)), auth_template: authTemplateFile(ctx, /** @type {TrainEntry[]} */ (draft)) } : {}),
         };
         return { json, exit: ok ? 0 : 1 };
+      },
+    },
+
+    "auth-ignore": {
+      usage: "<line> [--root <qa-dir>]",
+      run(given, { root }) {
+        if (given.length !== 1) throw new UsageError("train auth-ignore takes one <line>: an `access_files` entry's `gitignore_line`");
+        const [line] = given;
+        const refuse = (/** @type {string} */ reason, /** @type {string} */ error) => ({ exit: 1, json: { action: "auth-ignore", ok: false, reason, error } });
+        const problem = ignoreLineProblem(line);
+        if (problem) return refuse("invalid_ignore_line", problem);
+        const repo = repositoryOf(resolve(/** @type {string} */ (root)));
+        if (!repo) return refuse("not_a_repository", "the project is not in a git repository, so there is no `.gitignore` to keep the file out of");
+        const { added } = appendIgnoreLine(repo.top, line);
+        return { exit: 0, json: { action: "auth-ignore", ok: true, file: GITIGNORE, line, added, commit: added ? commitLine([GITIGNORE], `qa(train): ignore ${line}`) : null } };
       },
     },
   },
@@ -412,12 +433,16 @@ function relearnGate(ctx, facets, evidence, commit) {
 /**
  * @param {TrainContext} ctx
  * @param {ParsedFile} parsed
+ * @param {string} text
  * @param {{ code: string, field?: string, message: string, line?: number | null }[]} errors
  * @returns {void}
  */
-function checkCodegenDraft(ctx, parsed, errors) {
+function checkCodegenDraft(ctx, parsed, text, errors) {
   const stack = ctx.stack?.root;
   const data = parsed.data;
+  const fileLines = text.replace(/\r\n/g, "\n").split("\n");
+  /** @param {string} s */
+  const norm = (s) => s.replace(/['"]/g, '"');
   const error = (/** @type {string} */ field, /** @type {string} */ message) => errors.push({ code: "invalid", field, message });
   if (Array.isArray(data.trained_stacks) && data.trained_stacks.some((s) => s !== stack)) {
     error("trained_stacks", "a trained stack is the project's `stack.root`");
@@ -436,6 +461,22 @@ function checkCodegenDraft(ctx, parsed, errors) {
       if (!resolvesUnderAny(ctx.repo, ref, allowed)) {
         // The ref is never repeated: a ref is a path, and a path can carry a credential.
         error(`${entry.key}.refs`, `a ref does not resolve under ${roots.length ? "`module_paths`" : "the stack root"}`);
+      }
+    }
+    const entryFences = (parsed.fences ?? []).filter((f) => f.line > entry.line && f.line <= entry.end);
+    if (entryFences.length >= 3 && Array.isArray(entry.data.sources)) {
+      const antiLines = entryFences.slice(2).flatMap((f) => fileLines.slice(f.line, f.end - 1))
+        .map((line) => norm(line.replace(/\s*(?:\/\/|#|--|\/\*).*$/, "").trim())).filter(Boolean);
+      for (const source of entry.data.sources) {
+        const match = typeof source === "string" ? /^code:(.+)#L(\d+)@[0-9a-f]{7}$/i.exec(source) : null;
+        if (!match || !resolvesUnderAny(ctx.repo, match[1], [ctx.repo])) continue;
+        try {
+          const cited = norm(readFileSync(resolve(ctx.repo, match[1]), "utf8").replace(/\r\n/g, "\n").split("\n")[Number(match[2]) - 1]?.trim() ?? "");
+          if (cited && antiLines.some((anti) => cited.includes(anti) || anti.includes(cited))) {
+            error(`${entry.key}.sources`, "a `code:` source never cites the form the Convention forbids");
+            break;
+          }
+        } catch { /* missing or unreadable citation file */ }
       }
     }
   }
@@ -471,8 +512,15 @@ function checkDraft(ctx, text, target) {
   const file = repoPath(ctx, rel);
   const parsed = parse(rel, text);
   const checked = checkFile(parsed, rootConfig(ctx.root));
-  if (target === CODEGEN_TRAIN_KEY) checkCodegenDraft(ctx, parsed, checked.errors);
-  checked.errors.push(...executeIntegrity(parsed, { root: ctx.root, roles: ctx.roles, features: /** @type {Set<string>} */ (/** @type {unknown} */ (ctx.index.features)) }));
+  checked.errors.push(...credentialSourceProblems(ctx.root, parsed, { draft: true }));
+  checked.warnings.push(...credentialSourceWarnings(ctx.root, parsed));
+  if (target === CODEGEN_TRAIN_KEY) checkCodegenDraft(ctx, parsed, text, checked.errors);
+  checked.errors.push(...executeIntegrity(parsed, {
+    root: ctx.root,
+    roles: ctx.roles,
+    features: /** @type {Set<string>} */ (/** @type {unknown} */ (ctx.index.features)),
+    execute_levels: ctx.execute_levels,
+  }));
   checked.warnings.push(...executeOutcomeClaims(parsed));
   checked.ok = checked.errors.length === 0;
   const baseline = baselineOf(ctx, target);
@@ -497,6 +545,7 @@ function checkDraft(ctx, text, target) {
   const out = { ok: checked.ok, file, path, errors: checked.errors, warnings: checked.warnings, ...listed, statability };
   if (!out.ok) return out;
   const changeset = [file];
+  if (target === ACCESS_TRAIN_KEY && authTemplateFile(ctx, drafted("access_notes"))) changeset.push(repoPath(ctx, AUTH_TEMPLATE));
   // Design's message stays v1's, since bare `/qa-train` still means design.
   const message = target === DESIGN_TRAIN_KEY ? "qa(train): /qa-train" : `qa(train): /qa-train ${target}`;
   // The draft's raw entries leave only here, for `access`'s file report; they are never printed.
@@ -535,6 +584,7 @@ function accessFiles(ctx, notes) {
   for (const note of notes) {
     const { via } = note.data;
     const named = /** @type {unknown[]} */ ([
+      ...(authKeysNeeded([note]).length ? [relative(dirname(root), join(root, AUTH_FILE)).split(sep).join("/")] : []),
       ...(via === "cli:playwright-cli" ? [isMap(note.data.identifiers) ? note.data.identifiers.login_state : undefined] : []),
       ...(typeof via === "string" && via.startsWith("file:") ? [via.slice("file:".length)] : []),
     ]);
@@ -549,6 +599,20 @@ function accessFiles(ctx, notes) {
     }
   }
   return [...findings.values()].sort((a, b) => a.path.localeCompare(b.path));
+}
+
+// The Auth template (ADR-0060) the drafted Access notes need, for the gate to write beside `train/access.md`:
+// `{path, text}`, `{path, text: null}` when no note names an `auth:` key any more but a template is
+// still on disk (the gate deletes it), or null. It holds no value.
+/**
+ * @param {TrainContext} ctx
+ * @param {readonly TrainEntry[]} notes
+ * @returns {{ path: string, text: string | null } | null}
+ */
+function authTemplateFile(ctx, notes) {
+  const text = authTemplate(notes);
+  if (text === null && !existsSync(join(ctx.root, AUTH_TEMPLATE))) return null;
+  return { path: repoPath(ctx, AUTH_TEMPLATE), text };
 }
 
 // One entry kind's change from `was` to `draft` (each a list from `entriesOf`): the keys `listed`
@@ -840,6 +904,7 @@ function trainState(ctx, target) {
     const withheld = new Set(kindsOf(target).flatMap(entries).filter((e) => e.withheld).map((e) => e.line));
     return { ...base, ...training,
       ...((secretsIn({ setup_role: training.setup_role }).length > 0 || credentialIn(JSON.stringify(training.setup_role) ?? "")) && { setup_role: WITHHELD }),
+      ...((secretsIn({ redaction_exempt: training.redaction_exempt }).length > 0 || credentialIn(JSON.stringify(training.redaction_exempt) ?? "")) && { redaction_exempt: WITHHELD }),
       entries: training.entries.map((e) => withheld.has(e.line) ? { kind: e.kind, key: shownKey(e.key), line: e.line, withheld: true } : e),
     };
   }
@@ -850,7 +915,7 @@ function trainState(ctx, target) {
   if (target === CODEGEN_TRAIN_KEY) {
     const file = baseline ? parse(baseline.rel, readFileSync(baseline.path, "utf8")) : null;
     const data = file?.data ?? {};
-    return { ...base, pr: data.pr ?? "on-request", trained_stacks: data.trained_stacks ?? [], codegen_repeats: data.codegen_repeats ?? 3, codegen_attempts: data.codegen_attempts ?? 3,
+    return { ...base, approaches: data.approaches ?? [], pr: data.pr ?? "on-request", trained_stacks: data.trained_stacks ?? [], codegen_repeats: data.codegen_repeats ?? 3, codegen_attempts: data.codegen_attempts ?? 3,
       conventions: entries("conventions").map((e) => e.withheld ? brief(e) : { ...brief(e), stack: e.data.stack, facet: e.data.facet, refs: e.data.refs ?? [], signal: e.data.signal ?? null }),
       practices: entries("practices").map(brief) };
   }

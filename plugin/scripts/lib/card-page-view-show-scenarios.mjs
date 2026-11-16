@@ -63,7 +63,7 @@ function showScenarioLabels(values, retired) {
  * @returns {void}
  */
 function showScenarioSummary(summary, feature, entry, review, ctx) {
-  ctx.node('span', ` · Test level: ${entry.data.level ?? 'none'}`, summary);
+  ctx.node('span', ` · Test level: ${entry.levels.length ? entry.levels.join(', ') : 'Layer-free'}`, summary);
   const tags = showScenarioList(entry.data.tags);
   if (tags.length) ctx.node('span', ` · Tags: ${showScenarioLabels(tags, ctx.model.labels.retiredTags)}`, summary);
   for (const field of ctx.model.labels.customFields) {

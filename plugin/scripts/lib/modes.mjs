@@ -8,6 +8,7 @@ import { command as next } from "./next.mjs";
 import { command as ask } from "./ask.mjs";
 import { command as checkFile } from "./check-file-cli.mjs";
 import { command as checkReply } from "./check-reply.mjs";
+import { command as commit } from "./commit.mjs";
 import { command as deepDive } from "./deep-dive.mjs";
 import { command as delegate } from "./delegation.mjs";
 import { command as design } from "./design.mjs";
@@ -29,6 +30,7 @@ import { command as tester } from "./tester.mjs";
 /** @type {CommandRegistry} */
 export const MODES = {
   "check-file": checkFile,
+  commit,
   mint,
   "migrate-keys": migrateKeys,
   "migration-status": migrationStatus,

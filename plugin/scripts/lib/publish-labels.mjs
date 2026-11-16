@@ -125,6 +125,19 @@ function customPublishedLabels(data, definitions) {
 }
 
 /**
+ * Whether the tracker's Test level destination accepts several values: one distinct field of
+ * `level_destinations` whose cardinality is `multiple`. Anything else is a single-value level.
+ * @param {LabelDestination[] | undefined} destinations
+ * @returns {boolean}
+ */
+export function levelDestinationIsMultiple(destinations) {
+  const fields = (Array.isArray(destinations) ? destinations : [])
+    .filter((destination) => isMap(destination) && destination.name === "level")
+    .flatMap((destination) => (Array.isArray(destination.fields) ? destination.fields : []));
+  return fields.length === 1 && isMap(fields[0]) && fields[0].cardinality === "multiple";
+}
+
+/**
  * @param {PublishedLabel[]} labels
  * @returns {boolean}
  */

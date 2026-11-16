@@ -63,7 +63,7 @@ after: permissions
 ```
 ````
 
-Pipe it into `train check categories --stdin`:
+Pass it to `train check categories --input <file>`:
 
 - **`ok: false`**: fix every `errors` entry and check again. A changed meaning says to retire the
   key and add a new one; a removal without its key in `retired:` says to add it.

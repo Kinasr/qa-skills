@@ -29,11 +29,20 @@
  */
 
 /**
+ * Whether a section is a Feature's `## Open questions`, which holds its Parked questions.
+ * @param {{ level: number, title: string }} section
+ * @returns {boolean}
+ */
+export function isOpenQuestionsSection(section) {
+  return section.level === 2 && section.title === "Open questions";
+}
+
+/**
  * @param {FeatureMarkdownFile} file
  * @returns {ParkedQuestion[]}
  */
 export function parkedQuestions(file) {
-  const section = file.sections.find((s) => s.level === 2 && s.title === "Open questions");
+  const section = file.sections.find(isOpenQuestionsSection);
   if (!section) return [];
   const out = [];
   const lines = file.text.replace(/\r\n/g, "\n").split("\n");

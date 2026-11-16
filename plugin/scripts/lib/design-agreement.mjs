@@ -353,8 +353,7 @@ export function checkAgreement(ctx, proposal) {
         bad("summary_required", `\`${key}\` is a new scenario, so it needs a one-line summary`, { scenario: key });
       }
     }
-    const levels = stringList(raw.levels, "levels", key, "bad_levels", bad);
-    if (!levels.length) bad("levels_required", `\`${key}\` needs a non-empty list of wanted levels`, { scenario: key });
+    const levels = raw.levels === undefined ? [] : stringList(raw.levels, "levels", key, "bad_levels", bad);
     for (const level of levels) if (!ctx.levels.includes(level)) bad("unknown_level", `\`${key}\` names level \`${level}\`, which is not in \`project.stack.levels\``, { scenario: key });
 
     /** @type {AgreementScenario} */

@@ -1,7 +1,7 @@
 // @ts-check
-// The chain from a case's Automations to the Tester's Execution: an aggregate Automation result
-// (Failed > Blocked > Flaky > Passed) decides whether an Execution follows. A case with no
-// Automation follows straight to an Execution; only a Failed aggregate sends an automated case
+// The chain from one level's Automations to the Tester's Execution: an aggregate Automation result
+// (Failed > Blocked > Flaky > Passed) decides whether an Execution follows. A level with no
+// Automation follows straight to an Execution; only a Failed aggregate sends an automated level
 // there. `execute next` uses this to decide what to start, and `execute ingest` uses it to explain
 // an Execution that was due but never started.
 import { displaySelector } from "./runners/index.mjs";
@@ -47,9 +47,9 @@ export function aggregateAutomation(entries) {
 }
 
 /**
- * Whether a Tester Execution follows this case, and why not: `{follow, aggregate, missing}`.
- * `missing` names the case's Automations with no result yet (a due but unstarted Automation),
- * which Block the chain instead of sending the case to an Execution.
+ * Whether a Tester Execution follows this level, and why not: `{follow, aggregate, missing}`.
+ * The plan has partitioned `automations` by level. `missing` names this level's Automations
+ * with no result yet (due but unstarted), which Block the chain instead of sending it to a Tester.
  * @param {Pick<ExecuteExecution, "automations">} ex
  * @param {ReadonlyMap<string, AutomationResult>} results
  * @returns {{ follow: boolean, aggregate?: "passed" | "failed" | "flaky" | "blocked", missing: string[] }}

@@ -34,7 +34,6 @@ const list = (xs) => (xs.length ? xs.map((x) => `\`${x}\``).join(", ") : "(none)
  * @typedef {{
  *   key: string,
  *   summary: string,
- *   levels?: readonly string[],
  *   mode?: DesignPromptMode,
  *   kept?: readonly string[],
  * }} BriefScenarioUnit
@@ -46,7 +45,10 @@ const list = (xs) => (xs.length ? xs.map((x) => `\`${x}\``).join(", ") : "(none)
  *   slug: string,
  *   feature: string,
  *   roles: readonly string[],
+ *   signedOutRoles?: readonly string[],
  *   levels: readonly string[],
+ *   executableLevels: readonly string[],
+ *   executeModes: Readonly<Record<string, string>>,
  *   labels?: import("./case-labels.mjs").LabelDefinitions | null,
  *   conventions?: string | null,
  *   upstreamRules: readonly BriefUpstreamRules[],
@@ -72,7 +74,7 @@ const list = (xs) => (xs.length ? xs.map((x) => `\`${x}\``).join(", ") : "(none)
  * @param {DesignBriefOptions} options
  * @returns {string}
  */
-export function designBrief({ slug, feature, roles, levels, labels = null, conventions = null, upstreamRules, scenarios, scenario, agreement = null }) {
+export function designBrief({ slug, feature, roles, signedOutRoles = [], levels, executableLevels, executeModes, labels = null, conventions = null, upstreamRules, scenarios, scenario, agreement = null }) {
   const { mode = "fill", kept = [] } = scenario; // see TASK below
   const vocabulary = labelVocabulary(labels);
   return `You are filling one Test Scenario of the Feature \`${slug}\` with Test Cases. Everything you need
@@ -81,10 +83,11 @@ the orchestrator that sent you writes the file.
 
 === WHAT A TEST CASE IS HERE ===
 
-The Feature below states its behaviour as Rules, each headed \`### rule_<key>: <statement>\`. A Rule's
-statement carries its whole claim; any prose under it only clarifies. The Rules are the only claims
-there are: a Test Case exercises one or more of them and claims nothing they do not state, because a
-claim no Rule states can never be judged when the Feature changes.
+The Feature below states its behaviour as Rules, each a numbered item under \`## Rules\`, as
+\`1. **rule_<key>**: <statement>\`. A Rule's statement carries its whole claim; any prose under it
+only clarifies. The Rules are the only claims there are: a Test Case exercises one or more of them
+and claims nothing they do not state, because a claim no Rule states can never be judged when the
+Feature changes.
 
 A Rule followed by \`Waived: <reason>\` is Waived. Do not cover it in a Test Case: its Waiver deliberately
 leaves it without a case. The Feature shows each Waived Rule's reason; quote that reason when noting
@@ -95,11 +98,15 @@ Rules of this Feature, and an Upstream Rule never supplies a missing local claim
 
 ${TASK[mode]}
 
+Design two layers: atomic coverage of each Rule's partitions, boundaries and negative conditions,
+and interaction and journey coverage across Rules. Group both by one manual pass. An interaction
+or journey case asserts only what the interaction produces, without repeating atomic outcomes,
+and covers every Rule involved. Derive combined outcomes only from the Feature's stated Rules.
+
 Size each case as one manual pass: the claims a manual tester checks from one setup in one run of
 steps are one case, a check that builds on an earlier step's outcome included. The case covers each
-of their Rules and states every outcome in its Expected result. It takes the level the whole pass
-runs at, and is \`automatable: false\` when any of its checks is (see below): claims that differ in
-level or automatability still make one manual pass. A new case starts only where the tester needs a
+of their Rules and states every outcome in its Expected result. It is \`automatable: false\` when any of its checks is (see below): claims that differ in
+automatability still make one manual pass. A new case starts only where the tester needs a
 new setup or a new run. A Convention that sets granularity overrides this rule.
 
 Each Test Case has:
@@ -113,21 +120,27 @@ Each Test Case has:
   distinct pass that still repeats them, state why in one sentence: it is shown to the engineer as a
   proposal and does not on its own get the case written. Omit otherwise.
 - \`roles\`: only Roles that act in a Step, each listed once, from the roles below; an empty list
-  when no Role acts. A Role needed only for setup belongs on its precondition, not in this list.
-- \`level\`: required on every case; one of the scenario's wanted levels at the end of this brief.
+  when no Role acts. A Role needed only for setup belongs on its precondition, not in this list.${signedOutRoles.length ? "\n  A case about a signed-out visitor lists a Signed-out Role in `roles` (together with any signed-in Role that also acts in the case); its session has no login, so the case neither signs in nor signs out. An empty `roles` list stays the default account." : ""}
+- \`level\`: omit for a Layer-free case. Use the level whose execute mode is browser for a visual layout, the API level for a payload contract; bind a denial to every executable level. Give each binding a non-empty \`binding_reason\`.
 ${vocabulary === "" ? "" : LABEL_FIELDS}- \`automatable\`: \`true\` or \`false\`, always given; see below.
+- \`manual\`: optional; \`false\` when no Tester can perform the case (see the Tester's limits).
+  A case with no \`manual\` is one a Tester can run.
 - \`preconditions\`: optional; states needed before the steps, as a string or list of non-empty
   strings. Omit when empty.
 - \`steps\`: required in every mode; a non-empty list of non-empty strings, in order.
 - \`expected\`: the Expected-result paragraph: the outcome a tester observes. Never empty.
 
-State behaviour at intent level: what a user does and what the system does in response. Never write
-selectors, element ids, URLs, endpoint paths, request or response payload shapes, or code. The test
-code owns how a case runs; the case states what it checks.
+State behaviour from the actor's side: what the actor does and what the system does in response.
+Name a button, selector, HTTP method or endpoint only when the covered Rule is about that detail.
 
 When a good case would need a behaviour no Rule states (a boundary, a message, a permission, an
 error), do not write that case. Put the behaviour in \`proposed_rules\` instead, as one sentence the
 engineer can take to /qa-deep-dive, with why the scenario needs it.
+
+When combined Rules leave an outcome unclear, return a \`questions\` entry with \`text\`, the
+implicated \`rules\`, and a \`held_case\` proposal: one-line \`summary\`, \`covers\` naming every
+implicated Rule, and optional \`preconditions\` and \`steps\` lists. Supply no guessed Expected
+result. Keep only that proposal out of \`cases\`; return the other settled cases normally.
 
 A case is \`automatable: false\` when checking its Expected result needs any of:
 
@@ -141,12 +154,23 @@ A case is \`automatable: false\` when checking its Expected result needs any of:
 
 Every other case is \`automatable: true\`. The engineer confirms the value when they review the case.
 
+=== WHAT A TESTER CAN DO ===
+
+A manual Execution gives the tester one session per Role and no other: it cannot hold two sessions of
+one account, is not shown a token or credential, stays on the target origin and reads no system
+outside it, such as a mailbox, a database or a log. A case needing more than that is still a real
+case, and Automation may check it: write \`manual: false\` beside \`automatable\`. A case with no
+\`manual\` is one a tester can run.
+
+\`manual: false\` is not \`automatable: false\`: the first says no tester can perform the case, the
+second that no Automation is expected. Write \`manual: false\` only when a Step or the Expected result
+cannot be carried out inside those limits; the engineer confirms it at Review.
+
 Write no key, \`sources\`, \`review\` or any other field: the orchestrator adds them.
 
 === WRITING FOR A TESTER ===
 
-Write one action by one actor per step, in order, at intent level. Use a UI control's label only
-when the Feature gives that label; otherwise name its intent. Use the Feature's own terms as its
+Write one action by one actor per step, in order, at intent level. Name a UI control only when the covered Rule is about it. Use the Feature's own terms as its
 Rules define them; explain shorthand or a term from outside the Feature.
 
 With two or more Roles, open every step with \`As <Role>, \` naming a Role in \`roles\` exactly,
@@ -160,8 +184,9 @@ Step, never a precondition: otherwise a product Defect could appear as Blocked s
 When a covered Rule claims a target-observable effect, state what the case's Roles observe in the
 Expected result: "succeeds", "is rejected", or a status only when that exact code is the claim.
 Keep internal side effects to those the Rule claims. When the Rule claims only an off-target
-effect, state that claim and add a \`proposed_rule\` in \`proposed_rules\` if its observable
-confirmation is unstated.
+effect, state that claim and write the case \`manual: false\`. If how a tester confirms it is unstated, add a \`check_gap\` naming the
+case's summary and what the check needs: it is test-environment knowledge for /qa-train design,
+never a \`proposed_rule\`, which states behaviour.
 
 Baseline inputs stay abstract (for example, "valid loan details"); the Tester fills them from
 trained data recipes. State the triggering input at the Rule's level: an exact value for a stated
@@ -173,14 +198,19 @@ put an unstated boundary in \`proposed_rules\`.
 
 Think as you need to, then end your reply with exactly one fenced json block, and nothing after it:
 
-${fenced(`{"cases": [{"summary": "...", "covers": ["rule_..."], "relies_on": ["rule_..."], "roles": ["..."], "level": "...", "automatable": true, "preconditions": ["..."], "steps": ["..."], "expected": "..."}],
- "proposed_rules": [{"statement": "...", "why": "..."}]}`, "json")}
-\`proposed_rules\` is an empty list when there is nothing to propose.
+${fenced(`{"cases": [{"summary": "...", "covers": ["rule_..."], "relies_on": ["rule_..."], "roles": ["..."], "automatable": true, "preconditions": ["..."], "steps": ["..."], "expected": "..."}],
+ "check_gaps": [{"case": "<the case's summary>", "needs": "..."}],
+ "proposed_rules": [{"statement": "...", "why": "..."}],
+ "questions": [{"text": "...", "rules": ["rule_..."], "held_case": {"summary": "...", "covers": ["rule_..."], "steps": ["..."]}}]}`, "json")}
+\`check_gaps\`, \`proposed_rules\` and \`questions\` are empty lists when there is nothing to report,
+propose or hold.
 
 === THE PROJECT'S VOCABULARY ===
 
-- Roles: ${list(roles)}
-- Levels: ${list(levels)}${vocabulary}
+- Roles: ${list(roles)}${signedOutRoles.length ? `\n- Signed-out Roles: ${list(signedOutRoles)}. Their Access note logs in as nobody: a case they act in opens signed out (with a signed-in Role too, it opens one session per Role).` : ""}
+- Levels: ${list(levels)}
+- Execution modes: ${levels.map((level) => `\`${level}\`: ${executeModes[level] ?? "not executable"}`).join(", ")}
+- Executable levels: ${list(executableLevels)}${vocabulary}
 ${conventions === null ? "" : `
 === THE CONVENTIONS ===
 
@@ -201,7 +231,7 @@ ${scenarios.map((s) => `- \`${s.key}\`: ${s.summary}`).join("\n")}
 ${agreement === null ? "" : `\n${agreement}`}
 === THE SCENARIO TO ${mode.toUpperCase()} ===
 
-\`${scenario.key}\`: ${scenario.summary}. Every case names its own \`level\`, chosen from the wanted levels: ${(scenario.levels ?? levels).map((level) => `\`${level}\``).join(", ")}. ${mode === "fill" ? "It has no Test Cases yet." : HAS[mode](kept)}
+\`${scenario.key}\`: ${scenario.summary}. Write Layer-free cases unless their claims require a binding. ${mode === "fill" ? "It has no Test Cases yet." : HAS[mode](kept)}
 `;
 }
 

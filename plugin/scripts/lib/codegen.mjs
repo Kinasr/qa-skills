@@ -14,7 +14,9 @@ import { dirname, join, resolve } from "node:path";
 import { noArguments, requireOption, UsageError } from "./cli.mjs";
 import { buildIndex, loadWorkingTree } from "./qa-index.mjs";
 import { checkFile, edit, parse, projectConfig } from "./knowledge-file.mjs";
-import { caseFields, caseLevel, caseSteps } from "./case-fields.mjs";
+import { automationCoverage, supportedCodegenLevels } from "./automation-coverage.mjs";
+import { CODEGEN_APPROACH_NAMES, codegenApproaches } from "./codegen-approaches.mjs";
+import { caseFields, caseLevels, caseMatchesLevels, casePreconditions, caseSteps, stepActor } from "./case-fields.mjs";
 import { isDeclaredTag } from "./case-labels.mjs";
 import { scan } from "./scan.mjs";
 import { storedCaseFindings } from "./stored-findings.mjs";
@@ -41,6 +43,10 @@ import { proveSelection } from "./test-proof.mjs";
 import { credentialIn } from "./credentials.mjs";
 import { runSelection } from "./runners/index.mjs";
 import { isMap } from "./dialect.mjs";
+import { accessFor } from "./access.mjs";
+import { headerCredential } from "./access-note.mjs";
+import { latestLevelFailures } from "./execution-results.mjs";
+import { LEVEL_TARGET_REFUSALS, hasUnmappedSplit, levelTargetRefusalLine, resolveLevelTargets, spanningTargetsData, spansMultipleTargets, unmappedLevelsData } from "./level-target.mjs";
 
 /**
  * @import { CommandAction, CommandContext, CommandResult } from "./cli.mjs"
@@ -50,8 +56,10 @@ import { isMap } from "./dialect.mjs";
  * @import { AutomationSelection, RunnerResult } from "./test-runner.mjs"
  * @import { PrFile } from "./pr-git.mjs"
  * @import { IndexedClass, IndexedFunction, KeyPatterns } from "./code-index.mjs"
- * @import { StackAdapter } from "./stack.mjs"
+ * @import { StackAdapter, StackUnavailableNote } from "./stack.mjs"
  * @import { TrainFile } from "./training.mjs"
+ * @import { CodegenApproachName } from "./codegen-approaches.mjs"
+ * @import { TargetSpec } from "./level-target.mjs"
  */
 
 /**
@@ -65,6 +73,8 @@ import { isMap } from "./dialect.mjs";
  *   scenario_key?: string,
  *   summary: string,
  *   level: string,
+ *   choice?: { level: string, approach: CodegenApproachName, reason: string, practice?: string },
+ *   prior_results?: import("./execution-results.mjs").LevelFailure[],
  *   tracker?: string,
  *   expected: ExpectedSentence[],
  *   status: "pending" | "in_progress" | "done" | "failed",
@@ -100,6 +110,7 @@ import { isMap } from "./dialect.mjs";
  *   prefixes: CodegenPrefix[],
  *   items: CodegenItem[],
  *   skipped: Array<{ key: string, reasons: string[] }>,
+ *   unsupported: Array<{ key: string, levels: string[] }>,
  *   dirty?: string[],
  *   done?: string[],
  *   regression?: AutomationSelection[],
@@ -121,13 +132,13 @@ import { isMap } from "./dialect.mjs";
 const { stop, fact } = refusalsFor({
   invalid_project: "Fix `.qa/project.md` before writing code.",
   unknown_stack: "`--stack` must name `project.stack.root`.",
-  untrained_stack: "Teach code gen your project's style first with `/qa-train codegen --stack`.",
   training_refs_unresolved: "A codegen Convention points at a path that is gone; repair it with `/qa-train codegen`.",
   no_test_runner: "Set `test_runner` in `project.md` with `/qa-init` so a generated test can be proved.",
   no_code_adapter: "The project's stack has no code adapter to read and write its tests with.",
   no_targets: "Add a target origin to `.qa/project.md`: targets: {staging: https://app.example.test}",
   multiple_targets: "A Run takes at most one target.",
   unknown_target: "Choose one of the configured target names; raw URLs are not targets.",
+  ...LEVEL_TARGET_REFUSALS,
   invalid_filter: "Use tag:<name> or level:<name> with a non-blank name and no whitespace or extra colon.",
   unknown_tag: "The requested Tag is not declared in the project.",
   retired_tag: "The requested Tag is retired.",
@@ -140,6 +151,7 @@ const { stop, fact } = refusalsFor({
   no_codegen_level: "None of the requested Test levels runs on this stack (`execute_levels`).",
   no_matching_cases: "No live Test Case in the scope matches the requested Tags and Test levels.",
   no_eligible_cases: "Every selected case is skipped; there is nothing to generate.",
+  invalid_choice: "Supply a valid choice for every Layer-free case.",
   unknown_item: "The item id is not in this Run's plan.",
   wrong_state: "The item is not in a state that step acts on.",
   not_started: "Start the item before verifying it.",
@@ -162,15 +174,36 @@ const { stop, fact } = refusalsFor({
   expects_line: "A mapped value is not `<file>:<line>` under `module_paths`.",
   expects_not_added: "A mapped line was not added by this item.",
   expects_not_in_test: "A mapped line is blank, a comment, an import, or outside the new test and its new support.",
+  expects_no_assertion: "An Expected sentence has no mapped line in an assertion statement.",
   automates_write: "The case's `automates` could not be written.",
   "external-mint-required": "`--pr` is not available: the project's own tool mints Automation keys. Run in the working tree, then mint with your tool and run `/qa-sync`.",
   dirty: "A pre-existing dirty path under `module_paths` is touched; commit or revert it first.",
   items_pending: "Finish or fail every item before `codegen regress`.",
   already_prepared: "The PR is already prepared; `codegen regress` runs before `pr-prepare`.",
-  regress_required: "Run `codegen regress` before `pr-prepare`: a done item touched a pre-existing file.",
+}, (code, data) => {
+  if (code === "no_code_adapter") {
+    const note = /** @type {StackUnavailableNote | undefined} */ (data.unavailable);
+    return { ...data, ...(note && { line: `The project's stack has a code adapter, but it could not load here: ${note.message}. Fix: ${note.fix}.` }) };
+  }
+  const line = levelTargetRefusalLine(code, data);
+  return line !== null ? { ...data, line } : data;
 });
 
 const CLOSED_REASONS = new Set(["cap-reached", "out-of-scope", "blocked", "app-disagrees", "case-wrong", "not-expressible", "convention-conflict", "invalid-key-prefix", "no-auth", "dirty", "regressed"]);
+
+// The one refusal every `no_code_adapter` stop returns. A stack with no fitting adapter keeps the
+// plain line; one whose adapter fits but could not load here carries the adapter's own note.
+/**
+ * @param {{ language?: unknown } | null | undefined} stack
+ * @param {StackUnavailableNote | null} [unavailable]
+ * @returns {CommandResult}
+ */
+export function noAdapterRefusal(stack, unavailable = null) {
+  return stop("no_code_adapter", {
+    stack: typeof stack?.language === "string" ? stack.language : null,
+    ...(unavailable && { unavailable }),
+  });
+}
 
 /**
  * @param {unknown} value
@@ -282,24 +315,25 @@ function expectedSentences(expected) {
  * @param {ReturnType<typeof scan>} facts
  * @param {Set<string>} named
  * @param {{ code: ReturnType<typeof buildCodeIndex>, proposals: Set<string> }} code
+ * @param {import("./automation-coverage.mjs").AutomationCoverage} coverage
+ * @param {string[]} supported
  * @returns {string[]}
  */
-function skipReasons(c, config, facts, named, code) {
+function skipReasons(c, config, facts, named, code, coverage, supported) {
   const entry = /** @type {ParsedEntry} */ (c.entry);
   const findings = storedCaseFindings(facts.history, c.file, entry);
   const tracker = typeof entry.data.tracker === "string" ? entry.data.tracker : null;
   const carriesTracker = tracker !== null && code.code.functions.some((fn) => fn.trackerKeys.some((t) => t.key === tracker));
   const review = facts.history.reviews.find((r) => r.key === entry.key)?.status ?? "none";
-  const level = String(entry.data.level ?? "");
   return /** @type {string[]} */ ([
-    strings(entry.data.automates).length > 0 && "automated",
+    !coverage.gap && (coverage.covered.length > 0 || (!coverage.bound.length && strings(entry.data.automates).length > 0)) && "automated",
     (code.proposals.has(entry.key) || carriesTracker) && "binding-pending",
     entry.data.automatable === false && "not-automatable",
     caseSteps(/** @type {import("./case-fields.mjs").CaseFieldEntry} */ (entry)).length === 0 && "no-steps",
     !caseFields(/** @type {import("./case-fields.mjs").CaseFieldEntry} */ (entry)).expected && "no-expected",
     findings.some((f) => f.kind === "Conflict" && f.status === "open") && "conflict",
     review !== "fresh" && !named.has(entry.key) && "unreviewed",
-    !Object.hasOwn(config.execute_levels ?? {}, level) && "no-stack",
+    (coverage.bound.length ? !coverage.supported.length : !supported.length) && "no-stack",
     !keyRoute(entry, config) && "no-key-route",
   ].filter(Boolean));
 }
@@ -357,7 +391,7 @@ function scenarioPrefixed(c, code) {
  * @param {CommandContext} ctx
  * @returns {CommandResult}
  */
-function plan(args, { root, stack: requestedStack, pr: requestedPr }) {
+function plan(args, { root, stack: requestedStack, pr: requestedPr, choices: rawChoices }) {
   const files = loadWorkingTree(/** @type {string} */ (root));
   const index = buildIndex(files);
   const config = projectConfig(index.project);
@@ -372,21 +406,21 @@ function plan(args, { root, stack: requestedStack, pr: requestedPr }) {
   const stack = config.stack?.root ?? ".";
   if (requestedStack !== undefined && requestedStack !== stack) return stop("unknown_stack", { stack: requestedStack, root: stack });
   const train = /** @type {TrainFile | null} */ (trainFile(index, CODEGEN_TRAIN_KEY));
-  if (!strings(train?.data?.trained_stacks).includes(stack)) return stop("untrained_stack", { stack, train: `/qa-train codegen --stack ${stack}` });
   const dead = unresolvedRefs(train, repo, stack, config);
   if (dead.length) return stop("training_refs_unresolved", { conventions: dead, next: "/qa-train codegen" });
   const runner = config.test_runner;
   if (runnerToolProblem || !runner || !testRunnerMatchesStack(runner.tool, config.stack)) return stop("no_test_runner", { ...(runner && { tool: runner.tool }), ...(config.stack && { stack: config.stack.language }) });
-  const adapter = resolveAdapter(config.stack, repo).adapter;
-  if (!adapter) return stop("no_code_adapter", { stack: config.stack?.language ?? null });
+  const { adapter, unavailable: adapterNote } = resolveAdapter(config.stack, repo);
+  if (!adapter) return noAdapterRefusal(config.stack, adapterNote);
 
   const targets = args.filter((a) => a.startsWith("target:")).map((a) => a.slice(7));
   if (targets.length > 1) return stop("multiple_targets", { targets });
   const rawUrl = args.find((a) => /^[a-z][a-z0-9+.-]*:\/\//i.test(a));
   if (!config.targets) return stop("no_targets");
-  const slug = targets[0] ?? Object.keys(config.targets)[0];
-  if (rawUrl || !Object.hasOwn(config.targets, slug)) return stop("unknown_target", { target: rawUrl ?? slug, targets: Object.keys(config.targets) });
-  const target = { slug, origin: config.targets[slug] };
+  const explicitTarget = targets[0];
+  if (rawUrl || (explicitTarget !== undefined && !Object.hasOwn(config.targets, explicitTarget))) {
+    return stop("unknown_target", { target: rawUrl ?? explicitTarget ?? "", targets: Object.keys(config.targets) });
+  }
 
   const invalid = args.find((a) => /^(tag|level):/.test(a) && !/^(tag|level):[^\s:]+$/u.test(a));
   if (invalid !== undefined) return stop("invalid_filter", { token: invalid });
@@ -424,17 +458,56 @@ function plan(args, { root, stack: requestedStack, pr: requestedPr }) {
   const broken = facts.results.filter((r) => r.kind === "integrity_error" && selectedFiles.has(/** @type {string} */ (r.file)));
   if (broken.length) return stop("integrity_error", { errors: broken.map(({ code, file, line, key, message }) => ({ code, file, line, key, message })) });
   const requestedLevels = new Set(levels);
-  const executable = Object.keys(config.execute_levels ?? {});
+  const executable = supportedCodegenLevels(train, config);
   const unavailable = [...requestedLevels].filter((l) => !executable.includes(l));
   if (requestedLevels.size && unavailable.length === requestedLevels.size) return stop("no_codegen_level", { levels, executable });
-  const selected = selectedCases.filter((c) => (!tags.length || strings(c.entry?.data.tags).some((tag) => tags.includes(tag))) && (!levels.length || levels.includes(String(c.entry?.data.level))));
+  const selected = selectedCases.filter((c) => (!tags.length || strings(c.entry?.data.tags).some((tag) => tags.includes(tag))) && caseMatchesLevels(c.entry?.data ?? {}, c.file.data, config.schemaVersion, requestedLevels));
   if (!selected.length) return stop("no_matching_cases", { selection: { scope, tags, levels } });
   const code = buildCodeIndex(repo, config.modulePaths, config.annotationMap, adapter, keyPatterns(config));
   const proposals = new Set(facts.results.filter((r) => r.kind === "binding_proposal" && ["mint_and_bind", "rebind"].includes(/** @type {string} */ (r.code))).flatMap((r) => [...strings(r.bind), ...strings(r.replace_in)]));
-  const reasons = new Map(selected.map((c) => [c, skipReasons(c, config, facts, named, { code, proposals })]));
+  const automationPaths = new Map(Object.entries(facts.index.automations ?? {}));
+  const coverage = new Map(selected.map((c) => {
+    const all = automationCoverage(c.entry?.data ?? {}, c.file.data, config, train, automationPaths);
+    const wanted = (/** @type {string} */ level) => !levels.length || levels.includes(level);
+    const supported = all.supported.filter(wanted);
+    const covered = all.covered.filter(wanted);
+    const missing = all.missing.filter(wanted);
+    return [c, { ...all, supported, covered, missing, gap: all.bound.length ? c.entry?.data.automatable !== false && missing.length > 0 : all.gap }];
+  }));
+  const unsupported = selected.flatMap((c) => {
+    const levels = /** @type {import("./automation-coverage.mjs").AutomationCoverage} */ (coverage.get(c)).unsupported;
+    return levels.length ? [{ key: /** @type {string} */ (c.entry?.key), levels }] : [];
+  });
+  const reasons = new Map(selected.map((c) => [c, skipReasons(c, config, facts, named, { code, proposals }, /** @type {import("./automation-coverage.mjs").AutomationCoverage} */ (coverage.get(c)), executable)]));
   const skipped = selected.filter((c) => /** @type {string[]} */ (reasons.get(c)).length > 0).map((c) => ({ key: /** @type {string} */ (c.entry?.key), reasons: /** @type {string[]} */ (reasons.get(c)) }));
-  const eligible = selected.filter((c) => /** @type {string[]} */ (reasons.get(c)).length === 0);
-  if (!eligible.length) return stop("no_eligible_cases", { skipped });
+  const free = selected.filter((c) => /** @type {string[]} */ (reasons.get(c)).length === 0);
+  if (!free.length) return stop("no_eligible_cases", { skipped, unsupported });
+  /** @type {Record<string, unknown>} */
+  let choices = {};
+  try {
+    const parsed = rawChoices === undefined ? {} : JSON.parse(String(rawChoices));
+    if (!isMap(parsed)) return stop("invalid_choice");
+    choices = parsed;
+  } catch { return stop("invalid_choice"); }
+  // Under `level:<x>`, a Layer-free case whose choice names another level is skipped, not refused.
+  const otherLevel = (/** @type {ScopeDeclaration} */ c) => {
+    if (!levels.length || caseLevels(c.entry?.data ?? {}, c.file.data, config.schemaVersion).length) return false;
+    const choice = choices[String(c.entry?.key)];
+    return isMap(choice) && typeof choice.level === "string" && !levels.includes(choice.level);
+  };
+  for (const c of free.filter(otherLevel)) skipped.push({ key: /** @type {string} */ (c.entry?.key), reasons: ["other-level"] });
+  const eligible = free.filter((c) => !otherLevel(c));
+  if (!eligible.length) return stop("no_eligible_cases", { skipped, unsupported });
+  for (const c of eligible) {
+    if (caseLevels(c.entry?.data ?? {}, c.file.data, config.schemaVersion).length) continue;
+    const choice = choices[String(c.entry?.key)];
+    if (!isMap(choice) || typeof choice.level !== "string" || !executable.includes(choice.level) ||
+        (levels.length > 0 && !levels.includes(choice.level)) ||
+        !CODEGEN_APPROACH_NAMES.includes(/** @type {CodegenApproachName} */ (choice.approach)) ||
+        !codegenApproaches(train, config.levels).some((entry) => entry.approach === choice.approach && entry.level === choice.level) ||
+        typeof choice.reason !== "string" ||
+        (choice.practice !== undefined && (typeof choice.practice !== "string" || !choice.practice.trim()))) return stop("invalid_choice", { case: c.entry?.key });
+  }
   /** @type {CodegenPrefix[]} */
   const prefixes = [];
   if (config.autRecipe) {
@@ -453,6 +526,45 @@ function plan(args, { root, stack: requestedStack, pr: requestedPr }) {
   const trainingPr = typeof train?.data?.pr === "string" ? train.data.pr : "on-request";
   const asked = Boolean(requestedPr) || trainingPr === "always";
   if (requestedPr && config.autExternal) return stop("external-mint-required", { stack, next: "run in the working tree, mint with your tool, then /qa-sync" });
+  const levelFailures = latestLevelFailures(files, index);
+  /** @type {CodegenItem[]} */
+  const items = eligible.flatMap((c) => {
+    const entry = /** @type {ParsedEntry} */ (c.entry);
+    const missing = /** @type {import("./automation-coverage.mjs").AutomationCoverage} */ (coverage.get(c)).missing;
+    const choice = /** @type {CodegenItem["choice"]} */ (caseLevels(entry.data, c.file.data, config.schemaVersion).length ? undefined : choices[entry.key]);
+    return (missing.length ? missing : [/** @type {NonNullable<CodegenItem["choice"]>} */ (choice).level]).map((level) => {
+      const prior = choice ? (levelFailures.get(entry.key) ?? []).filter((f) => f.level !== level && executable.includes(f.level)) : [];
+      return {
+        id: "",
+        case: entry.key,
+        feature: String(c.feature ?? ""),
+        scenario: c.file.rel,
+        ...(typeof c.file.data.key === "string" && { scenario_key: c.file.data.key }),
+        summary: String(entry.summary ?? ""),
+        level,
+        ...(choice && { choice }),
+        ...(prior.length && { prior_results: prior }),
+        ...(typeof entry.data.tracker === "string" && { tracker: entry.data.tracker }),
+        expected: expectedSentences(caseFields(/** @type {import("./case-fields.mjs").CaseFieldEntry} */ (entry)).expected),
+        status: "pending",
+        attempts: 0,
+      };
+    });
+  });
+  items.forEach((item, i) => { item.id = `cg_${i + 1}`; });
+  const targetResolution = resolveLevelTargets({
+    targets: config.targets,
+    levelTargets: config.level_targets,
+    levels: items.map((item) => item.level),
+    explicitTarget,
+  });
+  if (hasUnmappedSplit(targetResolution, config.targets)) {
+    return stop("unmapped_levels", unmappedLevelsData(targetResolution, config.targets, config.level_targets));
+  }
+  if (spansMultipleTargets(targetResolution)) {
+    return stop("spanning_targets", spanningTargetsData("/qa-codegen", targetResolution, { scope, tags }));
+  }
+  const target = /** @type {TargetSpec} */ (targetResolution.singleTarget);
   const qaPaths = [...new Set(eligible.map((c) => `.qa/${c.file.rel.replaceAll("\\", "/")}`))];
   const commit = headCommit(repo) ?? "";
   const run = newRunId();
@@ -470,23 +582,6 @@ function plan(args, { root, stack: requestedStack, pr: requestedPr }) {
   if (config.autExternal && asked) {
     pr = { ...pr, mode: { kind: "working-tree", reason: "external-mint-required", confirm: "Working tree only: the project's own tool mints Automation keys; mint with it, then `/qa-sync`" } };
   }
-  /** @type {CodegenItem[]} */
-  const items = eligible.map((c, i) => {
-    const entry = /** @type {ParsedEntry} */ (c.entry);
-    return {
-      id: `cg_${i + 1}`,
-      case: entry.key,
-      feature: String(c.feature ?? ""),
-      scenario: c.file.rel,
-      ...(typeof c.file.data.key === "string" && { scenario_key: c.file.data.key }),
-      summary: String(entry.summary ?? ""),
-      level: String(caseLevel(entry.data, c.file.data, config.schemaVersion) ?? ""),
-      ...(typeof entry.data.tracker === "string" && { tracker: entry.data.tracker }),
-      expected: expectedSentences(caseFields(/** @type {import("./case-fields.mjs").CaseFieldEntry} */ (entry)).expected),
-      status: "pending",
-      attempts: 0,
-    };
-  });
   const dir = /** @type {{ make(): string }} */ (newRunDir(undefined, "qa-skills-codegen-")).make();
   /** @type {CodegenState} */
   const stateOut = {
@@ -507,6 +602,7 @@ function plan(args, { root, stack: requestedStack, pr: requestedPr }) {
     prefixes,
     items,
     skipped,
+    unsupported,
     dirty: dirtyPaths(repo, config.modulePaths),
     done: [],
     pr,
@@ -514,7 +610,7 @@ function plan(args, { root, stack: requestedStack, pr: requestedPr }) {
   writeCodegen(dir, stateOut);
   const warnings = facts.results.filter((r) => r.kind === "train_warning" && ["convention_drift", "citation_broken"].includes(r.code) && r.stack === stack);
   const text = [planText(stateOut, dir, aliases), ...warnings.map((warning) => `Warning ${warning.code}: ${warning.message}`)].join("\n");
-  return { exit: 0, json: { action: "plan", ok: true, dir, run, pr_mode: pr.mode, warnings, items: items.map((i) => ({ id: i.id, case: i.case, summary: i.summary, level: i.level, scenario: i.scenario })), skipped, prefixes, text } };
+  return { exit: 0, json: { action: "plan", ok: true, dir, run, pr_mode: pr.mode, warnings, items: items.map((i) => ({ id: i.id, case: i.case, summary: i.summary, level: i.level, scenario: i.scenario, ...(i.choice && { choice: i.choice }), ...(i.prior_results && { prior_results: i.prior_results }) })), skipped, unsupported, prefixes, text } };
 }
 
 /**
@@ -536,13 +632,15 @@ function modeText(mode) {
  * @returns {string}
  */
 function planText(state, dir, aliases) {
+  const count = new Set(state.items.map((item) => item.case)).size;
   return [
-    `Code generate ${state.items.length} case${state.items.length === 1 ? "" : "s"} on stack ${state.stack.root} against ${state.target.slug} (${state.target.origin}).`,
+    `Code generate ${count} case${count === 1 ? "" : "s"} (${state.items.length} items) on stack ${state.stack.root} against ${state.target.slug} (${state.target.origin}).`,
     `Mode: ${modeText(state.pr?.mode)}.`,
     ...aliases.map((a) => `Former key: ${a}`),
     "Cases:",
-    ...state.items.map((i) => `  ${i.id} ${i.case}: ${i.summary} (${i.level})`),
+    ...state.items.map((i) => `  ${i.id} ${i.case}: ${i.summary} (${i.level})${i.choice ? ` — ${i.choice.approach}: ${i.choice.reason}${i.choice.practice ? ` (Practice ${i.choice.practice})` : ""}` : ""}${i.prior_results?.length ? `; prior: ${i.prior_results.map((r) => `${r.level} ${r.result}${r.reason ? ` (${r.reason})` : ""}`).join(", ")}` : ""}`),
     ...(state.skipped.length ? [`Skipped (${state.skipped.length}):`, ...state.skipped.map((s) => `  ${s.key} (${s.reasons.join(", ")})`)] : []),
+    ...(state.unsupported.length ? ["Unsupported automation levels:", ...state.unsupported.map((s) => `  ${s.key}: ${s.levels.join(", ")}`)] : []),
     ...(state.skipped.some((s) => s.reasons.includes("binding-pending")) ? ["Run `/qa-sync` for the binding-pending cases before generating their tests."] : []),
     ...(state.prefixes.length ? ["Key prefixes to confirm:", ...state.prefixes.map((p) => `  ${p.scenario}: ${p.prefix ?? "(name one)"}`)] : []),
     `Run dir: ${dir}`,
@@ -688,9 +786,20 @@ function briefText(state, item) {
   const code = adapter ? buildCodeIndex(state.repo, config.modulePaths, config.annotationMap, adapter, keyPatterns(config)) : null;
   const siblings = siblingAutomationFiles(index, item, code);
   const evidence = passedEvidence(files, item.case);
+  const passed = evidence ? passedEvidenceLines(evidence) : ["(none: expected values come only from the case's prose and the Rules above)"];
+  const entry = index.cases.get(item.case)?.[0]?.entry;
+  const roles = strings(entry?.data.roles);
+  const setupRoles = entry ? casePreconditions(/** @type {import("./case-fields.mjs").CaseFieldEntry} */ (entry)).map((p) => stepActor(p, { precondition: true })).filter((role) => role !== null) : [];
+  const uri = `url:${state.target.origin}/`;
+  const credentials = [...new Set(roles.length ? [...roles, ...setupRoles] : [null, ...setupRoles])].flatMap((role) => {
+    const note = accessFor(index, [uri], { role, passwordFiles: true, headerCredentials: true })[uri];
+    const metadata = headerCredential(note);
+    return metadata ? [{ role: role ?? "(no Role)", ...metadata }] : [];
+  });
   return [
     `# Codegen ${item.id}: ${item.case} — ${item.summary}`,
     "",
+    ...(item.choice ? [`Choice: ${item.choice.level}, ${item.choice.approach} — ${item.choice.reason}${item.choice.practice ? ` (Practice ${item.choice.practice})` : ""}`, ""] : []),
     "## The case (pinned text)",
     "",
     caseText(index, item.case),
@@ -704,7 +813,7 @@ function briefText(state, item) {
     "",
     "## Passed Execution evidence",
     "",
-    ...(evidence ? [evidence.text] : ["(none: expected values come only from the case's prose and the Rules above)"]),
+    ...passed,
     "",
     `## Conventions (train/codegen.md, stack ${state.stack.root})`,
     "",
@@ -726,6 +835,11 @@ function briefText(state, item) {
     "",
     `Target: ${state.target.slug} (${state.target.origin})`,
     `Runner: ${state.runner.tool} in ${state.runner.dir}`,
+    "",
+    "## Header credentials",
+    "",
+    ...(credentials.length ? credentials.map((credential) => `- Role: ${credential.role}; header: ${credential.header}; scheme: ${credential.scheme ?? "(none)"}; variable: ${credential.name}${credential.source === "auth" ? " (from the Auth file; the CLI sets it when it runs the test, and CI must set it as a secret)" : ""}`) : ["(none)"]),
+    "Read each variable from the runtime environment through the project's existing loading convention; do not add a dotenv dependency.",
     "",
     "## What you may read",
     "",
@@ -849,22 +963,60 @@ function siblingAutomationFiles(index, item, code) {
 }
 
 /**
+ * One Passed entry of the chosen record: its level when the record names one, its prose and the
+ * responses it mocked. A top-level typedef so the brief renders each entry from one shape.
+ * @typedef {{
+ *   level?: string,
+ *   text: string,
+ *   routes: string[],
+ * }} PassedEvidenceEntry
+ */
+
+/**
+ * The latest Passed Execution of `key`, with one entry per passed level of the chosen record. Each
+ * entry keeps its own text and its own routes; an entry whose prose is empty still keeps its routes.
  * @param {ReturnType<typeof loadWorkingTree>} files
  * @param {string} key
- * @returns {{ text: string } | null}
+ * @returns {PassedEvidenceEntry[] | null}
  */
 function passedEvidence(files, key) {
-  /** @type {{ at: number, text: string } | null} */
+  /** @type {{ at: number, entries: PassedEvidenceEntry[] } | null} */
   let best = null;
   for (const file of files) {
     if (file.unreadable || file.type !== "execution") continue;
-    for (const entry of file.executions) {
-      if (entry.key !== key || entry.data.result !== "passed") continue;
-      const at = Date.parse(String(file.data.executed_at));
-      if (best === null || at > best.at) best = { at, text: entry.prose.map((p) => p.text.trim()).filter(Boolean).join("\n") };
+    const passed = file.executions.filter((entry) => entry.key === key && entry.data.result === "passed");
+    if (!passed.length) continue;
+    const at = Date.parse(String(file.data.executed_at));
+    if (best === null || at > best.at) {
+      best = {
+        at,
+        entries: passed.map((entry) => ({
+          ...(typeof entry.data.level === "string" && entry.data.level && { level: entry.data.level }),
+          text: entry.prose.map((p) => p.text.trim()).filter(Boolean).join("\n"),
+          routes: strings(entry.data.routes),
+        })).filter((entry) => entry.text || entry.routes.length),
+      };
     }
   }
-  return best && best.text ? { text: best.text } : null;
+  return best && best.entries.length ? best.entries : null;
+}
+
+/**
+ * The Passed evidence lines: each entry with its own routes and its own text, headed by its level
+ * when the case passed at more than one. Routes are never dropped for an entry without prose.
+ * @param {PassedEvidenceEntry[]} entries
+ * @returns {string[]}
+ */
+function passedEvidenceLines(entries) {
+  const several = entries.length > 1;
+  /** @type {string[]} */
+  const lines = entries.flatMap((entry) => [
+    ...(several && entry.level ? [`Level ${entry.level}:`, ""] : []),
+    ...(entry.routes.length ? ["Mocked responses (the Execution's recorded routes):", ...entry.routes.map((route) => `- ${route}`), ""] : []),
+    ...(entry.text ? [entry.text, ""] : []),
+  ]);
+  while (lines[lines.length - 1] === "") lines.pop();
+  return lines;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -906,8 +1058,8 @@ function verify(args, { dir, seed, env, item: id, hypothesis }) {
   }
   const files = loadWorkingTree(state.root);
   const config = projectConfig(buildIndex(files).project);
-  const adapter = resolveAdapter(config.stack, state.repo).adapter;
-  if (!adapter) return stop("no_code_adapter", { stack: config.stack?.language ?? null });
+  const { adapter, unavailable: adapterNote } = resolveAdapter(config.stack, state.repo);
+  if (!adapter) return noAdapterRefusal(config.stack, adapterNote);
   /** @type {AutomationSelection | null} */
   let selection = null;
   if (item.key) {
@@ -937,7 +1089,7 @@ function verify(args, { dir, seed, env, item: id, hypothesis }) {
   for (let repeat = 1; repeat <= repeats; repeat++) {
     const output = join(loaded.dir, "codegen", `${item.id}-${item.attempts}-${repeat}`);
     mkdirSync(output, { recursive: true });
-    const outcome = runSelection({ selection, runner: state.runner, repo: state.repo, dir: output, origin: state.target.origin, env, retries: 0 });
+    const outcome = runSelection({ selection, runner: state.runner, root: state.root, repo: state.repo, dir: output, origin: state.target.origin, env, retries: 0 });
     const proof = proofOf(outcome.parsed);
     if (!proof.passed) {
       failed = { ...proof, repeat };
@@ -1033,9 +1185,14 @@ function spans(text, path, annotationMap, adapter, patterns) {
     offsets.set(i + 1, offset);
     offset += lines[i].length + 1;
   }
+  // A test's own text: its first line to the end of the line closing its body. An adapter that
+  // reports no end leaves the region running to the next declaration, or to the end of the file.
   return index.functions.map((fn) => {
-    const next = starts.find((line) => line > fn.line) ?? lines.length + 1;
     const start = offsets.get(fn.line) ?? 0;
+    if (typeof fn.end === "number" && fn.end >= fn.line && fn.end <= lines.length) {
+      return { name: fn.name, text: text.slice(start, (offsets.get(fn.end) ?? 0) + lines[fn.end - 1].length) };
+    }
+    const next = starts.find((line) => line > fn.line) ?? lines.length + 1;
     const end = next <= lines.length ? offsets.get(next) ?? text.length : text.length;
     return { name: fn.name, text: text.slice(start, end) };
   });
@@ -1120,8 +1277,8 @@ function selectionOf(config, fn) {
  */
 function mintAndRender(state, item, changes, seed) {
   const config = projectConfig(buildIndex(loadWorkingTree(state.root)).project);
-  const adapter = resolveAdapter(config.stack, state.repo).adapter;
-  if (!adapter) return { refusal: stop("no_code_adapter", { stack: config.stack?.language ?? null }) };
+  const { adapter, unavailable: adapterNote } = resolveAdapter(config.stack, state.repo);
+  if (!adapter) return { refusal: noAdapterRefusal(config.stack, adapterNote) };
   const found = addedFunction(state, item, changes, adapter, config);
   if ("refusal" in found) return found;
   const { path, fn } = found;
@@ -1373,10 +1530,13 @@ function parseExpects(text) {
  * @returns {CommandResult | null}
  */
 function checkExpects(state, item, mapping, changes) {
-  const known = new Set(item.expected.map((s) => s.id));
+  const known = new Map(item.expected.map((s) => [s.id, s.text]));
   for (const id of Object.keys(mapping)) if (!known.has(id)) return { exit: 1, json: { ok: false, refusals: [fact("expects_unknown", { sentence: id })] } };
   for (const sentence of item.expected) if (!mapping[sentence.id]?.length) return { exit: 1, json: { ok: false, refusals: [fact("expects_unmapped", { sentence: sentence.id, text: sentence.text })] } };
+  const config = projectConfig(buildIndex(loadWorkingTree(state.root)).project);
+  const adapter = resolveAdapter(config.stack, state.repo).adapter;
   for (const [id, lines] of Object.entries(mapping)) {
+    let hasAssertion = false;
     for (const line of lines) {
       const parsed = /^(.*):(\d+)$/.exec(line);
       if (!parsed) return refusal("expects_line", id, line);
@@ -1389,8 +1549,10 @@ function checkExpects(state, item, mapping, changes) {
       if (!addedLines(before, after).has(at)) return refusal("expects_not_added", id, line);
       const lineText = after.split("\n")[at - 1] ?? "";
       if (!usableLine(lineText)) return { exit: 1, json: { ok: false, refusals: [fact("expects_not_in_test", { sentence: id, value: line, message: "the line is blank, a comment or an import" })] } };
-      if (!insideNewTest(state, path, at, before, after)) return refusal("expects_not_in_test", id, line);
+      if (!insideNewTest(config, adapter, path, at, before, after)) return refusal("expects_not_in_test", id, line);
+      if (adapter?.guard.assertionAt(after, at)) hasAssertion = true;
     }
+    if (!hasAssertion) return { exit: 1, json: { ok: false, refusals: [fact("expects_no_assertion", { sentence: id, text: known.get(id), values: lines })] } };
   }
   return null;
 }
@@ -1431,16 +1593,15 @@ function usableLine(line) {
 }
 
 /**
- * @param {CodegenState} state
+ * @param {ReturnType<typeof projectConfig>} config
+ * @param {import("./stack.mjs").StackAdapter | null} adapter
  * @param {string} path
  * @param {number} line
  * @param {string | null} beforeText
  * @param {string} afterText
  * @returns {boolean}
  */
-function insideNewTest(state, path, line, beforeText, afterText) {
-  const config = projectConfig(buildIndex(loadWorkingTree(state.root)).project);
-  const adapter = resolveAdapter(config.stack, state.repo).adapter;
+function insideNewTest(config, adapter, path, line, beforeText, afterText) {
   if (!adapter) return false;
   const patterns = keyPatterns(config);
   const after = indexSource(afterText, path, config.annotationMap, adapter, patterns);
@@ -1543,7 +1704,7 @@ function regress(args, { dir, env }) {
   const passes = (/** @type {AutomationSelection} */ selection, /** @type {number} */ cycle) => {
     const output = join(batch, String(cycle), selection.id.replace(/[^\w-]/g, "_"));
     mkdirSync(output, { recursive: true });
-    return proveSelection({ selection, runner: state.runner, repo: state.repo, dir: output, origin: state.target.origin, env, retries: 0 }, 1).passed;
+    return proveSelection({ selection, runner: state.runner, root: state.root, repo: state.repo, dir: output, origin: state.target.origin, env, retries: 0 }, 1).passed;
   };
   const rollback = (/** @type {string} */ id) => {
     const item = itemOf(id);
@@ -1716,15 +1877,39 @@ function sensitiveLiteral(line) {
   return /\b(?:password|passwd|passcode|secret|api[_-]?key|token|client[_-]?secret|private[_-]?key)\b\s*[:=]\s*(?:"[^"]+"|'[^']+'|`[^`]+`)/i.test(line);
 }
 
+// An `unreviewed` skip waits on a Review: the plan, or its `no_eligible_cases` refusal, names
+// `/qa-design <feature> --review` once per Feature with such a case (`reviews` and the confirm's
+// `text`, or the refusal's `next`).
+/**
+ * @param {CommandResult} result
+ * @param {string} root
+ * @returns {CommandResult}
+ */
+function withReviews(result, root) {
+  /** @typedef {{ key: string, reasons: string[] }} Skip */
+  const json = /** @type {{ ok?: boolean, refusals?: Array<{ code: string, skipped?: Skip[] }>, skipped?: Skip[], text?: string }} */ (result.json);
+  const refusal = json.ok === false ? json.refusals?.[0] ?? null : null;
+  if (json.ok === false && refusal?.code !== "no_eligible_cases") return result;
+  const skipped = (refusal ?? json).skipped ?? [];
+  const keys = skipped.filter((s) => s.reasons.includes("unreviewed")).map((s) => s.key);
+  if (!keys.length) return result;
+  const cases = buildIndex(loadWorkingTree(root)).cases;
+  const features = [...new Set(keys.map((key) => cases.get(key)?.[0]?.feature).filter((f) => typeof f === "string"))].sort();
+  const reviews = features.map((feature) => `/qa-design ${feature} --review`);
+  if (!reviews.length) return result;
+  if (refusal) return { ...result, json: { ...json, refusals: [{ ...refusal, next: reviews.join(", ") }, ...(json.refusals ?? []).slice(1)] } };
+  return { ...result, json: { ...json, reviews, text: `${json.text}\nReview the unreviewed cases first: ${reviews.map((r) => `\`${r}\``).join(", ")}.` } };
+}
+
 // ---------------------------------------------------------------------------------------------
 // The command
 
 /** @type {Record<string, CommandAction>} */
 export const codegenActions = {
   plan: {
-    options: { root: "qa-dir", stack: "value", pr: "flag" },
-    usage: "[<scope>...] [tag:<name>...] [level:<name>...] [target:<slug>] [--stack <root>] [--pr] [--root <qa-dir>]",
-    run: plan,
+    options: { root: "qa-dir", stack: "value", pr: "flag", choices: "value" },
+    usage: "[<scope>...] [tag:<name>...] [level:<name>...] [target:<slug>] [--stack <root>] [--choices <json>] [--pr] [--root <qa-dir>]",
+    run: (args, ctx) => withReviews(plan(args, ctx), /** @type {string} */ (ctx.root)),
   },
   start: { options: { dir: "value" }, usage: "--dir <run-dir>", run: start },
   verify: { options: { dir: "value", item: "value", hypothesis: "value" }, usage: "--dir <run-dir> --item <id> --hypothesis <line>", run: verify },
@@ -1735,25 +1920,14 @@ export const codegenActions = {
 };
 
 /**
- * The shared `pr-prepare`/`pr-record` actions, with codegen's own pre-flight: a branch or PR Run
- * whose done item touched a pre-existing file needs a passing `codegen regress` first.
+ * The shared `pr-prepare`/`pr-record` actions, with codegen's own PR line. Running `codegen regress`
+ * before `pr-prepare` is the skill's step order (ADR-0057), not a refusal here.
  * @returns {Record<string, CommandAction>}
  */
 function codegenPrActions() {
   return Object.fromEntries(Object.entries(prActions({ file: "codegen.json" })).map(([name, action]) => [name, {
     ...action,
     run(/** @type {string[]} */ args, /** @type {CommandContext} */ ctx) {
-      if (name === "pr-prepare" && typeof ctx.dir === "string") {
-        /** @type {CodegenState | undefined} */
-        let state;
-        try {
-          state = JSON.parse(readFileSync(join(resolve(ctx.dir), "codegen.json"), "utf8"));
-        } catch {
-          state = undefined;
-        }
-        if (state?.pr && state.pr.mode.kind !== "working-tree" && Array.isArray(state.items) &&
-          state.items.some((item) => item.status === "done" && item.pre_existing) && !state.regressPassed) return stop("regress_required", { run: state.run });
-      }
       const result = /** @type {CommandResult} */ (action.run(args, ctx));
       if (name === "pr-record" && result.exit === 0) {
         const record = /** @type {import("./pr.mjs").PrRecord} */ (result.json.record);

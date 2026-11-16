@@ -27,6 +27,7 @@ import { existsSync, readFileSync, readdirSync, renameSync, writeFileSync } from
 import { dirname, join, relative, sep } from "node:path";
 import { noArguments, orThrow } from "./cli.mjs";
 import { scrubRecordText } from "./credentials.mjs";
+import { caseOutcome } from "./case-outcome.mjs";
 import { worstAutomationResult } from "./execute-chain.mjs";
 import { uncommittedUnder } from "./git.mjs";
 import { hasBugPublishTracker, parse } from "./knowledge-file.mjs";
@@ -52,9 +53,11 @@ import { loadWorkingTree } from "./qa-index.mjs";
  *   file: string,
  *   cases: string[],
  *   route: "execution-passed" | "flaky" | "standalone",
+ *   routes?: string[],
  *   state: "pending" | "in-progress" | "done" | "handed-off" | "failed",
  *   summary?: string,
  *   assertions_reduced?: string,
+ *   outcome?: string,
  *   reason?: string,
  *   detail?: string,
  *   hypothesis?: string,
@@ -71,8 +74,10 @@ import { loadWorkingTree } from "./qa-index.mjs";
  *   kind: "bug",
  *   case: string,
  *   automations: string[],
+ *   failing_levels?: string[],
  *   route: "execution-failed" | "no-automation-failed" | "fix-handoff",
  *   state: "pending" | "done" | "failed",
+ *   routes?: string[],
  *   app_cause?: string,
  *   draft?: string,
  *   summary?: string,
@@ -118,6 +123,7 @@ import { loadWorkingTree } from "./qa-index.mjs";
  *   unresolved: Unresolved[],
  *   suppressed: Suppressed[],
  *   counts: { fix: number, bug: number },
+ *   outcomes: Map<string, import("./case-outcome.mjs").CaseOutcome>,
  * }} WorkList
  */
 
@@ -172,6 +178,7 @@ const strings = (value) => (Array.isArray(value) ? value.filter((v) => typeof v 
  *   data: Record<string, unknown> & {
  *     result?: string,
  *     reason?: string,
+ *     routes?: string[],
  *     automation?: Array<{ id?: string, result?: string, reason?: string, attempts?: string[] }>,
  *     execution_skipped?: string[],
  *   },
@@ -194,6 +201,16 @@ function executionState(block) {
 }
 
 /**
+ * The routes the record holds for the named cases, in record order, once each.
+ * @param {WorkBlock[]} blocks
+ * @param {readonly string[]} keys
+ * @returns {string[]}
+ */
+function routesFor(blocks, keys) {
+  return [...new Set(blocks.filter((block) => keys.includes(block.key)).flatMap((block) => strings(block.data.routes)))];
+}
+
+/**
  * The follow-up work a Run's outcome earns.
  * @param {Pick<ExecutePlan, "executions"> & { automation?: { selections?: Array<{ id: string, file?: string }> } }} plan
  * @param {WorkBlock[]} blocks
@@ -201,8 +218,22 @@ function executionState(block) {
  */
 export function workList(plan, blocks) {
   const byKey = new Map(blocks.map((block) => [block.key, block]));
+  // A plan is one Run at one Application target, so its identity holds no run or target values;
+  // the claim digest still separates a block recorded for another edit of the case.
+  const outcomes = new Map(plan.executions.map((ex) => {
+    const identity = { key: ex.key, run: '', target: '', digest: String(ex.digest) };
+    const evidence = blocks.filter((b) => b.key === ex.key).map((b) => ({
+      ...identity, digest: String(b.data.digest ?? ex.digest),
+      level: /** @type {string | undefined} */ (b.data.level), result: b.data.result, automation: b.data.automation,
+    }));
+    return [ex.key, caseOutcome(identity, ex.bound_levels ?? [], evidence)];
+  }));
   const selections = new Map((plan.automation?.selections ?? []).map((selection) => [selection.id, selection]));
-  const stateOf = (/** @type {string} */ key) => executionState(byKey.get(key));
+  const stateOf = (/** @type {string} */ key) => {
+    const outcome = outcomes.get(key);
+    if (outcome && (outcome.result !== "incomplete" || blocks.some((b) => b.key === key && b.data.result))) return outcome.result;
+    return executionState(byKey.get(key));
+  };
   /** @type {Array<{ id: string, cases: string[], results: string[] }>} */
   const automations = [];
   /** @type {Map<string, { id: string, cases: string[], results: string[] }>} */
@@ -216,7 +247,7 @@ export function workList(plan, blocks) {
       }
       const automation = /** @type {{ id: string, cases: string[], results: string[] }} */ (byAutomation.get(id));
       if (!automation.cases.includes(ex.key)) automation.cases.push(ex.key);
-      const entry = (byKey.get(ex.key)?.data.automation ?? []).find((e) => e.id === id);
+      const entry = blocks.filter((block) => block.key === ex.key && (block.data.level === undefined || block.data.level === ex.level)).flatMap((block) => block.data.automation ?? []).find((e) => e.id === id);
       if (typeof entry?.result === "string") automation.results.push(entry.result);
     }
   }
@@ -232,11 +263,14 @@ export function workList(plan, blocks) {
    * @param {FixItem["route"]} route
    * @returns {FixItem}
    */
-  const fixOf = (automation, route) => ({
-    id: `fix_${automation.id}`, kind: "fix", automation: automation.id,
-    file: selections.get(automation.id)?.file ?? "",
-    cases: [...automation.cases], route, state: "pending",
-  });
+  const fixOf = (automation, route) => {
+    const routes = routesFor(blocks, automation.cases);
+    return {
+      id: `fix_${automation.id}`, kind: "fix", automation: automation.id,
+      file: selections.get(automation.id)?.file ?? "",
+      cases: [...automation.cases], route, ...(routes.length && { routes }), state: "pending",
+    };
+  };
   for (const automation of automations) {
     const result = worstAutomationResult(automation.results);
     const cases = automation.cases.map((key) => ({ key, state: stateOf(key) }));
@@ -252,20 +286,22 @@ export function workList(plan, blocks) {
         suppressed.push({ automation: automation.id, failed: cases.filter((c) => c.state === "failed").map((c) => c.key), cases: cases.filter((c) => c.state === "passed").map((c) => c.key) });
       } else unresolved.push({ automation: automation.id, result, cases });
     } else if (result === "blocked") {
-      const reason = (byKey.get(automation.cases[0])?.data.automation ?? []).find((e) => e.id === automation.id)?.reason;
+      const reason = blocks.filter((block) => automation.cases.includes(block.key)).flatMap((block) => block.data.automation ?? []).find((e) => e.id === automation.id && e.result === "blocked")?.reason;
       unresolved.push({ automation: automation.id, result, ...(typeof reason === "string" && { reason }), cases });
     }
   }
   for (const ex of plan.executions) {
-    if (stateOf(ex.key) !== "failed") continue;
-    const automationsOfCase = ex.automations ?? [];
+    if (stateOf(ex.key) !== "failed" || items.some((item) => item.kind === "bug" && item.case === ex.key)) continue;
+    const automationsOfCase = [...new Set(plan.executions.filter((e) => e.key === ex.key).flatMap((e) => e.automations ?? []))];
+    const routes = routesFor(blocks, [ex.key]);
     items.push({
       id: `bug_${ex.key}`, kind: "bug", case: ex.key, automations: [...automationsOfCase],
-      route: automationsOfCase.length ? "execution-failed" : "no-automation-failed", state: "pending",
+      ...(outcomes.get(ex.key)?.failing_levels.length && { failing_levels: outcomes.get(ex.key)?.failing_levels }),
+      route: automationsOfCase.length ? "execution-failed" : "no-automation-failed", ...(routes.length && { routes }), state: "pending",
     });
   }
   return {
-    items, unresolved, suppressed,
+    items, unresolved, suppressed, outcomes,
     counts: { fix: items.filter((i) => i.kind === "fix").length, bug: items.filter((i) => i.kind === "bug").length },
   };
 }
@@ -516,6 +552,7 @@ export function summaryText(state, { dir, configured }) {
       `  ${item.automation}: ${item.cases.join(", ") || "(no cases)"} (${item.route}${item.route === "flaky" ? ", flaky" : ""})`,
       item.summary ? ` — ${scrubbed(item.summary)}` : "",
       item.assertions_reduced ? `; assertions reduced: ${scrubbed(item.assertions_reduced)}` : "",
+      item.outcome?.startsWith("fixed-by ") ? `; fixed by ${item.outcome.slice(9)}, with no edit of its own` : item.outcome === "already-passing" ? "; already passing, with no edit of its own" : "",
     ].join("")));
   }
   if (failed.length) {

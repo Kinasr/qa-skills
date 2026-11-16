@@ -14,6 +14,7 @@ import { line } from "./render.mjs";
  *   tracker?: string,
  *   count?: number,
  *   sample?: string,
+ *   hint?: string,
  *   asked?: true,
  *   default?: true,
  *   picked?: true,
@@ -161,10 +162,19 @@ import { line } from "./render.mjs";
  */
 
 /**
+ * A Tier the engineer picked in the interview: no item number and no answer to give.
+ * @typedef {object} InitPickedTier
+ * @property {string} label
+ * @property {unknown} value
+ * @property {true} [smoke_passed]
+ */
+
+/**
  * The first-run card, as `init` prints it.
  * @typedef {object} InitCardData
  * @property {{ items: number, questions: number }} counts
  * @property {readonly InitItem[]} items
+ * @property {readonly InitPickedTier[]} picked_tiers
  * @property {readonly InitStack[]} stacks
  * @property {"inherit"} fallback
  * @property {readonly { path: string, frontmatter: string }[]} files
@@ -187,6 +197,7 @@ import { line } from "./render.mjs";
  * @property {unknown} [detected]
  * @property {InitEvidence | null} [evidence]
  * @property {{ errors: number, unread: number }} [effect]
+ * @property {readonly string[]} [needs] What the Reply must answer (an edit, an adoption or a drop).
  */
 
 /**
@@ -208,6 +219,7 @@ import { line } from "./render.mjs";
  * @property {readonly string[]} edits
  * @property {string} drop
  * @property {{ errors: number, unread: number }} [effect]
+ * @property {readonly string[]} [needs]
  */
 
 /**
@@ -247,10 +259,10 @@ import { line } from "./render.mjs";
 export const REFUSALS = {
   // A call that cannot be made.
   bad_arguments: "The action takes no positional argument.",
-  no_proposal: "The proposal is read from stdin: pass --stdin.",
+  no_proposal: "The proposal is read from a file or stdin: pass --input <file> or --stdin.",
   proposal_not_json: "The proposal on stdin is not JSON.",
   needs_dir: "The action needs the run dir `init card` printed.",
-  apply_needs_stdin: "Apply needs JSON decisions on stdin: pass --stdin.",
+  apply_needs_stdin: "Apply needs JSON decisions from a file or stdin: pass --input <file> or --stdin.",
   no_card: "No Card is kept in the run dir.",
   card_changed: "The proposal's evidence, `.qa/` or the date changed since the Card was shown.",
   write_failed: "The write failed and was rolled back.",
@@ -262,6 +274,7 @@ export const REFUSALS = {
   missing: "A required setting has no value.",
   no_evidence: "A setting's evidence is missing or unfit.",
   roles_from_code: "Roles come from the tracker or the engineer, never from test code.",
+  role_meaning_missing: "A non-empty Role list needs one line saying what it means.",
   tracker_partial: "A tracker needs provider, project and key shape, or none.",
   stack_evidence: "A test stack lacks its language, framework, count or sample.",
   guidance_unquoted: "A guidance quote is not a line of the named file.",
@@ -269,6 +282,7 @@ export const REFUSALS = {
   stack_not_chosen: "Several test stacks are listed and none is chosen.",
   not_smoke_tested: "A Tier model label has no passing smoke test in the run dir.",
   check_file: "`.qa/project.md` would not pass its check.",
+  unusable_carrier: "The Automation key's carrier is not one the stack's adapter writes.",
   project_unreadable: "`.qa/project.md` cannot be edited in place.",
   unwritable: "A detected value cannot be written in `.qa/project.md`.",
   // The JSON decisions.
@@ -304,11 +318,13 @@ export const { fact, refuse, refusalOf } = refusalsFor(REFUSALS);
 /** @type {Record<string, InitNoteText>} */
 export const NOTES = {
   automation_key_overlap: { line: "The Automation-key pattern matches a documented `tc_`/`ts_`/`su_` witness sample. A pattern matching none of the samples is not proven disjoint." },
-  no_tracker: { line: "There is no tracker, so no Test Scenario or Test Case carries a Tracker key.", term: "Tracker key" },
+  no_tracker: { line: "No tracker: nothing is published." },
   tracker_key_without_tracker: { line: "A tracker-key annotation is named, but there is no tracker, so no tracker key can match its values." },
   no_playwright_cli: { line: "`playwright-cli` is not on the PATH, so `/qa-execute` cannot run Test Cases in the application and `/qa-deep-dive`'s `observe:` input cannot look at it until it is installed (`npm install -g @playwright/cli@latest`). Nothing on this card needs it." },
+  refused_playwright_cli: { line: "`playwright-cli` resolved on PATH was refused by Windows executable policy, so `/qa-execute` and `/qa-deep-dive`'s `observe:` input cannot run it until a supported `.exe` or `@playwright/cli` shim is installed. Nothing on this card needs it." },
   old_playwright_cli: { line: "`playwright-cli` is older than 0.1.22, or its version could not be read, so `/qa-execute` will refuse to run until it is upgraded (`npm install -g @playwright/cli@latest`). Nothing on this card needs it." },
   label_repeats_category: { line: "A Custom-field value repeats a Coverage category key. A team category is never a Coverage category: Coverage still derives from Rules and `covers`, so pick a different value if the two could be confused.", term: "Custom field" },
+  target_env_multiple_origins: { line: "Every `test_runner.target_env` variable is set to the Run's one origin on every Run; on a project with Level targets (`level_targets`), list only the variables for that Run's origin so any other-origin variable keeps the test configuration's own default.", term: "Level target" },
   commit_before_persist: { line: "Commit `.qa/` before the first `/qa-design` settle, which refuses a `.qa/` holding uncommitted changes." },
 };
 /** @type {InitFields} */
@@ -338,6 +354,7 @@ const notesOf = (notes, terms) => notes.map((note) => {
 /**
  * @param {{
  *   items: readonly InitCardItem[],
+ *   picked_tiers: readonly InitPickedTier[],
  *   stacks: readonly InitStackRow[],
  *   files: readonly { path: string, text: string }[],
  *   notes: readonly { code: string, overlaps?: string[] }[],
@@ -345,7 +362,7 @@ const notesOf = (notes, terms) => notes.map((note) => {
  * @param {(field: string) => string} fieldLabelOf
  * @returns {InitCardData}
  */
-export function firstCardData({ items, stacks, files, notes }, fieldLabelOf) {
+export function firstCardData({ items, picked_tiers, stacks, files, notes }, fieldLabelOf) {
   const terms = new Set(["Tier", "Fallback"]);
   const shown = items.map((i) => {
     const out = { n: i.n, kind: i.kind, label: i.label, needs: i.needs, edits: i.edits, drop: i.drop };
@@ -354,6 +371,10 @@ export function firstCardData({ items, stacks, files, notes }, fieldLabelOf) {
       if (i.label.includes("Tags")) terms.add("Tag");
       if (i.label === "Custom fields") terms.add("Custom field");
       if (i.label.includes("Key prefix")) terms.add("Key prefix");
+      if (i.label.includes("Tracker key")) terms.add("Tracker key");
+      if (i.label === "Targets") terms.add("Target");
+      if (i.label === "Execution levels") terms.add("Execution mode");
+      if (i.label === "Level targets") terms.add("Level target");
       Object.assign(out, { type: i.type, value: i.value, evidence: i.evidence, ...(i.default !== undefined && { default: i.default }), ...(i.smokePassed && { smoke_passed: true }) });
     } else if (i.kind === "stack") {
       Object.assign(out, { chosen: i.chosen === null ? null : stacks[i.chosen].root, by: i.by });
@@ -366,6 +387,7 @@ export function firstCardData({ items, stacks, files, notes }, fieldLabelOf) {
   return {
     counts: { items: items.length, questions: items.filter((i) => i.question).length },
     items: shown,
+    picked_tiers,
     stacks: stacks.map(({ chosen, ...s }) => s),
     fallback: "inherit",
     files: files.map(({ path, text }) => ({ path, frontmatter: text.slice(0, text.indexOf("\n---\n", 4) + 4) })),
@@ -393,6 +415,9 @@ export function maintenanceCardData({ items, check, notes }) {
     if (i.label === "Custom fields") terms.add("Custom field");
     if (i.label.includes("Key prefix")) terms.add("Key prefix");
     if (i.label.includes("Tier")) terms.add("Tier");
+    if (i.label === "Targets") terms.add("Target");
+    if (i.label === "Execution levels") terms.add("Execution mode");
+    if (i.label === "Level targets") terms.add("Level target");
     return {
       n: i.n,
       label: i.label,
@@ -402,6 +427,7 @@ export function maintenanceCardData({ items, check, notes }) {
       edits: i.edits,
       drop: i.drop,
       ...(i.effect && { effect: i.effect }),
+      ...(i.needs && { needs: i.needs }),
     };
   });
   if (items.some((i) => i.effect && i.effect.errors + i.effect.unread > 0)) terms.add("Integrity error");

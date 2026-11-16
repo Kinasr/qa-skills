@@ -8,6 +8,8 @@
 // a failing `page.request` prints the request's headers, cookies included, so only its `### Result` is
 // read and an error is cut to its first line.
 import { redactCredentials, redactQueryParams } from "./credentials.mjs";
+import { maskCredentialText, maskCredentialValue } from "./header-credential.mjs";
+import { HEADER_TOKEN } from "./access-note.mjs";
 import { no } from "./tester-command.mjs";
 
 /** @type {readonly string[]} */
@@ -19,11 +21,17 @@ export const REFUSED_HEADERS = ["cookie", "authorization", "proxy-authorization"
 const MAX_PAIRS = 20;
 const MAX_JSON = 65536;
 // What the browser hands back of a body: `playwright-cli` prints it as JSON on stdout, which `spawnSync` caps at 1 MB.
-const MAX_FETCHED = 200000;
-const MAX_INLINE = 4096;
-const MAX_ERROR = 200;
-const TOKEN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
+/** @type {number} */
+export const MAX_FETCHED = 200000;
+/** @type {readonly string[]} */
+export const RESPONSE_HEADERS = ["content-type", "location", "content-length"];
+export const MAX_INLINE = 4096;
+export const MAX_ERROR = 200;
 const CONTROL = /[\u0000-\u001f\u007f]/;
+
+/** @typedef {"absent" | "invalid" | "expired"} CredentialVariant */
+/** @type {readonly CredentialVariant[]} */
+export const CREDENTIAL_VARIANTS = ["absent", "invalid", "expired"];
 
 /**
  * A successful tester request parse result.
@@ -34,6 +42,7 @@ const CONTROL = /[\u0000-\u001f\u007f]/;
  *   url: string,
  *   headers: Record<string, string>,
  *   data?: unknown,
+ *   auth?: CredentialVariant,
  *   code?: never,
  *   error?: never,
  * }} TesterRequestSuccess
@@ -57,20 +66,20 @@ const CONTROL = /[\u0000-\u001f\u007f]/;
  * @typedef {TesterRequestSuccess | TesterRequestRefusal} TesterRequestResult
  */
 
-// `words` is `[<METHOD>, <url>, (--query k=v | --header Name:value | --json <body>)…]` and `origin` the
+// `words` is `[<METHOD>, <url>, (--query k=v | --header Name:value | --json <body> | --auth <variant>)…]` and `origin` the
 // target's. `{ok: true, method, href, url, headers, data?}` or `{ok: false, code, error, method?, url?}`: `href` is the
 // URL with its query merged, for the request; `url` is what the trace and the output keep, its origin
 // and path only. `headers` has lower-case names; `data` is the parsed `--json`.
 /**
  * @param {readonly string[]} words
- * @param {{ origin: string }} options
+ * @param {{ origin: string, header?: string }} options
  * @returns {TesterRequestResult}
  */
-export function parseTesterRequest(words, { origin }) {
+export function parseTesterRequest(words, { origin, header }) {
   const [verb, target, ...flags] = words;
-  if (typeof verb !== "string" || typeof target !== "string") return /** @type {TesterRequestRefusal} */ (no("bad_arguments", "usage: request <METHOD> <url> [--query k=v]… [--header Name:value]… [--json <body>]"));
+  if (typeof verb !== "string" || typeof target !== "string") return /** @type {TesterRequestRefusal} */ (no("bad_arguments", `usage: request <METHOD> <url> [--query k=v]… [--header Name:value]… [--json <body>] [--auth ${CREDENTIAL_VARIANTS.join("|")}]`));
   const method = verb.toUpperCase();
-  if (!METHODS.includes(method)) return /** @type {TesterRequestRefusal} */ (no("bad_method", `\`${verb.slice(0, 20)}\` is not a request method; the methods are ${METHODS.join(", ")}`));
+  if (!METHODS.includes(method)) return /** @type {TesterRequestRefusal} */ (no("bad_method", `the request methods are ${METHODS.join(", ")}`));
   if (CONTROL.test(target)) return /** @type {TesterRequestRefusal} */ (no("bad_url", "`request` takes a URL of printable characters"));
 
   let url;
@@ -89,12 +98,17 @@ export function parseTesterRequest(words, { origin }) {
   const headers = {};
   /** @type {unknown} */
   let body;
+  /** @type {CredentialVariant | undefined} */
+  let auth;
   for (let i = 0; i < flags.length; i += 2) {
     const flag = flags[i];
     const value = flags[i + 1];
-    if (!["--query", "--header", "--json"].includes(flag)) return fail("bad_arguments", "usage: request <METHOD> <url> [--query k=v]… [--header Name:value]… [--json <body>]");
+    if (!["--query", "--header", "--json", "--auth"].includes(flag)) return fail("bad_arguments", `usage: request <METHOD> <url> [--query k=v]… [--header Name:value]… [--json <body>] [--auth ${CREDENTIAL_VARIANTS.join("|")}]`);
     if (typeof value !== "string") return fail("bad_arguments", `${flag} needs a value`);
-    if (flag === "--json") {
+    if (flag === "--auth") {
+      if (auth !== undefined || !CREDENTIAL_VARIANTS.includes(/** @type {CredentialVariant} */ (value))) return fail("bad_arguments", `\`--auth\` takes ${CREDENTIAL_VARIANTS.join(", ")}, given once`);
+      auth = /** @type {CredentialVariant} */ (value);
+    } else if (flag === "--json") {
       if (body !== undefined) return fail("bad_arguments", "`--json` is given once");
       if (value.length > MAX_JSON) return fail("bad_json", `\`--json\` is at most ${MAX_JSON} characters`);
       try {
@@ -111,9 +125,9 @@ export function parseTesterRequest(words, { origin }) {
       const at = value.indexOf(":");
       const name = at < 1 ? "" : value.slice(0, at);
       const text = at < 1 ? "" : value.slice(at + 1).trim();
-      if (!TOKEN.test(name) || CONTROL.test(text)) return fail("bad_header", "`--header` takes Name:value");
+      if (!HEADER_TOKEN.test(name) || CONTROL.test(text)) return fail("bad_header", "`--header` takes Name:value");
       const lower = name.toLowerCase();
-      if (REFUSED_HEADERS.includes(lower)) return fail("forbidden_header", `the \`${lower}\` header is the session's, never the Tester's`);
+      if ((REFUSED_HEADERS.includes(lower) || lower === header?.toLowerCase())) return fail("forbidden_header", `the \`${lower}\` header is the session's, never the Tester's`);
       if (Object.hasOwn(headers, lower)) return fail("bad_header", `the \`${lower}\` header is given once`);
       headers[lower] = text;
     }
@@ -122,26 +136,48 @@ export function parseTesterRequest(words, { origin }) {
 
   for (const [k, v] of queries) url.searchParams.append(k, v);
   url.hash = "";
-  return { ok: true, method, href: url.href, url: url.origin + url.pathname, headers, ...(body !== undefined && { data: body }) };
+  return { ok: true, method, href: url.href, url: url.origin + url.pathname, headers, ...(body !== undefined && { data: body }), ...(auth && { auth }) };
+}
+
+/**
+ * Mask decoded JSON strings and keys, or plain text, before the transport's body ceiling.
+ * Injected into requestCode with the literal maskers; keep its dependencies limited to them.
+ * @param {string} text
+ * @param {readonly string[]} values
+ * @returns {string}
+ */
+export function maskResponseBody(text, values) {
+  try { return JSON.stringify(maskCredentialValue(JSON.parse(text), values)); }
+  catch { return maskCredentialText(text, values); }
 }
 
 // The function `playwright-cli run-code` runs, the input JSON-encoded on its one line (`const input = …;`).
-// Redirects are not followed, a 4xx or 5xx is data, and the session's cookies apply.
+// Redirects are not followed and a 4xx or 5xx is data. Session cookies apply unless the
+// transport supplies the empty cookie header for a Credential variant.
+/** @typedef {{ method: string, href: string, headers: Record<string, string>, data?: unknown, values?: readonly string[] }} RequestCodeInput */
 /**
  * @param {{ method: string, href: string, headers: Record<string, string>, data?: unknown }} options
+ * @param {readonly string[]} [values] Private literals, used only in filename-backed calls.
  * @returns {string}
  */
-export function requestCode({ method, href, headers, data }) {
-  const input = JSON.stringify({ method, href, headers, ...(data !== undefined && { data }) });
+export function requestCode({ method, href, headers, data }, values = []) {
+  /** @type {RequestCodeInput} */
+  const payload = { method, href, headers, ...(data !== undefined && { data }), ...(values.length && { values }) };
+  const input = JSON.stringify(payload);
+  // Reuse the CLI's literal maskers in the sandbox, where neither imports nor env are available.
+  const maskers = values.length ? `const maskCredentialText = ${maskCredentialText.toString()};\nconst maskCredentialValue = ${maskCredentialValue.toString()};\nconst maskResponseBody = ${maskResponseBody.toString()};\n` : "";
+  const body = values.length ? "const body = maskResponseBody(text, input.values);" : "const body = text;";
+  const error = values.length ? "maskCredentialText(String((e && e.message) || e), input.values)" : "String((e && e.message) || e)";
   return `async (page) => {
 const input = ${input};
-try {
+${maskers}try {
   const r = await page.request.fetch(input.href, { method: input.method, headers: input.headers, data: input.data, maxRedirects: 0, failOnStatusCode: false, timeout: 30000 });
   const h = r.headers();
   const text = await r.text();
-  return { status: r.status(), headers: { "content-type": h["content-type"], location: h.location, "content-length": h["content-length"] }, body: text.slice(0, ${MAX_FETCHED}), cut: text.length > ${MAX_FETCHED} };
+  ${body}
+  return { status: r.status(), headers: Object.fromEntries(${JSON.stringify(RESPONSE_HEADERS)}.map(name => [name, h[name]])), body: body.slice(0, ${MAX_FETCHED}), cut: body.length > ${MAX_FETCHED} };
 } catch (e) {
-  return { error: String((e && e.message) || e).split("\\n")[0] };
+  return { error: ${error}.split("\\n")[0] };
 }
 }`;
 }
@@ -149,9 +185,10 @@ try {
 // A transport error as the Tester may see it: its first line, URLs cut to origin and path, redacted.
 /**
  * @param {unknown} text
+ * @param {readonly string[]} [values]
  * @returns {string}
  */
-export const errorLine = (text) => redactCredentials(String(text).split("\n")[0].replace(/(https?:\/\/[^\s?#]*)[?#]\S*/gi, "$1")).slice(0, MAX_ERROR);
+export const errorLine = (text, values = []) => redactCredentials(maskCredentialText(String(text), values).split("\n")[0].replace(/(https?:\/\/[^\s?#]*)[?#]\S*/gi, "$1")).slice(0, MAX_ERROR);
 
 /**
  * Result of parsing a response.
@@ -177,10 +214,10 @@ export const errorLine = (text) => redactCredentials(String(text).split("\n")[0]
 // the body is parsed when it is JSON. Never throws: a result in no known shape is an `{error}`.
 /**
  * @param {string} result
- * @param {{ href: string, origin: string }} options
+ * @param {{ href: string, origin: string, values?: readonly string[] }} options
  * @returns {TesterResponseResult}
  */
-export function responseOf(result, { href, origin }) {
+export function responseOf(result, { href, origin, values = [] }) {
   let r;
   try {
     r = JSON.parse(result);
@@ -188,11 +225,11 @@ export function responseOf(result, { href, origin }) {
     return { error: "the request returned no result" };
   }
   if (r === null || typeof r !== "object") return { error: "the request returned no result" };
-  if (typeof r.error === "string") return { error: errorLine(r.error) };
+  if (typeof r.error === "string") return { error: errorLine(r.error, values) };
   if (!Number.isInteger(r.status)) return { error: "the request returned no status" };
   /** @type {Record<string, string>} */
   const headers = {};
-  for (const name of ["content-type", "location", "content-length"]) if (typeof r.headers?.[name] === "string") headers[name] = r.headers[name];
+  for (const name of RESPONSE_HEADERS) if (typeof r.headers?.[name] === "string") headers[name] = maskCredentialText(r.headers[name], values);
   if (headers.location !== undefined) {
     try {
       const to = new URL(headers.location, href);
@@ -205,9 +242,9 @@ export function responseOf(result, { href, origin }) {
   let body = text;
   try {
     body = JSON.parse(text);
-    return { status: r.status, headers, body, cut: r.cut === true, parsed: true };
+    return { status: r.status, headers: maskCredentialValue(headers, values), body: maskCredentialValue(body, values), cut: r.cut === true, parsed: true };
   } catch {
-    return { status: r.status, headers, body, cut: r.cut === true, parsed: false };
+    return { status: r.status, headers: maskCredentialValue(headers, values), body: maskCredentialValue(body, values), cut: r.cut === true, parsed: false };
   }
 }
 

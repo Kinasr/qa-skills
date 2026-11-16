@@ -3,7 +3,7 @@
 // builds an item's commit on a temporary index. Nothing here switches the checkout, stages in the
 // engineer's index, or reaches the network.
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { UsageError } from "./cli.mjs";
@@ -31,16 +31,25 @@ export function prGit(repo, args, { input, index } = {}) {
 }
 
 /**
+ * `result`'s raw stdout buffer, or a usage error naming git's first stderr line.
+ * @param {ReturnType<typeof prGit>} result
+ * @returns {Buffer}
+ */
+function gitRawOutput(result) {
+  if (result.status !== 0) {
+    const why = result.stderr.toString("utf8").trim().split("\n")[0] || "git failed";
+    throw new UsageError(why, { code: "git_error", why });
+  }
+  return result.stdout;
+}
+
+/**
  * `result`'s trimmed stdout, or a usage error naming git's first stderr line.
  * @param {ReturnType<typeof prGit>} result
  * @returns {string}
  */
 export function gitOutput(result) {
-  if (result.status !== 0) {
-    const why = result.stderr.toString("utf8").trim().split("\n")[0] || "git failed";
-    throw new UsageError(why, { code: "git_error", why });
-  }
-  return result.stdout.toString("utf8").trim();
+  return gitRawOutput(result).toString("utf8").trim();
 }
 
 /**
@@ -64,6 +73,31 @@ export function gitOk(repo, args) {
   return prGit(repo, args).status === 0;
 }
 
+/** @param {string} repo @returns {boolean} */
+function isFilemodeFalse(repo) {
+  return gitMaybe(repo, ["config", "--bool", "core.filemode"]) === "false";
+}
+
+/**
+ * Parse `git ls-files --stage -z` output into a map of path to index mode, preferring stage 0.
+ * @param {string} output
+ * @returns {Map<string, string>}
+ */
+function parseStagedModes(output) {
+  /** @type {Map<string, string>} */
+  const modes = new Map();
+  for (const record of output.split("\0")) {
+    if (!record) continue;
+    const match = record.match(/^(\d{6}) [0-9a-f]+ (\d+)\t([\s\S]*)$/);
+    if (!match) continue;
+    if (match[2] === "0" || !modes.has(match[3])) modes.set(match[3], match[1]);
+  }
+  return modes;
+}
+
+/** @param {string | undefined} staged @returns {string} */
+const regularMode = (staged) => (staged === "100644" || staged === "100755" ? staged : "100644");
+
 // The working tree's tracked and untracked files, excluding what git ignores, by path. Snapshotting
 // all of them is what lets `done` notice an edit outside module_paths and refuse it. Each file is
 // hashed into the object database by one batched `git hash-object` call, so a snapshot holds blob
@@ -71,6 +105,9 @@ export function gitOk(repo, args) {
 /** @param {string} repo @returns {PrTree} */
 export function snapshotPrTree(repo) {
   const names = gitOutput(prGit(repo, ["ls-files", "--cached", "--others", "--exclude-standard", "-z"]));
+  const stagedModes = isFilemodeFalse(repo)
+    ? parseStagedModes(gitRawOutput(prGit(repo, ["ls-files", "--stage", "-z"])).toString("utf8"))
+    : null;
   /** @type {PrTree} */
   const tree = {};
   /** @type {{ name: string, mode: string }[]} */
@@ -83,7 +120,9 @@ export function snapshotPrTree(repo) {
     if (stat.isSymbolicLink() || /[\n\r]/.test(name) || name.startsWith('"')) {
       const file = workingFile(repo, name);
       if (file) tree[name] = file;
-    } else batch.push({ name, mode: modeOf(stat) });
+    } else {
+      batch.push({ name, mode: stagedModes ? regularMode(stagedModes.get(name)) : modeOf(stat) });
+    }
   }
   if (batch.length) {
     const oids = gitOutput(prGit(repo, ["hash-object", "-w", "--no-filters", "--stdin-paths"], { input: batch.map((b) => `${b.name}\n`).join("") })).split("\n");
@@ -115,8 +154,15 @@ const modeOf = (stat) => (stat.isSymbolicLink() ? "120000" : stat.mode & 0o111 ?
 export function workingFile(repo, path) {
   const stat = statOf(repo, path);
   if (!stat) return null;
-  const bytes = stat.isSymbolicLink() ? Buffer.from(readlinkSync(join(repo, path))) : readFileSync(join(repo, path));
-  return { mode: modeOf(stat), oid: gitOutput(prGit(repo, ["hash-object", "-w", "--stdin"], { input: bytes })) };
+  if (stat.isSymbolicLink()) {
+    const bytes = Buffer.from(readlinkSync(join(repo, path)));
+    return { mode: "120000", oid: gitOutput(prGit(repo, ["hash-object", "-w", "--no-filters", "--stdin"], { input: bytes })) };
+  }
+  const mode = isFilemodeFalse(repo)
+    ? regularMode(parseStagedModes(gitRawOutput(prGit(repo, ["ls-files", "--stage", "-z", "--", path])).toString("utf8")).get(path))
+    : modeOf(stat);
+  const bytes = readFileSync(join(repo, path));
+  return { mode, oid: gitOutput(prGit(repo, ["hash-object", "-w", "--no-filters", "--stdin"], { input: bytes })) };
 }
 
 // A snapshot file's bytes, read back from the object database. No ref holds a snapshot's blobs, so
@@ -262,7 +308,9 @@ export function pathsChanged(repo, a, b, paths) {
   return prGit(repo, ["diff", "--quiet", a, b, "--", ...paths]).status !== 0;
 }
 
-// A path's blob and mode at a commit, or null when the commit does not hold it.
+// A path's blob and mode at a commit, or null when the commit does not hold it. A regular file is
+// smudged for the working tree and stored as a raw blob so restore leaves `git status` clean and
+// resume compares raw bytes to raw bytes; symlinks stay raw.
 /**
  * @param {string} repo
  * @param {string} commit
@@ -275,7 +323,10 @@ export function commitFile(repo, commit, path) {
   const record = listing.stdout.toString("utf8").split("\0").find(Boolean);
   const match = record?.match(/^(\d{6}) (\w+) ([0-9a-f]+)\t([\s\S]*)$/);
   if (!match || match[2] !== "blob") return null;
-  return { mode: match[1], oid: match[3] };
+  if (match[1] === "120000") return { mode: match[1], oid: match[3] };
+  const smudged = gitRawOutput(prGit(repo, ["cat-file", "--filters", `--path=${path}`, match[3]]));
+  const oid = gitOutput(prGit(repo, ["hash-object", "-w", "--no-filters", "--stdin"], { input: smudged }));
+  return { mode: match[1], oid };
 }
 
 // Write `file` at `path`, or unlink it when `file` is null. The journal already checked that the
@@ -299,9 +350,9 @@ export function writeTreeFile(repo, path, file) {
     symlinkSync(bytes.toString("utf8"), target);
     return;
   }
-  if (existsSync(target) && lstatSync(target).isSymbolicLink()) rmSync(target, { force: true });
+  if (statOf(repo, path)?.isSymbolicLink()) rmSync(target, { force: true });
   writeFileSync(target, bytes);
-  chmodSync(target, file.mode === "100755" ? 0o755 : 0o644);
+  if (!isFilemodeFalse(repo)) chmodSync(target, file.mode === "100755" ? 0o755 : 0o644);
 }
 
 // Whether the path is a symlink whose real target escapes every allowed root.
@@ -352,8 +403,12 @@ export function itemCommit(repo, parent, changes, message) {
   try {
     gitOutput(prGit(repo, ["read-tree", parent], { index }));
     const entries = Object.entries(changes).map(([path, file]) => {
-      // The snapshot wrote every file's blob, so its id goes in as it is.
-      const sha = file ? file.oid : "0".repeat(parent.length);
+      // Snapshots hold raw blobs; each regular file is re-hashed clean for the commit, while symlinks stay raw.
+      const sha = !file
+        ? "0".repeat(parent.length)
+        : file.mode === "120000"
+          ? file.oid
+          : gitOutput(prGit(repo, ["hash-object", "-w", "--stdin", `--path=${path}`], { input: fileBytes(repo, file) }));
       return `${file?.mode ?? "0"} ${sha}\t${path}\0`;
     }).join("");
     if (entries) gitOutput(prGit(repo, ["update-index", "-z", "--index-info"], { index, input: entries }));

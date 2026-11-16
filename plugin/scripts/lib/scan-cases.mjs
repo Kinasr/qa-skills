@@ -5,14 +5,15 @@
 // belong to the code index pass.
 
 import { isMap } from "./dialect.mjs";
+import { missingPermissionLevels, permissionRulesOf } from "./permission-binding.mjs";
 import { noList, sameSummary } from "./schema.mjs";
 
-/** @import { CaseEntry, QaFile, ScanContext } from "./scan.mjs" */
-/** @import { ParsedRule } from "./knowledge-file.mjs" */
+/** @import { CaseEntry, ScanContext } from "./scan.mjs" */
+/** @import { ParsedFile, ParsedRule } from "./knowledge-file.mjs" */
 
 /**
  * The kinds of result this pass reports.
- * @typedef {"outcome_gap" | "divergence" | "review_overdue" | "overreach"} CaseResultKind
+ * @typedef {"outcome_gap" | "divergence" | "review_overdue" | "overreach" | "case_warning"} CaseResultKind
  */
 
 /**
@@ -46,7 +47,7 @@ import { noList, sameSummary } from "./schema.mjs";
  */
 
 /** @type {readonly CaseResultKind[]} */
-export const kinds = ["outcome_gap", "divergence", "review_overdue", "overreach"];
+export const kinds = ["outcome_gap", "divergence", "review_overdue", "overreach", "case_warning"];
 
 /**
  * @param {ScanContext} ctx
@@ -58,6 +59,7 @@ export function run(ctx) {
     const feature = ctx.index.featureOf(f) ?? undefined;
     const scenario = typeof f.data.key === "string" ? f.data.key : undefined;
     const waived = feature === undefined ? new Map() : waivedRules(ctx, feature);
+    const permissionRules = feature === undefined ? new Set() : permissionsRules(ctx, feature);
 
     if (f.h1?.key && isMap(f.data.mirror)) {
       summary(ctx, f.h1.text, f.data.mirror, { file: f.rel, line: f.h1.line, feature, key: f.h1.key });
@@ -87,8 +89,42 @@ export function run(ctx) {
         ctx.emit({ kind: "review_overdue", code: "review_by_passed", ...where, review_by: due, message: `\`${c.key}\` was due for review by ${due}` });
       }
       overreach(ctx, c, where, waived);
+      partialPermissionBinding(ctx, /** @type {ParsedFile} */ (f), c, where, permissionRules);
     }
   }
+}
+
+// Rules recorded under the Permissions Coverage category are the only Rules that make a partial
+// binding meaningful. A covered Permissions line may name several Rules; another category's
+// coverage never implies permission behaviour.
+/**
+ * @param {ScanContext} ctx
+ * @param {string} feature
+ * @returns {Set<string>}
+ */
+function permissionsRules(ctx, feature) {
+  return permissionRulesOf(ctx.index.features.get(feature)?.[0]?.file);
+}
+
+/**
+ * @param {ScanContext} ctx
+ * @param {ParsedFile} scenario
+ * @param {CaseEntry} c
+ * @param {ResultWhere} where
+ * @param {Set<string>} permissionRules
+ * @returns {void}
+ */
+function partialPermissionBinding(ctx, scenario, c, where, permissionRules) {
+  const missing = missingPermissionLevels(c, scenario, permissionRules, ctx.config);
+  if (missing.length === 0) return;
+
+  ctx.emit({
+    kind: "case_warning",
+    code: "partial_permission_binding",
+    ...where,
+    missing_levels: missing,
+    message: `\`${c.key}\` covers a Permissions Rule but is not bound to executable level${missing.length === 1 ? "" : "s"} ${missing.map((level) => `\`${level}\``).join(", ")}`,
+  });
 }
 
 // The Waived Rules of a Feature, by Rule key: the Rules its file holds with a Waiver (ADR-0039). A

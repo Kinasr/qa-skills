@@ -57,7 +57,7 @@
 
 /**
  * One candidate Rule of the Feature-level judge unit, as the brief gives it: its key and its full
- * text, the heading and the elaboration, as the judge reads it.
+ * text, the item or heading and the elaboration, as the judge reads it.
  * @typedef {{
  *   key: string,
  *   text: string,
@@ -137,13 +137,15 @@ below. Your entire output is one report.
 
 === WHAT YOU ARE JUDGING ===
 
-A Feature file holds narrative prose plus Rules, each written as \`### rule_<key>: <statement>\`.
-Rules are the stated intent for the feature. Test Scenario files hold Test Cases, each written as
-\`### <KEY>: <summary>\` followed by a \`yaml\` block and prose (Preconditions / Steps / Expected
-result). A case's \`covers:\` field names the Rules it is believed to exercise.
+A Feature file holds narrative prose plus Rules, each a numbered item under \`## Rules\`:
+\`1. **rule_<key>**: <statement>\`. Rules are the stated intent for the feature. Test Scenario files
+hold Test Cases, each written as \`### <KEY>: <summary>\` followed by a \`yaml\` block and prose
+(Preconditions / Steps / Expected result). A case's \`covers:\` field names the Rules it is believed
+to exercise.
 
-A Feature file may also hold **Boundaries**, each written as \`### boundary_<key>: <statement>\`
-with an \`Owner:\` line naming the Feature that owns that behaviour, or \`none\`.
+A Feature file may also hold **Boundaries**, each a numbered item under \`## Boundaries\`:
+\`1. **boundary_<key>**: <statement>\`, with an \`Owner:\` line in the field block below it naming the
+Feature that owns that behaviour, or \`none\`.
 
 **\`covers:\` is content, not a filter.** A case with \`covers: []\` is judged exactly like any
 other. Judge every case against **all** the Rules in the Feature, not just the ones it names.
@@ -307,9 +309,10 @@ Change **nothing**. Write **no files**. Run **no commands**. Your entire output 
 
 === WHAT YOU ARE JUDGING ===
 
-A Feature holds Rules, each written as \`### rule_<key>: <statement>\`, and may hold
-**Boundaries**, each written as \`### boundary_<key>: <statement>\` with an \`Owner:\` line naming
-the Feature that owns that behaviour, or \`none\`.
+A Feature holds Rules, each a numbered item under \`## Rules\`: \`1. **rule_<key>**: <statement>\`,
+and may hold **Boundaries**, each a numbered item under \`## Boundaries\`:
+\`1. **boundary_<key>**: <statement>\`, with an \`Owner:\` line in the field block below it naming the
+Feature that owns that behaviour, or \`none\`.
 
 You are judging the Rules below against the Boundaries below: a Rule that states behaviour a
 Boundary hands elsewhere crosses that Boundary.

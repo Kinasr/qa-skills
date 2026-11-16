@@ -141,10 +141,11 @@ export function parseCoverage(text) {
 /**
  * Every problem a drafted Feature's `## Coverage` has, as `check-file`-shaped errors: a line the
  * parser could not read, a key that is unknown or retired, a line repeated or out of walk order, a
- * missing effective category, a Rule or Boundary reference that no longer resolves, a tag on a
- * category that is not awaiting, an `awaiting` line with no tagged Parked question, and an `n/a`
- * with no reason. `opts.current` is the Feature this draft replaces: when it has a section and the
- * draft does not, the draft is refused, while a legacy Feature with no section stays valid.
+ * missing effective category, a Rule or Boundary reference that no longer resolves, an `n/a` reason
+ * that names a live Rule, a tag on a category that is not awaiting, an `awaiting` line with no
+ * tagged Parked question, and an `n/a` with no reason. `opts.current` is the Feature this draft
+ * replaces: when it has a section and the draft does not, the draft is refused, while a legacy
+ * Feature with no section stays valid.
  * @param {ParsedFile} feature The drafted Feature.
  * @param {EffectiveCategories} effective The effective category list and its retired keys.
  * @param {CoverageOptions} [opts]
@@ -212,6 +213,21 @@ export function coverageProblems(feature, effective, { current = null } = {}) {
     for (const boundary of tokens(text, BOUNDARY_TOKEN)) {
       if (!boundaries.has(boundary)) errors.push({ code: "coverage_boundary", field: boundary, line: line.line, message: `Coverage names \`${boundary}\`, which is not a live Boundary of this Feature` });
     }
+    // An n/a says why the Feature has no behaviour of that kind. A reason naming a live Rule says the
+    // opposite: a Rule covers the behaviour, so the category or functionality belongs under `covered by`.
+    /** @type {{ functionality: string | null, reason: string }[]} */
+    const reasons = [
+      ...(line.reason === null ? [] : [{ functionality: null, reason: line.reason }]),
+      ...line.na.map((na) => ({ functionality: na.functionality, reason: na.reason })),
+    ];
+    for (const { functionality, reason } of reasons) {
+      for (const rule of new Set(tokens(reason, RULE_TOKEN))) {
+        if (!rules.has(rule)) continue;
+        const subject = functionality === null ? `\`${line.key}\` is n/a` : `\`${line.key}\` is n/a for \`${functionality}\``;
+        const covered = functionality === null ? "the category" : `\`${functionality}\``;
+        errors.push({ code: "coverage_na_rule", field: rule, line: line.line, message: `${subject}, but its reason names \`${rule}\`, a live Rule: ${covered} is \`covered by\` that Rule` });
+      }
+    }
   }
 
   const awaiting = new Set(section.lines.filter((line) => line.disposition === "awaiting").map((line) => line.key));
@@ -276,8 +292,9 @@ export function coverageDue(featureFile, effective, opts = {}) {
   };
   for (const problem of coverageProblems(featureFile, effective, opts)) {
     const trigger = fromProblem[problem.code];
-    // A malformed, duplicate or out-of-order line, a tag on a category that is not awaiting, and
-    // an n/a with no reason belong to the deep-dive check: none is one of the due triggers.
+    // A malformed, duplicate or out-of-order line, a tag on a category that is not awaiting, an n/a
+    // with no reason, and an n/a naming a live Rule belong to the deep-dive check: none is one of
+    // the due triggers.
     if (trigger) add(trigger, problem.message);
   }
 

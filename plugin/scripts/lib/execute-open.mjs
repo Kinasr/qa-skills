@@ -1,19 +1,22 @@
 // @ts-check
 // `execute open` and `execute close`: the lifecycle of one
-// Execution's browser sessions, which the skill reaches through `execute next` and `record` and
+// Execution's browser and header-only sessions, which the skill reaches through `execute next` and `record` and
 // the tests through these actions directly.
 //
 //   open --dir <run-dir> --execution <id> [--root <qa-dir>]
 //       Opens one session per Role of the Execution, named `<run-id>-<exec-id>-<role-slug>`, from
 //       `<run>/executions/<id>/` (every `playwright-cli` call of the Execution runs there). Each
-//       session name is registered in `guard.json` before its browser opens, so a Run that dies half
-//       way can still close all of them. A session logs in (a CLI login, ADR-0019, whose state the Run
-//       keeps under `auth/` for the Executions after this one, ADR-0036) or loads the engineer's saved
-//       state, or, for a role-less case with no covering note, stays unauthenticated; it then goes to
+//       session name, kind and Header credential presence are registered in `guard.json` before
+//       any browser opens. Header-only sessions skip login, navigation and landing checks. A Run that dies half
+//       way can still close all of them. A session logs in (a CLI login, ADR-0019, made fresh for this
+//       Execution and kept under `auth/` only until the Run cleans it up) or loads the engineer's saved
+//       state, or, for a Role whose note logs in as nobody (ADR-0063) or a role-less case with no
+//       covering note, stays unauthenticated; it then goes to
 //       the target origin, which is checked as after any command. A session with a login that lands on
-//       the note's sign-in page or a password field is stale: a kept CLI login is deleted and made
-//       again once; a saved state, or a login that is no better when fresh, refuses `login_failed`,
-//       which `execute next` turns into a paused note. A target that cannot be reached, a CLI login's
+//       the note's sign-in page or a password field is stale: a saved state, or a login just made,
+//       refuses `login_failed`, which `execute next` turns into a paused note. A kept login from an
+//       earlier Execution is never loaded: that Execution may have signed it out, and a public home
+//       page would not show it. A target that cannot be reached, a CLI login's
 //       first page included, is `unreachable`, never `login_failed`. Nothing here counts toward the
 //       action cap. Fills `guard.uploads` with the fixtures the Tester may attach. A failure closes
 //       what was opened and removes the guard. A note `execute resume --skip` skipped is left out of
@@ -21,22 +24,28 @@
 //
 //       Before anything opens, the call rechecks the running host (lib/host-admission.mjs) against the
 //       supported Claude Code floor: one it cannot verify refuses `host_unverified`, having made no
-//       login or browser call and changed nothing.
+//       login or browser call and changed nothing, unless the Run is the Unguarded Run the engineer
+//       acknowledged for that same failure (never below the floor).
 //
 //   close --dir <run-dir> --execution <id>
 //       Closes that Execution's sessions, login ones included, one `close` each, never `close-all`.
 //
-import { existsSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { accessNoteNamed } from "./access.mjs";
-import { cliLoginUser } from "./access-note.mjs";
+import { dropProfile, ensureProfileFlag } from "./browser-profile.mjs";
+import { cliLoginUser, isHeaderOnly } from "./access-note.mjs";
+import { redactionExemptName } from "./credentials.mjs";
+import { readHeaderCredential, readExpiredHeaderCredential, headerCredentialValues, maskCredentialValue } from "./header-credential.mjs";
 import { UsageError, noArguments, orThrow, requireOption } from "./cli.mjs";
-import { authFile, dropAuth, isHelper, keepAuth } from "./execute-auth.mjs";
+import { dropAuth, isHelper, isPrivacyRefusalError, keepAuth } from "./execute-auth.mjs";
+import { checkDirPrivacy } from "./platform-privacy.mjs";
 import { executeTraining, fixtureExists } from "./execute-training.mjs";
 import { GUARD_FILE, executionDir, loginUrlOf, namedSessions, observe, passwordShown, playwright, readGuard, verdict, writeGuard } from "./execution-guard.mjs";
+/** @import { PlatformContext } from "./platform.mjs" */
 import { MIN_PLAYWRIGHT_CLI, UPGRADE_PLAYWRIGHT_CLI, playwrightCliVersion } from "./playwright-version.mjs";
 import { refusalsFor } from "./refusal.mjs";
-import { admitHost } from "./host-admission.mjs";
+import { admitRun } from "./host-admission.mjs";
 import { EXECUTE_TRAIN_KEY } from "./schema.mjs";
 import { loginFor } from "./scout.mjs";
 import { trainFile } from "./training.mjs";
@@ -89,18 +98,7 @@ import { openRunDir, readRunFile } from "./run-dir.mjs";
  * }} CandidatePlan
  */
 
-/**
- * Shape of an Access note read by execution commands.
- * @typedef {{
- *   key: string,
- *   withheld?: boolean,
- *   match?: string[],
- *   via?: string,
- *   role?: string,
- *   identifiers?: Record<string, string>,
- *   login_url?: string,
- * }} AccessNote
- */
+/** @typedef {import("./access.mjs").ShownAccessNote} AccessNote */
 
 /**
  * Shape of an upload entry in execute training.
@@ -130,6 +128,7 @@ const { stop } = refusalsFor({
   execution_blocked: "The Execution was Blocked before dispatch and has no sessions to open.",
   already_open: "The Execution already has a guard; reset its dir before opening it again.",
   no_playwright_cli: "`/qa-execute` drives the app through `playwright-cli`, which is not on the PATH; install it first.",
+  refused_playwright_cli: "`/qa-execute` refused the `playwright-cli` binary or shim resolved from PATH.",
   old_playwright_cli: "`/qa-execute` needs a newer `playwright-cli`; upgrade it first.",
   note_withheld: "The Access note holds what looks like a credential; fix `train/access.md` with `/qa-train access`.",
   note_missing: "The Access note is gone from `train/access.md`; add it back with `/qa-train access`.",
@@ -227,25 +226,33 @@ function fixtures(root, feature, execDir) {
   return uploads;
 }
 
-// How session `s` gets its login state: `{state}`, a path `state-load` takes, with `reused` when a CLI
-// login of the Run was kept for the note, `fresh` when one was just made (it is kept now, for the Executions
-// after this one), `saved` for the engineer's own file; `{refusal}` when the login fails, with `unreachable`
-// when the app could not be reached at all; `{state: null}` for an unauthenticated session.
+// How session `s` gets its login state: `{state}`, a path `state-load` takes, with `fresh` when the CLI
+// just logged in for this Execution (it is kept now, so the Run can clean it up), `saved` for the
+// engineer's own file; `{refusal}` when the login fails, with `unreachable` when the app could not be
+// reached at all; `{state: null}` for an unauthenticated session. A CLI login is always made fresh for
+// the Execution, never loaded from an earlier one: a sign-out in an earlier case can revoke it, and a
+// public home page still lands "ok", so a dead login would not be noticed.
 /**
  * @param {ExecutionSession} s
- * @param {{ root: string, runDir: string, origin: string, execDir: string, notes: Map<string | null, AccessNote> }} param1
- * @returns {{ state: string | null, reused?: boolean, fresh?: boolean, saved?: boolean, refusal?: undefined, unreachable?: undefined } | { state?: undefined, reused?: undefined, fresh?: undefined, saved?: undefined, refusal: RefusalResult, unreachable?: boolean }}
+ * @param {{ root: string, runDir: string, origin: string, execDir: string, notes: Map<string | null, AccessNote>, env?: Record<string, string | undefined>, platformContext?: PlatformContext }} param1
+ * @returns {{ state: string | null, fresh?: boolean, saved?: boolean, refusal?: undefined, unreachable?: undefined } | { state?: undefined, fresh?: undefined, saved?: undefined, refusal: RefusalResult, unreachable?: boolean }}
  */
-function loginStateFor(s, { root, runDir, origin, execDir, notes }) {
+function loginStateFor(s, { root, runDir, origin, execDir, notes, env, platformContext }) {
   if (s.acc === null) return { state: null };
   const note = notes.get(s.acc);
-  const kept = authFile(runDir, s.acc);
-  if (cliLoginUser(note) && existsSync(kept)) return { state: kept, reused: true };
-  const login = /** @type {ScoutLoginResult} */ (loginFor(root, /** @type {import("./scout.mjs").ScoutAccessNote} */ (note), `${origin}/`));
+  const login = /** @type {ScoutLoginResult} */ (loginFor(root, /** @type {import("./scout.mjs").ScoutAccessNote} */ (note), `${origin}/`, platformContext));
   if (login.refusal) return { refusal: login.refusal };
   const reached = login.reach(execDir, s.name);
   if (reached.refusal) return { refusal: reached.refusal, ...(reached.unreachable && { unreachable: true }) };
-  return login.record.login === "cli" ? { state: keepAuth(runDir, s.acc, reached.state), fresh: true } : { state: reached.state, saved: true };
+  if (login.record.login !== "cli") return { state: reached.state, saved: true };
+  try {
+    return { state: keepAuth(runDir, s.acc, reached.state, { env }), fresh: true };
+  } catch (error) {
+    if (isPrivacyRefusalError(error)) {
+      return { refusal: stop(error.refusal.code, { error: error.refusal.message, ...(error.refusal.command && { command: error.refusal.command }) }) };
+    }
+    throw error;
+  }
 }
 
 // The refusal a login refusal of the scout's words (`{ok, reason, error, …}`) becomes here.
@@ -261,44 +268,42 @@ function asRefusal(scout, access) {
 
 // Opens session `s`, logs it in and lands it on the target: `{seen, url}` (what `verdict` made of the
 // landing page), or `{refusal}`. A session with a login that lands on a sign-in page or a password
-// field has a stale state (observed, never timed): a kept CLI login is deleted and made again, once; a
-// saved state, or a login just made, that is no better cannot get in and refuses `login_failed`.
+// field has a stale state (observed, never timed): a saved state, or a login just made, that is no
+// better cannot get in and refuses `login_failed`.
 /**
  * @param {ExecutionSession} s
- * @param {{ root: string, runDir: string, origin: string, execDir: string, notes: Map<string | null, AccessNote>, env: Record<string, string | undefined>, attempted: string[] }} c
+ * @param {{ root: string, runDir: string, origin: string, execDir: string, notes: Map<string | null, AccessNote>, env: Record<string, string | undefined>, attempted: string[], platformContext?: PlatformContext }} c
  * @returns {{ seen: PageClassification, url?: string, refusal?: undefined } | { seen?: undefined, url?: undefined, refusal: RefusalResult }}
  */
 function openAndLand(s, c) {
-  const { origin, execDir, env, attempted, runDir } = c;
-  for (;;) {
-    const reached = loginStateFor(s, c);
-    if (reached.unreachable) return { refusal: stop("unreachable", { origin, error: reached.refusal.json.error }) };
-    if (reached.refusal) return { refusal: asRefusal(reached.refusal, s.acc) };
-    if (!attempted.includes(s.name)) attempted.push(s.name);
-    const opened = playwright(execDir, s.name, ["open"], env);
-    if (opened.missing) return { refusal: stop("no_playwright_cli", { upgrade: UPGRADE_PLAYWRIGHT_CLI }) };
-    if (opened.error) return { refusal: stop("unreachable", { origin, error: opened.error }) };
-    if (reached.state) {
-      const loaded = playwright(execDir, s.name, ["state-load", reached.state], env);
-      if (loaded.error) {
-        if (!reached.saved) dropAuth(runDir, s.acc);
-        return { refusal: stop("login_failed", { access: s.acc, error: `could not load the login state: ${loaded.error}` }) };
-      }
+  const { origin, execDir, env, attempted, runDir, platformContext } = c;
+  const reached = loginStateFor(s, c);
+  if (reached.unreachable) return { refusal: stop("unreachable", { origin, error: reached.refusal.json.error }) };
+  if (reached.refusal) return { refusal: asRefusal(reached.refusal, s.acc) };
+  const prof = ensureProfileFlag(execDir, s.name, { env });
+  if (!prof.ok) return { refusal: stop(prof.refusal.code, { access: s.acc, error: prof.refusal.message, ...(prof.refusal.command && { command: prof.refusal.command }) }) };
+  attempted.push(s.name);
+  const opened = playwright(execDir, s.name, ["open", prof.flag], env, undefined, platformContext);
+  if (opened.missing) return { refusal: stop("no_playwright_cli", { upgrade: UPGRADE_PLAYWRIGHT_CLI }) };
+  if (opened.refused) return { refusal: stop("refused_playwright_cli", { check: opened.refusal.code, reason: opened.refusal.message }) };
+  if (opened.error) return { refusal: stop("unreachable", { origin, error: opened.error }) };
+  if (reached.state) {
+    const loaded = playwright(execDir, s.name, ["state-load", reached.state], env, undefined, platformContext);
+    if (loaded.refused) return { refusal: stop("refused_playwright_cli", { check: loaded.refusal.code, reason: loaded.refusal.message }) };
+    if (loaded.error) {
+      if (!reached.saved) dropAuth(runDir, s.acc);
+      return { refusal: stop("login_failed", { access: s.acc, error: `could not load the login state: ${loaded.error}` }) };
     }
-    const landed = playwright(execDir, s.name, ["goto", `${origin}/`], env);
-    if (landed.error) return { refusal: stop("unreachable", { origin, error: landed.error }) };
-    const { url } = observe(execDir, s.name, /** @type {string} */ (landed.text), env);
-    const seen = url === undefined ? /** @type {PageClassification} */ ({ kind: "off" }) : verdict({ cwd: execDir, session: s.name, origin, loginUrl: s.login_url, url, tabs: [], env });
-    const stale = s.acc !== null && (seen.kind === "login" || seen.kind === "sso" || (seen.kind === "ok" && passwordShown(execDir, s.name, env)));
-    if (!stale) return { seen, url };
-    if (reached.reused) {
-      dropAuth(runDir, s.acc);
-      playwright(execDir, s.name, ["close"], env);
-      continue;
-    }
-    if (reached.fresh) dropAuth(runDir, s.acc);
-    return { refusal: stop("login_failed", { access: s.acc, error: reached.fresh ? "a fresh login still lands on the sign-in page: the password may be wrong, or the page asked for more" : "the saved login state lands on the sign-in page: log in again and save the state" }) };
   }
+  const landed = playwright(execDir, s.name, ["goto", `${origin}/`], env, undefined, platformContext);
+  if (landed.refused) return { refusal: stop("refused_playwright_cli", { check: landed.refusal.code, reason: landed.refusal.message }) };
+  if (landed.error) return { refusal: stop("unreachable", { origin, error: landed.error }) };
+  const { url } = observe(execDir, s.name, /** @type {string} */ (landed.text), env, platformContext);
+  const seen = url === undefined ? /** @type {PageClassification} */ ({ kind: "off" }) : verdict({ cwd: execDir, session: s.name, origin, loginUrl: s.login_url, url, tabs: [], env });
+  const stale = s.acc !== null && (seen.kind === "login" || seen.kind === "sso" || (seen.kind === "ok" && passwordShown(execDir, s.name, env)));
+  if (!stale) return { seen, url };
+  if (reached.fresh) dropAuth(runDir, s.acc);
+  return { refusal: stop("login_failed", { access: s.acc, error: reached.fresh ? "a fresh login still lands on the sign-in page: the password may be wrong, or the page asked for more" : "the saved login state lands on the sign-in page: log in again and save the state" }) };
 }
 
 // The notes `execute resume --skip` skipped, from the Run's `dispatch.json` (none before a Run is confirmed).
@@ -315,7 +320,7 @@ function skippedNotes(runDir) {
 /**
  * What `open` and `close` read of the command context: the run directory, the Execution, the
  * environment, and for `open` the `.qa/` root. A caller inside a run builds it by hand.
- * @typedef {{ dir?: string, root?: string, execution?: string, env: Record<string, string | undefined> }} OpenContext
+ * @typedef {{ dir?: string, root?: string, execution?: string, env: Record<string, string | undefined>, platformContext?: PlatformContext }} OpenContext
  */
 
 /**
@@ -323,7 +328,7 @@ function skippedNotes(runDir) {
  * @param {OpenContext} ctx
  * @returns {CommandResult}
  */
-function openExecution(args, { dir, root, execution: id, env }) {
+function openExecution(args, { dir, root, execution: id, env, platformContext }) {
   noArguments("execute open", args, "--dir <run-dir> and --execution <id>");
   requireOption("execute open", id, "--execution <id>", "an id of the plan's Executions");
   const found = execution(dir, /** @type {string} */ (id), "open");
@@ -333,30 +338,46 @@ function openExecution(args, { dir, root, execution: id, env }) {
   if (ex.blocked) return stop("execution_blocked", { execution: id, reason: ex.blocked.reason });
   const execDir = executionDir(runDir, /** @type {string} */ (id));
   if (readGuard(execDir)) return stop("already_open", { execution: id });
-  const hostRefusal = admitHost({ env });
-  if (hostRefusal) return hostRefusal;
-  const cli = playwrightCliVersion(env);
+  const host = admitRun(pinned, { env });
+  if (host.refusal) return host.refusal;
+  const cli = playwrightCliVersion(env, platformContext);
   if (cli.status === "missing") return stop("no_playwright_cli", { upgrade: UPGRADE_PLAYWRIGHT_CLI });
+  if (cli.status === "refused") return stop("refused_playwright_cli", { check: cli.refusal.code, reason: cli.refusal.message });
   if (cli.status === "old") return stop("old_playwright_cli", { ...(cli.found && { found: cli.found }), ...(cli.failure && { failure: cli.failure }), minimum: MIN_PLAYWRIGHT_CLI, upgrade: UPGRADE_PLAYWRIGHT_CLI });
 
+  root = pinned.root ?? root;
+  const trainedExempt = executeTraining(trainFile(/** @type {string} */ (root), EXECUTE_TRAIN_KEY)).redaction_exempt;
   const origin = pinned.target.origin;
   /** @type {Map<string | null, AccessNote>} */
   const notes = new Map();
+  /** @type {string[]} */
+  const values = [];
+  const safe = /** @template T @param {T} value @returns {T} */ (value) => maskCredentialValue(value, values);
   for (const key of ex.access) {
-    const note = accessNoteNamed(/** @type {string} */ (root), key);
+    const note = accessNoteNamed(/** @type {string} */ (root), key, { headerCredentials: true });
     if (!note) return stop("note_missing", { access: key });
     if (note.withheld) return stop("note_withheld", { access: key });
+    const header = readHeaderCredential(/** @type {string} */ (root), note);
+    if (header.refusal) return stop(header.refusal.code, { access: key, error: header.refusal.message, ...(header.refusal.gitignore_line && { gitignore_line: header.refusal.gitignore_line }) });
+    const expired = readExpiredHeaderCredential(/** @type {string} */ (root), note);
+    values.push(...headerCredentialValues(header.credential), ...headerCredentialValues(expired.credential ?? null));
+    if (expired.refusal) return safe(stop(expired.refusal.code, { access: key, error: expired.refusal.message, ...(expired.refusal.gitignore_line && { gitignore_line: expired.refusal.gitignore_line }) }));
     notes.set(key, note);
   }
   const skipped = skippedNotes(runDir);
-  const sessions = namedSessions(pinned.run, /** @type {string} */ (id), ex.sessions.filter((s) => !(skipped.includes(/** @type {string} */ (s.acc)) && isHelper(ex, s)))).map((s) => ({ ...s, login_url: loginUrlOf(notes.get(s.acc), origin) }));
+  const sessions = namedSessions(pinned.run, /** @type {string} */ (id), ex.sessions.filter((s) => !(skipped.includes(/** @type {string} */ (s.acc)) && isHelper(ex, s)))).map((s) => ({ ...s, ...(notes.get(s.acc)?.header_via !== undefined && { header: true }), ...(cliLoginUser(notes.get(s.acc)) && { user: /** @type {string} */ (cliLoginUser(notes.get(s.acc))) }), kind: /** @type {"header-only" | "browser"} */ (isHeaderOnly(notes.get(s.acc)) ? "header-only" : "browser"), login_url: loginUrlOf(notes.get(s.acc), origin) }));
   mkdirSync(join(runDir, ".playwright"), { recursive: true });
   mkdirSync(execDir, { recursive: true });
+  const execPrivacy = checkDirPrivacy(execDir, { env });
+  if (!execPrivacy.ok) return safe(stop(execPrivacy.refusal.code, { error: execPrivacy.refusal.message, ...(execPrivacy.refusal.command && { command: execPrivacy.refusal.command }) }));
   /** @type {ExecutionGuard} */
   const guard = {
     id: /** @type {string} */ (id), run: pinned.run, origin, cap: ex.cap, used: 0, stopped: null, sessions, login_sessions: sessions.filter((s) => cliLoginUser(notes.get(s.acc))).map((s) => `${s.name}-login`),
     match: Object.fromEntries(sessions.map((s) => [s.role, s.acc === null ? [`url:${origin}/`] : (/** @type {NonNullable<ReturnType<typeof notes.get>>} */ (notes.get(s.acc)).match ?? []).filter((m) => typeof m === "string")])),
+    ...(pinned.route_origins?.length && { route_origins: pinned.route_origins }),
+    ...(pinned.route_sign_in_urls?.length && { route_sign_in_urls: pinned.route_sign_in_urls }),
     uploads: fixtures(/** @type {string} */ (root), ex.feature, execDir), at_login: [], log: [],
+    redaction_exempt: Array.isArray(trainedExempt) ? trainedExempt.filter((name) => typeof name === "string" && redactionExemptName(name)).map((name) => name.toLowerCase()) : [],
   };
   writeGuard(execDir, guard);
 
@@ -366,19 +387,23 @@ function openExecution(args, { dir, root, execution: id, env }) {
   const landing = [];
   /** @param {RefusalResult} refusal */
   const fail = (refusal) => {
-    for (const name of attempted) playwright(execDir, name, ["close"], env);
+    for (const name of attempted) {
+      playwright(execDir, name, ["close"], env, undefined, platformContext);
+      dropProfile(execDir, name);
+    }
     rmSync(join(execDir, GUARD_FILE), { force: true });
-    return refusal;
+    return safe(refusal);
   };
   for (const s of sessions) {
-    const entered = openAndLand(s, { root: /** @type {string} */ (root), runDir, origin, execDir, notes, env, attempted });
+    if (s.kind === "header-only") continue;
+    const entered = openAndLand(s, { root: /** @type {string} */ (root), runDir, origin, execDir, notes, env, attempted, platformContext });
     if (entered.refusal) return fail(entered.refusal);
     const { seen, url } = entered;
     if (seen.kind === "off") guard.stopped ??= "off-target";
-    landing.push({ role: s.role, name: s.name, page_url: seen.kind === "off" ? seen.origin : url, ...(seen.kind === "off" && { stopped: "off-target" }) });
+    landing.push(safe({ role: s.role, name: s.name, page_url: seen.kind === "off" ? seen.origin : url, ...(seen.kind === "off" && { stopped: "off-target" }) }));
   }
   writeGuard(execDir, guard);
-  return { exit: 0, json: { action: "open", ok: true, execution: id, dir: execDir, cap: guard.cap, sessions: sessions.map(({ role, name, acc, setup }) => ({ role, name, acc, setup })), landing } };
+  return { exit: 0, json: { action: "open", ok: true, ...(host.unguarded && { unguarded: true }), execution: id, dir: execDir, cap: guard.cap, sessions: sessions.map(({ role, name, acc, setup, kind }) => ({ role, name, acc, setup, kind })), landing } };
 }
 
 /**
@@ -386,7 +411,7 @@ function openExecution(args, { dir, root, execution: id, env }) {
  * @param {OpenContext} ctx
  * @returns {CommandResult}
  */
-function closeExecution(args, { dir, execution: id, env }) {
+function closeExecution(args, { dir, execution: id, env, platformContext }) {
   noArguments("execute close", args, "--dir <run-dir> and --execution <id>");
   requireOption("execute close", id, "--execution <id>", "an id of the plan's Executions");
   const found = execution(dir, /** @type {string} */ (id), "close");
@@ -396,8 +421,10 @@ function closeExecution(args, { dir, execution: id, env }) {
   /** @type {string[]} */
   const closed = [];
   if (guard && !guard.closed) {
-    for (const name of [...guard.sessions.map((s) => s.name), ...(guard.login_sessions ?? [])]) {
-      if (!playwright(execDir, name, ["close"], env).missing) closed.push(name);
+    for (const name of [...guard.sessions.filter((s) => s.kind !== "header-only").map((s) => s.name), ...(guard.login_sessions ?? [])]) {
+      const closedRun = playwright(execDir, name, ["close"], env, undefined, platformContext);
+      if (!closedRun.missing && !closedRun.refused) closed.push(name);
+      dropProfile(execDir, name);
     }
     writeGuard(execDir, { ...guard, closed: true });
   }

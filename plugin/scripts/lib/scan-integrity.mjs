@@ -2,7 +2,8 @@
 // Integrity errors on the knowledge side: a reference that cannot resolve, a key
 // that does not match its kind's pattern, a key
 // naming two things, a file outside the dialect. Also `unknown_key` warnings: an unknown key is
-// reported and preserved, never deleted. And a `schema_warning` when
+// reported and preserved, never deleted. A `config_warning` for a module path that does not exist
+// yet. And a `schema_warning` when
 // `project.md` declares a `schema_version` newer than this CLI's: the scan still runs, and
 // every command that writes refuses (lib/schema-guard.mjs).
 //
@@ -27,7 +28,7 @@ import { ACCESS_TRAIN_KEY, LEVEL_ON_CASE_SCHEMA_VERSION, SCHEMA_VERSION } from "
 
 /**
  * Result kinds emitted by the integrity scan pass.
- * @typedef {"integrity_error" | "unknown_key" | "schema_warning"} IntegrityKind
+ * @typedef {"integrity_error" | "unknown_key" | "schema_warning" | "config_warning"} IntegrityKind
  */
 
 /**
@@ -92,7 +93,7 @@ import { ACCESS_TRAIN_KEY, LEVEL_ON_CASE_SCHEMA_VERSION, SCHEMA_VERSION } from "
  */
 
 /** @type {readonly IntegrityKind[]} */
-export const kinds = ["integrity_error", "unknown_key", "schema_warning"];
+export const kinds = ["integrity_error", "unknown_key", "schema_warning", "config_warning"];
 
 /**
  * @param {IntegrityContext} ctx
@@ -124,7 +125,12 @@ export function run(ctx) {
     }
     if (RESERVED.includes(f.name)) error("reserved_name", where, `\`${f.name}\` is a reserved name and stays unused in \`.qa/\``, { name: f.name });
     local(ctx, f, where, error);
-    for (const { code, message, ...at } of executeIntegrity(f, { root: ctx.root, roles: ctx.config.roles, features: /** @type {Set<string>} */ (/** @type {unknown} */ (index.features)) })) error(code, { ...where, ...at }, message);
+    for (const { code, message, ...at } of executeIntegrity(f, {
+      root: ctx.root,
+      roles: ctx.config.roles,
+      features: /** @type {Set<string>} */ (/** @type {unknown} */ (index.features)),
+      execute_levels: ctx.config.execute_levels,
+    })) error(code, { ...where, ...at }, message);
     if (f.type === "scenario") scenario(ctx, f, error);
     if (f.type === "feature") waivers(ctx, f, where, error);
     if (f.type === "feature") boundaries(ctx, f, where, error);
@@ -142,7 +148,7 @@ export function run(ctx) {
   trackerUniqueness(ctx, error);
   retired(ctx, error);
   pins(ctx, error);
-  projectConfig(ctx, error);
+  projectConfig(ctx, error, (code, where, message, extra = {}) => ctx.emit({ kind: "config_warning", code, ...where, message, ...extra }));
 }
 
 const RESERVED = ["index.md", "log.md"];
@@ -184,7 +190,7 @@ function trackerUniqueness(ctx, error) {
   }
 }
 
-// A Rule's Waiver (ADR-0039): the `Waived: <reason>` field under the Rule's heading says the Rule
+// A Rule's Waiver (ADR-0039): the `Waived: <reason>` field in the Rule's field block says the Rule
 // is deliberately left without a Test Case. A Waiver with no reason says nothing, so it is an
 // Integrity error on the Waiver's own line.
 /**
@@ -495,23 +501,28 @@ function pins(ctx, error) {
   }
 }
 
-// Relational config checks: every module path exists in the repository under test.
+// Relational config checks: every module path is a directory in the repository under test. One
+// that does not exist yet is a `config_warning` (git keeps no empty directory, and `/qa-codegen`
+// creates it); one that exists as anything else is an error.
 /**
  * @param {IntegrityContext} ctx
  * @param {(code: string, where: Record<string, unknown>, message: string, extra?: Record<string, unknown>) => void} error
+ * @param {(code: string, where: Record<string, unknown>, message: string, extra?: Record<string, unknown>) => void} warn
  * @returns {void}
  */
-function projectConfig(ctx, error) {
+function projectConfig(ctx, error, warn) {
   const project = ctx.index.project;
   if (!project) return;
   const at = (/** @type {string} */ k, /** @type {string} */ field) => ({ file: project.rel, line: project.keyLines[k] ?? project.frontmatterLine, field });
   for (const p of ctx.config.modulePaths) {
+    /** @type {boolean | null} */
     let dir;
     try {
       dir = statSync(resolve(ctx.repo, p)).isDirectory();
     } catch {
-      dir = false;
+      dir = null;
     }
-    if (!dir) error("missing_module_path", at("module_paths", "module_paths"), `module path \`${p}\` is not a directory in the repository`, { path: p });
+    if (dir === null) warn("module_path_absent", at("module_paths", "module_paths"), `module path \`${p}\` does not exist yet: /qa-codegen creates it, and nothing is indexed there until then`, { path: p });
+    else if (!dir) error("missing_module_path", at("module_paths", "module_paths"), `module path \`${p}\` is not a directory in the repository`, { path: p });
   }
 }

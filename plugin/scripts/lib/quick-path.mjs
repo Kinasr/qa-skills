@@ -17,6 +17,7 @@
 /** @import { ParsedFile } from "./knowledge-file.mjs" */
 import { join, resolve } from "node:path";
 import { clearHandoff, readHandoff, uncommittedKnowledge, writeHandoff } from "./change-handoff.mjs";
+import { commitLine } from "./changeset.mjs";
 import { refuse } from "./impact-json.mjs";
 import { loadQaAt, repositoryOf, resolveRef } from "./git-tree.mjs";
 import { buildIndex, loadWorkingTree } from "./qa-index.mjs";
@@ -167,6 +168,10 @@ export function checkQuick({ root, dir: named, feature, stdin }) {
     clearHandoff(dir);
   }
   const features = new Set(edits.map((e) => e.feature));
+  // Checkpoint 1's commit: the knowledge this change wrote and has not committed, as the Commit mode
+  // says (ADR-0062). Over the limit there is no checkpoint, so no commit.
+  const paths = over ? [] : uncommittedKnowledge(root);
+  const changeset = { paths, commit: paths.length ? commitLine(paths, `qa(${feature}): /qa-impact checkpoint 1`) : null };
   const plan = `impact plan${features.size === 1 ? ` ${feature}` : ""} --persist --dir ${dir}`;
   return {
     exit: 0,
@@ -176,6 +181,7 @@ export function checkQuick({ root, dir: named, feature, stdin }) {
       dir,
       threshold,
       handoff,
+      changeset,
       next_step: over ? `/qa-deep-dive ${feature} --dir ${dir}` : `commit the Rule edits (checkpoint 1), then \`${plan}\``,
     },
   };

@@ -2,7 +2,8 @@
 // Which `playwright-cli` this machine has, and whether it is new enough for `/qa-execute`.
 // `/qa-execute` drives the app through its sessions, run-code and
 // `--version`; `/qa-init` warns about the same shortfall without blocking.
-import { spawnSync } from "node:child_process";
+/** @import { PlatformContext, PlatformRefusal, PlatformRunnerOptions } from "./platform.mjs" */
+import { defaultPlatformRunner, mapStatusRefusal, spawnNodeCli } from "./platform.mjs";
 
 /** @type {string} */
 export const MIN_PLAYWRIGHT_CLI = "0.1.22";
@@ -40,30 +41,51 @@ export function atLeast(version, min = MIN_PLAYWRIGHT_CLI) {
  *   version?: never,
  *   found?: never,
  *   failure?: never,
+ *   refusal?: never,
+ * } | {
+ *   status: "refused",
+ *   refusal: PlatformRefusal,
+ *   version?: never,
+ *   found?: never,
+ *   failure?: never,
  * } | {
  *   status: "old",
  *   found?: string,
  *   failure?: string,
  *   version?: never,
+ *   refusal?: never,
  * } | {
  *   status: "ok",
  *   version: string,
  *   found?: never,
  *   failure?: never,
+ *   refusal?: never,
  * }} PlaywrightCliVersionResult
  */
 
 // What `playwright-cli --version` says under `env`, with a 5 s timeout:
 //   {status: "missing"}                       not on the PATH (or not executable)
+//   {status: "refused", refusal}              win32 wrapper or shim refused by platform resolution
 //   {status: "old", found?, failure?}         older than the minimum, or no version could be read
 //                                             (`failure` says why: timed out, exited non-zero, printed none)
 //   {status: "ok", version}
 /**
+ * Resolve `playwright-cli` through the platform boundary and verify `--version >= MIN_PLAYWRIGHT_CLI`.
  * @param {NodeJS.ProcessEnv} [env]
+ * @param {PlatformContext} [context]
  * @returns {PlaywrightCliVersionResult}
  */
-export function playwrightCliVersion(env = process.env) {
-  const r = spawnSync("playwright-cli", ["--version"], { env, encoding: "utf8", timeout: VERSION_TIMEOUT_MS });
+export function playwrightCliVersion(env = process.env, context = {}) {
+  const ctx = context.env ? context : { ...context, env };
+  /** @type {PlatformRunnerOptions} */
+  const spawnOptions = { env: ctx.env ?? env, encoding: "utf8", timeout: VERSION_TIMEOUT_MS };
+  const resolved = spawnNodeCli(
+    { kind: "playwright-cli", file: "playwright-cli", args: ["--version"], options: spawnOptions },
+    ctx,
+  );
+  if (resolved.refusal) return mapStatusRefusal(resolved.refusal);
+  const runner = context.run ?? defaultPlatformRunner;
+  const r = runner(resolved.file, resolved.args, resolved.options);
   if (r.error && ["ENOENT", "EACCES"].includes(/** @type {string} */ (/** @type {NodeJS.ErrnoException} */ (r.error).code))) return { status: "missing" };
   if (r.error) return { status: "old", failure: /** @type {NodeJS.ErrnoException} */ (r.error).code === "ETIMEDOUT" ? `\`playwright-cli --version\` timed out after ${VERSION_TIMEOUT_MS / 1000} s` : `\`playwright-cli --version\` failed: ${r.error.message}` };
   if (r.status !== 0) return { status: "old", failure: `\`playwright-cli --version\` exited with status ${r.status}` };

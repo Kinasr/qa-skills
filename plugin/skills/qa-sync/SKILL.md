@@ -25,8 +25,8 @@ A Practice that contradicts an Invariant is void.
   once, at the end.
 - **The tracker is read-only except `/qa-publish`.** This run's tracker scout fetches it field-limited.
 - **Never ask for a credential.** Name the env var or connector to fix; its value stays with the engineer.
-- **Never stage or commit.** A dirty working tree is fine; say nothing about it. Give the engineer
-  the CLI's commit command.
+- **Never run git to stage or commit yourself.** The commit follows the project's Commit mode through
+  `scan.mjs commit` (ADR-0062), never retried with `--no-verify`. A dirty working tree is fine; say nothing about it.
 - `name` maps an entry's Key, or a Feature's slug for its Test Suite, to a tracker key the engineer names, sent alone ([Attach](references/attach.md)).
 - **Never guess an answer.** Ask about ambiguity. Leave anything the Reply does not clearly address open.
 - **Never delete an Unlanded case automatically.** Never stamp a name the engineer didn't give.
@@ -39,8 +39,10 @@ Located relative to this skill's directory; run from the repository root (`--roo
 node <this skill's directory>/../../scripts/scan.mjs sync scope [<feature-key>] [--dir <run-dir>] [--root <qa-dir>]
 node <this skill's directory>/../../scripts/scan.mjs scout brief tracker --dir <run-dir> [--root <qa-dir>]
 node <this skill's directory>/../../scripts/scan.mjs sync card [<feature-key>] --dir <run-dir> [--root <qa-dir>]
-node <this skill's directory>/../../scripts/scan.mjs sync apply --dir <run-dir> --stdin [--root <qa-dir>]
+node <this skill's directory>/../../scripts/scan.mjs sync apply --dir <run-dir> --input <file> [--root <qa-dir>]
 ```
+
+Commands that read input take it from a file: write it outside the repository (the run dir or your scratch directory) and pass its absolute path as `--input <file>`. Run each command as one plain `node` line, with no pipe, heredoc, `&&` or `;` chain, variable prefix or `cd`.
 
 Each call prints JSON. Keep `scope`'s `dir` for every later call: the run dir holds the Feature,
 tracker payload and Card digest. The CLI checks the digest; never carry it in decisions.
@@ -73,7 +75,7 @@ Run `sync card --dir <run-dir>`.
 
 ## 3. Apply decisions
 
-Translate only clear answers into JSON on stdin, for example:
+Translate only clear answers into a JSON file, for example:
 
 ```json
 {"take":"all","drop":[3],"edits":{"4":{"level":"ui"},"7":{"keep":1}}}
@@ -81,16 +83,18 @@ Translate only clear answers into JSON on stdin, for example:
 
 `take` is `"all"` only for explicit whole-Card acceptance, otherwise a list of item numbers.
 `drop` lists rejected items. `edits` maps item numbers to allowed fields: strings, `keep` as a
-number, `roles` and `bind` as string arrays. An edit accepts its item. `merge` names a
+number, `roles` and `bind` as string arrays. An edit accepts its item. An intake item with
+`offered_level` asks whether to bind it: answer `level` with that value, or `""` for Layer-free.
+An item without an offer needs no level. `merge` names a
 pair ([Merge](references/merge.md)). Unmentioned
 items stay open. Ask on ambiguity before submitting. Retain clear decisions across clarification turns.
 
-Run `sync apply --dir <run-dir> --stdin`; explain refusal facts using their codes and data.
+Run `sync apply --dir <run-dir> --input <file>`; explain refusal facts using their codes and data.
 If a shared guard returns `text`, relay that procedural text intact.
 
 - **`ok: true`**: describe `applied` and `dropped`, minted keys and links, the Keys tracker intake
-  wrote (`intaken`), warnings and files from `report`, including its notes; copy its Markdown and
-  commit command. Finish at §4.
+  wrote (`intaken`), warnings and files from `report`, including its notes; copy its Markdown. When
+  `report.commit` is not null, make it as [the commit reference](../references/commit.md) says. Finish at §4.
 - **`confirm: true`**: nothing was written. Show every cascaded drop and removed answer. Wait for
   explicit confirmation, then submit the CLI's `decisions`, or revise from the engineer's answer.
 - **`rebuild: true`**: rebuild and show the new Card; obtain fresh answers before applying.

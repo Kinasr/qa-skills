@@ -30,6 +30,13 @@ On `design`, an item about the form of a Test Case is a Convention, not a Practi
 Statability Test. Run that reference's coherence pass on every `design` run, so the existing
 Conventions are re-checked too.
 
+Refuse a design Convention or Practice that chooses a Test level or execution speed. Point to
+`/qa-train execute` for the level used to run a Layer-free case, and `/qa-train codegen` for the
+test level or speed of an Automation. For example, “run Layer-free cases through the API” belongs
+to execute; “prefer API cases for speed” belongs to codegen. Apply this to existing design
+Conventions on every run as well as new proposals: flag an old layer or speed entry at the gate for
+revision or removal and name its target. You are done when every existing entry has been checked.
+
 A Practice's sources are `human:<name>`, and its example is optional.
 
 ## Two refusals

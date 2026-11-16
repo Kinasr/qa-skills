@@ -10,8 +10,8 @@ disable-model-invocation: true
 change `/qa-impact` handed off.
 
 Turns References into one **Feature**: narrative prose plus addressable **Rules**, settled by
-grilling the engineer, with questions they cannot answer yet parked. This is the only way Rules
-enter the knowledge layer.
+grilling the engineer, who parks what they cannot answer yet. Only this command adds Rules to
+the knowledge layer.
 
 ## Invariants
 
@@ -25,7 +25,7 @@ A Practice that contradicts an Invariant is void.
 - **Before drafting Rules**, read the scope decisions reference and compare each behaviour with the
   Feature's Boundaries.
 - **The Impact forecast reads Rules only, never Test Cases.** On an existing Feature, sort the
-  current Rules into Changes, May change and Unaffected before any edit, and have the engineer
+  Rules into Changes, May change and Unaffected before any edit, and have the engineer
   confirm it. Never store it: the Rule edits are the record.
 - **A `link_unrepaired` link is the engineer's to repair or confirm.** Never confirm for them.
 - **Checkpoint 1 is a commit.** Stale obligations are stored only against a commit, and
@@ -56,19 +56,22 @@ A Practice that contradicts an Invariant is void.
 - **Never ask for a credential.** Name the env var or connector to fix; its value stays with the
   engineer.
 - **Never answer your own questions.** Answers are the engineer's.
-- **A dirty working tree is fine.** Say nothing about it. Never stage or commit.
+- **A dirty working tree is fine.** Say nothing about it.
+- **Never run git to stage or commit yourself.** The commit follows the project's Commit mode through
+  `scan.mjs commit` (ADR-0062), never retried with `--no-verify`.
 
 ## The CLI
 
-Every deterministic step goes through the shared CLI, located relative to this skill's own
-directory:
+Every deterministic step uses the shared CLI, relative to this skill's directory:
 
 ```
 node <this skill's directory>/../../scripts/scan.mjs deep-dive <action> ... [--root <qa-dir>]
 ```
 
+Commands that read input take it from a file: write it outside the repository (the run dir or your scratch directory) and pass its absolute path as `--input <file>`. Run each command as one plain `node` line, with no pipe, heredoc, `&&` or `;` chain, variable prefix or `cd`.
+
 `--root` defaults to `./.qa`, so run it from the repository root. Each call prints one JSON object:
-read it, and never re-derive its results by grep or prose. The actions:
+read it, and never re-derive its results by grep or prose. Actions:
 
 | Action | What it answers |
 |---|---|
@@ -76,19 +79,20 @@ read it, and never re-derive its results by grep or prose. The actions:
 | `feature <key>` | the Feature key's usability, its Rules with coverage, Waivers, `depends_on` and `dependents`; other Features' live Rules in `other_rules`; Boundaries, `retired`, `sources`, `open_questions`, `openQuestions`, `caseIndex`, scenario files, `roles`, `next_step`, `categories`, `coverage`, `deferred_count`, `deferred_functionality`, `train` |
 | `roles <name>...` | which roles `project.roles` lacks, with the command that adds each |
 | `amend <key> <rule>...` | the bounded amendment inventory: those Rules in full, the `cases` linked to them, `omitted` counts |
-| `reconcile <key> --stdin [--dir <run-dir>]` | the confirmed forecast against the Rule edits: `edited`, `outside_band`, `unedited_changes`, `boundary_check`, `downstream`, `next_feature`, `widened`, `change_file`, `next_step` |
+| `reconcile <key> --input <file> [--dir <run-dir>]` | the confirmed forecast against the Rule edits: `edited`, `outside_band`, `unedited_changes`, `boundary_check`, `downstream`, `next_feature`, `widened`, `change_file`, `next_step` |
 | `resume --dir <run-dir>` | the quick path's handoff: `references`, `edits`, `open_questions`, `written`, the `uncommitted` files, `next_step` |
-| `check <key> --stdin [--confirm <link>,...]` | the drafted Feature file: `check-file` plus the re-run rules and Coverage; each retired Rule's `links`; when `ok`, the `changeset`, `commit` and `next_step`, always `coverage_digest` |
+| `check <key> --input <file> [--confirm <link>,...]` | the drafted Feature file: `check-file` plus the re-run rules and Coverage; each retired Rule's `links`; when `ok`, the `changeset`, `commit` and `next_step`, always `coverage_digest` |
 
 **Training.** `train` is `train/deep-dive.md` (`exists`, `text`, `entries`). Read it from the first
-call that returns it (`feature` with a key, else `refs`), before any fetch. Follow its Practices to
+call that returns it (`feature` with a key, else `refs`), before fetching. Follow its Practices to
 the close.
 
 ## 1. Split the arguments
 
 The first argument is the Feature key if it is a kebab-case slug (`^[a-z0-9]+(-[a-z0-9]+)*$`)
 and not a file in the repository. Everything else is a Reference or an
-`observe:<url> "<what to look at>"` input, except `--dir <run-dir>` and repeatable `--focus "<verb phrase>"`.
+`observe:<url> "<what to look at>"` input, `observe:signed-out <url> "<what to look at>"` for a
+signed-out page, except `--dir <run-dir>` and repeatable `--focus "<verb phrase>"`.
 `--focus` names functionalities; apply [the Deferred reference](references/deferred.md) in §4.
 With no Reference, `observe:` input or
 `--dir`, ask for one and stop.
@@ -96,7 +100,7 @@ With no Reference, `observe:` input or
 **A key was given**: run `deep-dive feature <key>` now.
 
 **`--dir <run-dir>`**: run `deep-dive resume --dir <run-dir>` first. Its `references` are the
-References to take in (§2, as usual); its `edits` are Rules already edited and confirmed, so they
+References to take in (§2); its `edits` are Rules already edited and confirmed, so they
 open the forecast as Changes and are not asked again; `uncommitted` files hold them in the working
 tree; its `open_questions` seed the walk. The run dir is the change's: pass `--dir` to
 `reconcile` and name it in the close, for `/qa-design`.
@@ -118,8 +122,8 @@ A live application is never a Reference: `observe:` records it as a `file:` Obse
 0. **`observe:` inputs first.** Read [the observe reference](references/observe.md), and run each
    input to the `file:` URI that replaces it.
 1. Run `deep-dive refs <every ref>`. Bare inputs are inferred (`DEMO-1` → `tracker:`, a URL →
-   `url:`, a path → `code:` under `module_paths`, else `file:`) and marked `inferred`. Use the
-   `uri` it returns, never the raw input.
+   `url:`, a path → `code:` under `module_paths`, else `file:`), marked `inferred`. Use the `uri` it
+   returns, never the raw input.
 2. Fetch each reference **to completion** before the next:
    - `pending` (tracker, url): fetch it yourself. A tracker issue is complete with every field, the
      description and every comment, including the `[qa-skills] Parked questions:` comment; note its
@@ -130,15 +134,14 @@ A live application is never a Reference: `observe:` records it as a `file:` Obse
    - `failed`: carry on, so the report is complete.
 3. Print **one report** listing every reference with its URI and status (ok, or failed and why).
    A file git does not track carries an `untracked` warning: a fresh clone cannot re-read it.
-   Say so here and again at the close (§10); it does not halt the intake.
+   Say so here and at the close (§10); it does not halt the intake.
 4. **If any reference or `observe:` input failed, halt here.** Tell the engineer to fix it or
    re-run without it, and print the access reference's hand-off for a failed tracker or url.
 
 ## 3. Settle the Feature slug
 
 **No key**: propose a kebab-case slug named for the behaviour, not for the tracker's structure.
-Check it with `deep-dive feature <slug>`, and have the engineer confirm or replace it before you go
-on.
+Run `deep-dive feature <slug>`; have the engineer confirm or replace it before continuing.
 
 `status` decides the run:
 
@@ -147,27 +150,29 @@ on.
 - `retired`, `succeeded` or `invalid`: unusable. A Retired key is never reused. Show `error` and
   settle another slug.
 
-Keep its `rules`, `boundaries`, `retired`, `sources`, `openQuestions`, `caseIndex` and `roles` as
-the state to reconcile against.
+Reconcile against its `rules`, `boundaries`, `retired`, `sources`, `openQuestions`, `caseIndex` and
+`roles`.
 
 ## 4. Inventory
 
-On an `existing` Feature, read [the re-run reference](references/re-run.md) before you build. It
+On an `existing` Feature, read [the re-run reference](references/re-run.md) before building. It
 holds the pick-up choice for Deferred functionality, then the Impact forecast, and the amendment
 mode: when the confirmed forecast names only some Rules and nothing needs a full inventory,
-inventory just those and their linked cases with `deep-dive amend`.
+inventory those and their linked cases with `deep-dive amend`.
 
-For every full inventory, read [the Deferred reference](references/deferred.md): leaving work for
+For full inventories, read [the Deferred reference](references/deferred.md): leaving work for
 later, focused inventories, existing items' lifecycle, and stating Coverage with its deferred count.
 
-Build the **functionality inventory** from the References, the Observations and, on a re-run, the
+For an OpenAPI or Swagger Reference, read [the contract reference](references/openapi.md).
+
+Build the **functionality inventory** from References, Observations and, on re-runs, the
 whole existing Feature and its `caseIndex`. Read every case's `summary` and Expected-result
-paragraph, and the rest only when needed to interpret its claims. List each **functionality** as a
+paragraph, and the rest only to interpret its claims. List each **functionality** as a
 verb phrase, with its evidence (Reference URI and place, Observation fact, unseen part) and
 visibility (seen in the app, documented, unseen).
 
-**Reconcile.** Place every behaviour-bearing item, existing Rule, case, Parked question and
-previously named functionality, or set it aside with its reason. A duplicate or misreading
+**Reconcile.** Place every behaviour-bearing item, existing Rule, case, Parked question,
+`proposed_rules` item and previously named functionality, or set it aside with its reason. A duplicate or misreading
 disappears with a one-line reason; a genuine exclusion becomes a Boundary (`Owner: none` allowed).
 Dropping an entry never retires a Rule.
 
@@ -206,12 +211,18 @@ across functionalities, especially permissions, shared state, concurrency and si
 Each functionality × category pair ends on one **aggregate disposition**: covered by Rules,
 awaiting an answer, or n/a. A pair with any unsettled behaviour is awaiting.
 
-Show a bulk table with the honest acceptance object the engineer reads: each Rule's key and
-statement, the evidence located (an Observation's fact number), an n/a's reason naming the
-functionality and scope, and every question still open. Only the engineer parks. Bulk acceptance
-covers only the proposals displayed; anything unaddressed or ambiguous stays open.
+Before a pair is `covered`, compare each clause of the category's meaning with the Rules it cites. A
+clause they leave out is a question to the engineer, and the pair stays awaiting until answered.
+Ask at intent level — is that behaviour claimed, and does a case need to check it? — never for exact
+wording. The engineer may answer that the Rule claims only what it states, settling the clause.
 
-Ask in rounds in the format the investigation reference gives. Drop any question a live Rule
+Show a bulk table with the honest acceptance object the engineer reads: each Rule's key and
+statement, the evidence located (an Observation's fact number or a Reference place:
+`<reference uri>, <place>`), an n/a's reason naming the functionality and scope, and every open
+question. Only the engineer parks. Bulk acceptance covers only the proposals displayed;
+anything unaddressed or ambiguous stays open.
+
+Ask in rounds in the investigation reference's format. Drop any question a live Rule
 already answers; never re-ask settled behaviour, even when two References still disagree about it.
 An Observation's facts are claims of current behaviour: one becomes a Rule only once the engineer
 confirms it. A parked question is tagged `[<category key>]` and enters `## Open questions`.
@@ -227,16 +238,17 @@ probe; and the draft passes `check`.
 Write the Rules from the confirmed outcomes, and `## Coverage` from the walk: one line per
 effective category in walk order, aggregating `awaiting` > `covered` > `n/a`.
 
-- One Rule per settled behaviour, headed `### rule_<key>: <statement>` under `## Rules`.
+- One Rule per settled behaviour, appended as the last item of `## Rules`: `<n>. **rule_<key>**: <statement>`.
 - A **Waiver** marks a Rule left without a Test Case: `Waived: <reason>` in the Rule's field block,
-  its contiguous lines at the Rule's first non-blank line.
-- **The statement carries the whole claim** and stands alone, so that the heading alone is enough
-  for the judge to quote. Optional prose may follow a Rule to clarify it, but it never adds a
-  claim.
+  its contiguous lines directly under the statement.
+- **The statement carries the whole claim**: its item's first line stands alone for judges to quote.
+  Optional prose follows, indented under the item, clarifying the Rule without adding claims.
 - Mint every new key with `mint rule --feature <slug> --count <n>`, and never invent one. A Rule's
   key never changes.
-- State behaviour at intent level. Never put selectors or payload shapes in a Rule.
-- A parked question is prose under `## Open questions`, never under a `rule_` heading. It is not a
+- State behaviour at intent level by default. Name a button, selector, HTTP method, endpoint,
+  status, header or payload field only when the engineer confirms the Rule is about that UI detail or
+  the API contract itself.
+- A parked question is prose under `## Open questions`, never a `rule_` item. It is not a
   claim, so nothing can cover or contradict it.
 
 **Roles.** Run `deep-dive roles <name>...` on every role the Rules name. A `missing` role never
@@ -249,7 +261,7 @@ Rule field blocks, Boundary owners, the `## Coverage` lines and `coverage_digest
 
 ## 9. Check, then write
 
-Pipe the complete draft, `## Coverage` included, into `deep-dive check <slug> --stdin`.
+Pass the complete draft, `## Coverage` included, to `deep-dive check <slug> --input <file>`.
 
 - **`ok: false`**: fix every `errors` entry and check again.
 - **A `link_unrepaired` error**: a retired or merged-away Rule is still named by a `covers`, Reliance or
@@ -263,15 +275,14 @@ Pipe the complete draft, `## Coverage` included, into `deep-dive check <slug> --
 
 ## 10. Close
 
-Print, in this order:
+Print in order:
 
 1. What changed: `rules.added`, `rules.edited` and `rules.retired` (with the cases each retired
    Rule leaves dangling), `sources_added`, the questions parked or cleared, and any missing roles
    with their `/qa-init --add-role` commands.
 2. The `changeset`: the Feature and this run's Observations.
-3. The suggested `commit`, as a command for the engineer to run from the repository root (the
-   directory holding `.qa/`), plus any other untracked `file:` or `code:` References to add with
-   it.
+3. The commit of the `changeset`, made as [the commit reference](../references/commit.md) says,
+   plus any other untracked `file:` or `code:` References for the engineer to add themselves.
 4. The `next_step`: a bare `/qa-design <slug>`. Never run it yourself. After Rule edits that reach
    other Features, also `next_feature` with its `summary`, and any `change_file`.
    Checkpoint 1: the commit in item 3 comes first.

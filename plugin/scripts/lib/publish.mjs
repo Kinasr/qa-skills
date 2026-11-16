@@ -36,10 +36,10 @@ import { readTracker, trackerAccess, trackerScope } from "./sync-tracker.mjs";
 import { suiteCandidates } from "./publish-suite.mjs";
 import { publishedPlan } from "./publish-plan.mjs";
 import { publisherPrompt } from "./publish-prompt.mjs";
-import { caseFields, PROSE_FIELDS, sameOwned, sameOwnedFields, writtenMirror } from "./case-fields.mjs";
+import { caseFields, caseLevel, comparisonLevel, PROSE_FIELDS, sameOwned, sameOwnedFields, writtenMirror } from "./case-fields.mjs";
 import { practicesText, trainFor } from "./training.mjs";
 import { labelDefinitions, caseLabelProblems } from "./case-labels.mjs";
-import { publishedLabels, configuredLabelDestinations, canPublishLabels, hasPublishTags, declaresTags, labelsDiffer, resolveLabelDestinations, confirmedLabelsMatch, sameLabelValue, confirmedLabelCopies, publishDestinationProblems, recoveredLabelCopies } from "./publish-labels.mjs";
+import { publishedLabels, configuredLabelDestinations, canPublishLabels, hasPublishTags, declaresTags, labelsDiffer, resolveLabelDestinations, confirmedLabelsMatch, sameLabelValue, confirmedLabelCopies, publishDestinationProblems, recoveredLabelCopies, levelDestinationIsMultiple } from "./publish-labels.mjs";
 /** @import { LabelOperation, ConfirmedLabel, LabelDestinationRequest, PublishedLabel, LabelCopies } from "./publish-labels.mjs" */
 import { parkedCandidates, parkedMatches, parkedStories, parkedWrites } from "./publish-parked.mjs";
 /** @import { RunFileResult } from "./run-dir.mjs" */
@@ -174,6 +174,7 @@ import { parkedCandidates, parkedMatches, parkedStories, parkedWrites } from "./
  *     tracker?: unknown,
  *     fields?: unknown,
  *     label_destinations?: LabelDestinationRequest[],
+ *     level_destinations?: LabelDestinationRequest[],
  *     mark_field?: string,
  *     mark_search?: { field: string, values: string[] },
  *     bug_statuses?: string[],
@@ -509,7 +510,7 @@ export const command = {
       // whose earlier link failed. The CLI filters linked keys after the fetch.
       const bugStatuses = ctx.config.bug_publish ? (ctx.allBugs ?? []).filter((bug) => bug.file.data.status === "published" && typeof bug.file.data.tracker === "string" && scopedBugs.some((scoped) => scoped.file.data.case === bug.file.data.case)).map((bug) => String(bug.file.data.tracker)) : [];
       const fetch_prose = ctx.execute_run ? [] : missingProse(ctx, candidates(ctx).items);
-      return /** @type {PublishScopeResult} */ ({ exit: 0, json: { dir: ctx.dir, payload_file: join(ctx.dir, "tracker.json"), tracker, fields, label_destinations: canPublishLabels(ctx.config.schemaVersion) ? configuredLabelDestinations(labelDefinitions(ctx.index.project?.data ?? {}), ctx.mapping) : [], mark_field, mark_search: markSearch(ctx), scenarios, suites, cases: [...new Set([...cases, ...bugCases])].sort(), ...(scopedBugs.length && ctx.config.bug_publish && { bug_metadata: { issue_type: ctx.config.bug_publish.issue_type, project: ctx.mapping.project }, bug_statuses: [...new Set(bugStatuses)].sort() }), stories: ctx.execute_run ? [] : parkedStories(/** @type {import("./publish-parked.mjs").PublishContext} */ (/** @type {unknown} */ (ctx))), fetch_prose, access: trackerAccess(ctx), train: trainFor(ctx.index, PUBLISH_TRAIN_KEY) } });
+      return /** @type {PublishScopeResult} */ ({ exit: 0, json: { dir: ctx.dir, payload_file: join(ctx.dir, "tracker.json"), tracker, fields, label_destinations: canPublishLabels(ctx.config.schemaVersion) ? configuredLabelDestinations(labelDefinitions(ctx.index.project?.data ?? {}), ctx.mapping) : [], level_destinations: [{ name: "level", cardinality: "multiple" }], mark_field, mark_search: markSearch(ctx), scenarios, suites, cases: [...new Set([...cases, ...bugCases])].sort(), ...(scopedBugs.length && ctx.config.bug_publish && { bug_metadata: { issue_type: ctx.config.bug_publish.issue_type, project: ctx.mapping.project }, bug_statuses: [...new Set(bugStatuses)].sort() }), stories: ctx.execute_run ? [] : parkedStories(/** @type {import("./publish-parked.mjs").PublishContext} */ (/** @type {unknown} */ (ctx))), fetch_prose, access: trackerAccess(ctx), train: trainFor(ctx.index, PUBLISH_TRAIN_KEY) } });
     }) },
     card: { usage: "[<feature>] --dir <run-dir> [--root <qa-dir>]", run: (args, options) => withRun("card", args, options, (ctx) => finish((/** @type {(ctx: PublishContext, dir: string) => import("./card-run.mjs").CardShown<PublishCardData> | import("./card-run.mjs").CardRefused} */ (lifecycle.card))(ctx, ctx.dir))) },
     apply: { usage: "--dir <run-dir> --stdin [--root <qa-dir>]", run: (args, options) => withRun("apply", args, options, (ctx, text) => finish(lifecycle.apply(ctx, ctx.dir, /** @type {string} */ (text)))) },
@@ -645,6 +646,7 @@ function candidates(ctx) {
   const summary = summaries(ctx.index);
   const resolver = ctx.index.tracker;
   const reviews = new Map(ctx.scan.history.reviews.map((/** @type {{ key: string, [key: string]: unknown }} */ r) => [r.key, r]));
+  const levelMultiple = levelDestinationIsMultiple(ctx.tracker.ok ? ctx.tracker.level_destinations : []);
   const { suites, refused: refusedFeatures } = /** @type {{ suites: Map<string, PublishCardItem>, refused: Set<string> }} */ (suiteCandidates(ctx, summary, skipped));
   /** @type {Map<string, { reason: string, hits?: string[], tracker_key?: string, issue_type?: string | null, expected?: string, current?: string | null, claim?: string, [key: string]: unknown }>} */
   const refusedScenarios = new Map();
@@ -699,7 +701,9 @@ function candidates(ctx) {
       continue;
     }
     const scenarioTracker = scenarioLink ?? scenarios.get(scenario)?.tracker_key;
-    const fields = caseFields(d.entry, scenarioTracker ?? scenario);
+    const level = comparisonLevel(caseLevel(/** @type {Record<string, unknown>} */ (d.entry.data), /** @type {{ data: Record<string, unknown> }} */ (/** @type {unknown} */ (d.file)).data, ctx.config.schemaVersion));
+    if (Array.isArray(level) && !levelMultiple) { skipped.push({ key, label, reason: "level_list_unsupported", levels: level }); continue; }
+    const fields = { ...caseFields(d.entry, scenarioTracker ?? scenario), level };
     const feature = /** @type {{ rel: string, data: { suite_key?: string, mirror?: { suite?: string }, sources?: unknown } } | undefined} */ (featureFile(ctx.index, d.feature));
     const definitions = labelDefinitions(ctx.index.project?.data ?? {});
     const invalidLabels = canPublishLabels(ctx.config.schemaVersion) ? caseLabelProblems(d.entry.data, definitions) : [];
@@ -751,13 +755,15 @@ function candidates(ctx) {
       return observed ? observed.value : p.destination === "labels" && Array.isArray(current?.labels) ? current.labels.filter((value) => p.managed?.includes(value)).sort() : p.known ? p.copy : null;
     };
     const diverges = creating ? [] : Object.keys(fields).filter((field) => !sameOwned(field, current?.[field], (/** @type {Record<string, unknown> | undefined} */ (d.entry.data.mirror))?.[field]));
-    const fieldValue = (/** @type {string} */ field, /** @type {unknown} */ value) => field === "scenario" && typeof value === "string" ? keyLabel(value, summary.scenario(scenario) ?? (/** @type {Extract<TrackerState, { ok: true }>} */ (ctx.tracker)).scenarios?.get(value)?.summary ?? "Test Scenario") : value;
+    const fieldValue = (/** @type {string} */ field, /** @type {unknown} */ value) => field === "level" && value === null ? "none" : field === "scenario" && typeof value === "string" ? keyLabel(value, summary.scenario(scenario) ?? (/** @type {Extract<TrackerState, { ok: true }>} */ (ctx.tracker)).scenarios?.get(value)?.summary ?? "Test Scenario") : value;
+    // A create writes no level for a Layer-free case; an update clears a level the tracker still holds.
+    const writtenFields = creating && level === null ? Object.fromEntries(Object.entries(fields).filter(([field]) => field !== "level")) : fields;
     cases.push({ code: creating ? "create_case" : "update_case", key, label, feature: d.feature, file: d.file.rel, scenario, suite,
       ...(resolved.labels.some((op) => pending.some((p) => p.id === op.id)) && { labels: resolved.labels.filter((op) => pending.some((p) => p.id === op.id)) }),
       target: { scenario: keyLabel(scenario, summary.scenario(scenario)), suite: suiteItem?.label ?? keyLabel(suite, "Test Suite") }, requires: /** @type {PublishCardItem[]} */ ([suiteItem, scenarioItem].filter(Boolean)), needs: [], edits: [], stories,
       ...(creating ? {
         issue_type: ctx.mapping.case_type, marker: marker(ctx, key, /** @type {Record<string, unknown>} */ (d.entry.data)),
-        links: stories.map((story) => ({ to: story, type: ctx.mapping.link_type })), fields: { ...fields, status: ctx.mapping.initial_status },
+        links: stories.map((story) => ({ to: story, type: ctx.mapping.link_type })), fields: { ...writtenFields, status: ctx.mapping.initial_status },
       } : {
         tracker_key: /** @type {string} */ (tracker), fields, changes: Object.fromEntries([...Object.entries(fields).map(([field, value]) => [field, { from: current?.[field] ?? null, to: value }]), ...pending.map((p) => [p.id, { from: labelBefore(p), to: p.desired }])]),
         markdown: table(["Field", "Tracker value", "New value"], [...Object.entries(fields).map(([field, value]) => [(/** @type {Record<string, string>} */ (FIELD_LABELS))[field], fieldValue(field, current?.[field] ?? null), fieldValue(field, value)]), ...pending.map((p) => [p.name, labelBefore(p) ?? "unknown", p.clear ? "clear" : p.desired])]),

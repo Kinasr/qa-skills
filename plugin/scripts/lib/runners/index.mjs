@@ -3,26 +3,28 @@
 // returns `{parsed, selector}`, where `parsed` is one ordered-attempt list per instance. Adding a
 // tool is one entry here plus its module: `gradle` and `maven` join it without reshaping the
 // seam execute, `codefix verify` and `codegen verify` share.
+import { withAuthHeaderEnv } from "../header-credential.mjs";
 import { runGradle } from "./gradle.mjs";
 import { runMaven } from "./maven.mjs";
 import { runPlaywright } from "./playwright.mjs";
-/**
- * @import { AutomationSelection, RunnerResult } from "../test-runner.mjs"
- * @import { TestRunner } from "../knowledge-file.mjs"
- */
+/** @import { PlatformContext } from "../platform.mjs" */
+/** @import { AutomationSelection, RunnerResult } from "../test-runner.mjs" */
+/** @import { TestRunner } from "../knowledge-file.mjs" */
 
 /**
  * One invocation's options.
  * @typedef {{
  *   selection: AutomationSelection,
  *   runner: TestRunner,
+ *   root: string,
  *   repo: string,
  *   dir: string,
  *   origin: string,
  *   env: Record<string, string | undefined>,
  *   retries: number,
  *   repeats?: number,
- *   fresh?: boolean,
+ *   platform?: NodeJS.Platform,
+ *   context?: PlatformContext,
  * }} RunnerOptions
  */
 
@@ -52,7 +54,8 @@ export function displaySelector(selection) {
 }
 
 /**
- * Run one Automation through its tool's adapter.
+ * Run one Automation through its tool's adapter, in `env` plus the target's `auth:` Header credentials
+ * (`withAuthHeaderEnv`), whichever caller runs it. `root` is the project's `.qa` directory.
  * @param {RunnerOptions} options
  * @returns {{ parsed: RunnerResult, selector: string }}
  */
@@ -64,5 +67,5 @@ export function runSelection(options) {
       selector: displaySelector(options.selection),
     };
   }
-  return adapter.run(options);
+  return adapter.run({ ...options, env: withAuthHeaderEnv(options.root, options.origin, options.env) });
 }

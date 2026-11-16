@@ -11,8 +11,9 @@
 //
 // The Change bundle of `/qa-impact` (ADR-0007) is read from `scan`'s history
 // facts, never re-derived:
-//   - the post-change Feature file with every Rule as its heading, plus full prose only for the
-//     Rules whose stripped block changed (`rules_changed`); on a first judgement, all in full;
+//   - the post-change Feature file with every Rule as its item's first line, plus full prose only
+//     for the Rules whose stripped block changed (`rules_changed`); on a first judgement, all in
+//     full;
 //   - the stripped diff since the Watermark (none on a first judgement, and none when the Feature is
 //     a candidate only because an Upstream Rule changed);
 //   - every direct Upstream Rule in full, plus changed transitive Upstream Rules with their
@@ -41,6 +42,7 @@ import { scan } from "./scan.mjs";
 import { collides, governingOf, isJudged, selectCases } from "./selection.mjs";
 import { resolveAdapter, wordsOf } from "./stack.mjs";
 import { bookkeepingLines, withoutBookkeeping } from "./stripped.mjs";
+import { proposedRulesSections } from "./proposed-rules.mjs";
 
 /** @import {CommandDefinition} from "./cli.mjs" */
 /** @import {ChangedCaseFacts, ContextCaseFacts, JudgeBriefJson} from "./impact.mjs" */
@@ -447,7 +449,8 @@ function featureUnit(slug, { root, target }) {
   };
 }
 
-// One Rule's text, as the judge sees it: its heading and its elaboration, less its Bookkeeping.
+// One Rule's text, as the judge sees it: its first line (item or heading) and its elaboration,
+// less its Bookkeeping.
 /**
  * @param {(string | null)[]} lines
  * @param {{ line: number, end: number }} rule
@@ -501,8 +504,8 @@ function contextCases(files, index, feature, scenario, chosen, keys) {
 }
 
 // Each Rule's text, as the judge sees it: its whole block where the bundle keeps it in full, its
-// heading and field lines where the bundle compresses it. The reply check reads them, so a quote
-// is compared with the text the judge was given.
+// item's first line and field lines where the bundle compresses it. The reply check reads them, so
+// a quote is compared with the text the judge was given.
 /**
  * @param {QaFile} file
  * @param {Set<string>} full - the Rules the bundle keeps in full
@@ -520,10 +523,10 @@ function ruleTexts(file, full) {
   return out;
 }
 
-// The Feature file with every Rule not in `full` cut to its heading line:
-// one blank line after each heading, everything else in the file untouched but its Bookkeeping.
-// A Rule's field block is not elaboration: it stays in the bundle, so the judge still sees every
-// field the Rule carries even where the elaboration is dropped.
+// The Feature file with every Rule not in `full` cut to its item's first line (a heading or a
+// numbered item), plus its field lines: one blank line after them, everything else in the file
+// untouched but its Bookkeeping. A Rule's field block is not elaboration: it stays in the bundle,
+// so the judge still sees every field the Rule carries even where the elaboration is dropped.
 /**
  * @param {QaFile} file
  * @param {Set<string>} full
@@ -545,14 +548,16 @@ function compress(file, full) {
   return out.filter((x) => x !== null).join("\n");
 }
 
-// A file's lines (LF), each Bookkeeping line (lib/stripped.mjs) null, so line numbers still hold:
-// a brief inlines no Bookkeeping, so no earlier finding anchors a verdict.
+// A file's lines (LF), each Bookkeeping line (lib/stripped.mjs) and a Feature's `## Proposed Rules`
+// section (ADR-0067) null, so line numbers still hold: a brief inlines no Bookkeeping, so no earlier
+// finding anchors a verdict, and no Proposed Rule, which claims nothing.
 /**
  * @param {QaFile} file
  * @returns {(string | null)[]}
  */
 function textLines(file) {
   const drop = bookkeepingLines(file);
+  if (file.type === "feature") for (const s of proposedRulesSections(file)) for (let l = s.line; l <= s.end; l++) drop.add(l);
   return file.text.replace(/\r\n/g, "\n").split("\n").map((x, i) => (drop.has(i + 1) ? null : x));
 }
 

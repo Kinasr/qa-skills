@@ -12,7 +12,7 @@ export function proveSelection(options, repeats) {
   for (let n = 0; n < (playwright ? 1 : repeats); n++) {
     const dir = join(options.dir, String(n + 1));
     mkdirSync(dir, { recursive: true });
-    const { parsed, selector } = runSelection({ ...options, dir, retries: 0, fresh: true, ...(playwright && repeats > 1 ? { repeats } : {}) });
+    const { parsed, selector } = runSelection({ ...options, dir, retries: 0, ...(playwright && repeats > 1 ? { repeats } : {}) });
     diagnostics.push(...automationResult(options.selection, parsed, selector, false).diagnostics);
     const entries = Object.entries(parsed.instances);
     if (parsed.reason || !entries.length || entries.some(([, list]) => list.length !== 1 || list[0].result !== 'passed')) return { passed: false, diagnostics };

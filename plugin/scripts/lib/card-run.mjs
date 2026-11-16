@@ -135,8 +135,14 @@ import { readRunFile } from "./run-dir.mjs";
 
 const CARD_FILE = "card.json";
 
+// A seal's digest ignores line endings, so a CRLF checkout seals the same knowledge an LF one does.
+// Each string in the seal folds CRLF to LF before it is serialised, so an LF seal keeps the digest
+// it had and no other text can fold into the same bytes.
+/** @param {string} _key @param {unknown} value @returns {unknown} */
+const foldLineEndings = (_key, value) => (typeof value === "string" ? value.replace(/\r\n/g, "\n") : value);
+
 /** @param {unknown} seal @returns {string} */
-const digestOf = (seal) => createHash("sha256").update(JSON.stringify(seal)).digest("hex").slice(0, 16);
+const digestOf = (seal) => createHash("sha256").update(JSON.stringify(seal, foldLineEndings)).digest("hex").slice(0, 16);
 
 /**
  * @template {CardContext} [Ctx=CardContext]

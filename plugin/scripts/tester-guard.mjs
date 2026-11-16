@@ -2,7 +2,7 @@
 // @ts-check
 // Plugin-wide PreToolUse guard: stay silent outside the named Tester.
 import { readFileSync } from "node:fs";
-import { TESTER_AGENT, testerCommandAllowed, testerReadAllowed, testerWriteAllowed } from "./lib/tester-guard.mjs";
+import { TESTER_DENIAL_MESSAGE, TESTER_AGENT, testerCommandAllowed, testerReadAllowed, testerWriteAllowed } from "./lib/tester-guard.mjs";
 
 /**
  * PreToolUse hook event sent by Claude Code on stdin (CODING_STANDARDS: trusted read boundary).
@@ -37,7 +37,7 @@ try {
   if (event.tool_name === "Bash" && testerCommandAllowed(event.tool_input?.command, process.env.CLAUDE_PLUGIN_ROOT, agent)) process.exit(0);
   if (event.tool_name === "Read" && testerReadAllowed(event.tool_input?.file_path, agent)) process.exit(0);
   if (event.tool_name === "Write" && testerWriteAllowed(event.tool_input?.file_path, agent)) process.exit(0);
-  deny("Tester guard: use only standalone tester do|request commands, artifacts and the report of your own Execution, with the brief's --dir.");
+  deny(TESTER_DENIAL_MESSAGE);
 } catch {
   deny("Tester guard: could not validate the tool call.");
 }

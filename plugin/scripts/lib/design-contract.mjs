@@ -1,34 +1,43 @@
 // @ts-check
 // The Delegate's design contract (`check-reply design`): the last fenced `json` block
-// holds `{cases: [{summary, covers, roles, level, automatable, preconditions?, steps, expected}], proposed_rules: [...]}`, and
-// the reply is usable iff it parses and every case has
+// holds `{cases: [{summary, covers, roles, level, automatable, preconditions?, steps, expected}], proposed_rules: [...]}`,
+// and `questions` may hold an unclear outcome with its implicated Rules and incomplete case proposal.
+// `check_gaps` may hold what checking a case of the reply needs from the test environment, which is
+// Training's knowledge, never a Rule's.
+// The reply is usable iff it parses and every case has
 //   - a one-line, non-empty `summary` (it becomes the case's heading);
 //   - non-empty `covers`, each key a Rule of the Feature;
 //   - `roles` ⊆ `project.roles`;
-//   - `level` ∈ `project.stack.levels` and the scenario's agreed levels, required on every case;
+//   - `level` absent on a Layer-free case; when present, one `project.stack.levels` slug or a
+//     non-empty list of distinct slugs, within agreed levels or equal to all executable levels,
+//     with a non-empty `binding_reason`;
 //   - a boolean `automatable`, the Delegate's proposal, in every mode;
+//   - an optional boolean `manual`: `false` when no Tester can perform the case, absent when one can;
 //   - `steps`, a non-empty list of non-empty strings;
 //   - a non-empty `expected`.
-// A fill or a regenerate must return at least one case unless the reply proposes Rules instead; an
+// A fill or a regenerate must return at least one case unless the reply proposes Rules or questions; an
 // expand may return none. A reply with zero cases, at least one valid proposed Rule and no other
 // problem is the terminal outcome `awaiting_rules`: the Delegate found no Rule to write a case from,
 // and its proposals go to `/qa-deep-dive`. Every other zero-case reply keeps its problems.
 // A case may add `override_reason`, a string: the reason it is a distinct pass although it repeats
 // a stored case or a sibling proposal. The contract only reads it; the writer shows it to the
 // engineer as a proposal and does not let the case through on it (lib/design-duplicates.mjs).
-// `proposed_rules` entries are a statement, or `{statement, why?}`; an absent list is empty. Fields
+// `proposed_rules` entries are a statement, or `{statement, why?}`; an absent list is empty. A
+// `check_gaps` entry is `{case, needs}`, `case` the one-line summary of one of the reply's own cases
+// and `needs` what checking its Expected result needs; an absent list is empty. Fields
 // the contract does not name (a key, `sources`) are dropped and listed: the orchestrator writes
 // those. Every problem is reported, and there is no partial acceptance.
 //
-// The normalised design result (`cases`, `proposed_rules`) is this module's contract:
-// `check-reply` returns it, and `design`, `design-write` and `contracts` read it. Its typedef is
-// the owner; the serialised value a Run dir writer carries is a `DesignResult` value.
+// The normalised design result (`cases`, `proposed_rules`, `check_gaps`, `questions`) is this
+// module's contract: `check-reply` returns it, and `design`, `design-write` and `contracts` read it.
+// Its typedef is the owner; the serialised value a Run dir writer carries is a `DesignResult` value.
 
 // A summary is one line (lib/dialect.mjs `LINE_BREAK`): none is allowed in it.
 import { LINE_BREAK } from "./dialect.mjs";
-import { stepActor, stripListMarker } from "./case-fields.mjs";
+import { caseLevels, normalizeCaseLevel, stepActor, stripListMarker } from "./case-fields.mjs";
 import { fillerLabels, labelKeys } from "./case-labels.mjs";
 import { isRuleRef, parseRuleRef } from "./rule-ref.mjs";
+import { oneLine } from "./schema.mjs";
 
 // The brief of one design unit, as this contract reads it: a local input projection typed at
 // check-reply's acceptance boundary, after the gates there (CODING_STANDARDS: trusted read
@@ -45,6 +54,7 @@ import { isRuleRef, parseRuleRef } from "./rule-ref.mjs";
  * @property {string[]} [relies_targets] - the qualified Upstream Rules a Reliance may name
  * @property {string[]} roles - `project.roles`
  * @property {string[]} levels - `project.stack.levels`
+ * @property {string[]} [executable_levels] - levels configured in `execute_levels`
  * @property {import("./case-labels.mjs").LabelDefinitions} [labels] - the project's Tags and Custom
  *   fields; absent, a reply's labels are not read
  */
@@ -58,8 +68,10 @@ import { isRuleRef, parseRuleRef } from "./rule-ref.mjs";
  * @property {string[]} [relies_on]
  * @property {string} [override_reason]
  * @property {string[]} roles
- * @property {string} [level]
+ * @property {import("./case-fields.mjs").CaseLevel} [level]
+ * @property {string} [binding_reason]
  * @property {boolean} automatable
+ * @property {boolean} [manual] - false when no Tester can perform the case
  * @property {string | string[]} [preconditions]
  * @property {string[]} [steps]
  * @property {string} [expected]
@@ -73,10 +85,29 @@ import { isRuleRef, parseRuleRef } from "./rule-ref.mjs";
  * @property {string} [why]
  */
 
+// One `check_gaps` entry of a reply: a case of this reply, named by its summary, and what checking
+// its Expected result needs. Test-environment knowledge for Training, never a claim about the system.
+/**
+ * @typedef {object} DesignReplyCheckGap
+ * @property {string} [case]
+ * @property {string} [needs]
+ */
+
+/**
+ * A case proposal whose Expected result cannot yet be stated from the Rules.
+ * @typedef {{ summary: string, covers: string[], steps?: string[], preconditions?: string[] }} HeldCase
+ */
+/**
+ * An unclear combined outcome, held separately from writable cases.
+ * @typedef {{ text: string, rules: string[], held_case: HeldCase }} DesignQuestion
+ */
+
 /**
  * @typedef {object} DesignReply
  * @property {DesignReplyCase[]} cases
+ * @property {DesignQuestion[]} [questions]
  * @property {(string | DesignReplyProposed)[]} [proposed_rules]
+ * @property {DesignReplyCheckGap[]} [check_gaps]
  */
 
 // A contract problem: a code, one factual line, and the case's index when it is a case's problem.
@@ -98,8 +129,10 @@ import { isRuleRef, parseRuleRef } from "./rule-ref.mjs";
  * @property {string} [override_reason] - why the case is a distinct pass, when it repeats another: a
  *   proposal for the engineer (lib/design-duplicates.mjs); only a non-blank reason is kept
  * @property {string[]} roles
- * @property {string} level
+ * @property {import("./case-fields.mjs").CaseLevel} [level]
+ * @property {string} [binding_reason]
  * @property {boolean} automatable
+ * @property {boolean} [manual] - false when no Tester can perform the case; absent means one can
  * @property {string[]} [preconditions]
  * @property {string[]} [steps]
  * @property {string} expected
@@ -118,6 +151,14 @@ import { isRuleRef, parseRuleRef } from "./rule-ref.mjs";
  * @typedef {object} DesignProposedRule
  * @property {string} statement
  * @property {string} [why]
+ */
+
+// One accepted check gap: the summary of a case of the reply, and what checking its Expected result
+// needs that the project's test environment does not yet say.
+/**
+ * @typedef {object} DesignCheckGap
+ * @property {string} case
+ * @property {string} needs
  */
 
 // A label of a reply's case that was dropped: the case by its place in the reply (from 1), the
@@ -140,11 +181,14 @@ import { isRuleRef, parseRuleRef } from "./rule-ref.mjs";
  * @property {number} rules_in
  * @property {number | null} cases_returned
  * @property {number | null} proposed_rules_count
+ * @property {number | null} check_gaps_count
  * @property {string[]} dropped_fields
  * @property {DroppedCaseLabel[]} dropped_labels - the labels of a usable reply dropped, never a
  *   reason to reject it
  * @property {DesignCase[] | null} cases
  * @property {DesignProposedRule[] | null} proposed_rules
+ * @property {DesignCheckGap[] | null} check_gaps
+ * @property {DesignQuestion[] | null} questions
  */
 
 // `unit` is the JSON `brief design` printed (a {@link DesignBriefProjection}); `reply` the Delegate's
@@ -166,7 +210,7 @@ export function design(reply, unit, lastJsonBlock) {
   const labelKey = new Set(labels === null ? [] : labelKeys(labels));
   /**
    * @param {DesignProblem[]} problems
-   * @param {{cases?: (DesignCase | null)[], proposed?: (DesignProposedRule | null)[], dropped?: string[], droppedLabels?: DroppedCaseLabel[]}} [parsed]
+   * @param {{cases?: (DesignCase | null)[], proposed?: (DesignProposedRule | null)[], checks?: DesignCheckGap[], dropped?: string[], droppedLabels?: DroppedCaseLabel[], questions?: DesignQuestion[]}} [parsed]
    * @returns {DesignResult}
    */
   const result = (problems, parsed = {}) => {
@@ -178,14 +222,17 @@ export function design(reply, unit, lastJsonBlock) {
       feature: unit.feature ?? null,
       scenario: unit.scenario ?? null,
       mode: unit.mode,
-      outcome: usable && parsed.cases?.length === 0 && (parsed.proposed?.length ?? 0) > 0 ? "awaiting_rules" : null,
+      outcome: usable && parsed.cases?.length === 0 && ((parsed.proposed?.length ?? 0) > 0 || (parsed.questions?.length ?? 0) > 0) ? "awaiting_rules" : null,
       rules_in: unit.rules.length,
       cases_returned: parsed.cases?.length ?? null,
       proposed_rules_count: parsed.proposed?.length ?? null,
+      check_gaps_count: parsed.checks?.length ?? null,
       dropped_fields: parsed.dropped ?? [],
       dropped_labels: parsed.droppedLabels ?? [],
       cases: usable ? /** @type {DesignCase[]} */ (parsed.cases) : null,
+      questions: usable ? parsed.questions ?? [] : null,
       proposed_rules: usable ? /** @type {DesignProposedRule[]} */ (parsed.proposed) : null,
+      check_gaps: usable ? parsed.checks ?? [] : null,
     };
   };
 
@@ -210,6 +257,21 @@ export function design(reply, unit, lastJsonBlock) {
   const dropped = new Set();
   /** @type {DroppedCaseLabel[]} */
   const droppedLabels = [];
+  /** @type {DesignQuestion[]} */
+  const questions = [];
+  if (data.questions !== undefined) {
+    if (!Array.isArray(data.questions)) problems.push({ code: "bad_question", message: "`questions` must be a list" });
+    else for (const q of data.questions) {
+      if (!validQuestion(q, rules, waivedRules)) {
+        problems.push({ code: "bad_question", message: "each question needs text, distinct live implicated Rules, and a held case proposal covering all of them" });
+      } else questions.push({
+        text: oneLine(q.text), rules: q.rules,
+        held_case: { summary: q.held_case.summary.trim(), covers: q.held_case.covers,
+          ...(q.held_case.steps !== undefined && { steps: q.held_case.steps }),
+          ...(q.held_case.preconditions !== undefined && { preconditions: q.held_case.preconditions }) },
+      });
+    }
+  }
   const cases = data.cases.map((c, i) => {
     /**
      * @param {string} code
@@ -256,7 +318,7 @@ export function design(reply, unit, lastJsonBlock) {
     let overrideReason;
     if (c.override_reason !== undefined && c.override_reason !== null) {
       if (typeof c.override_reason !== "string") bad("bad_override_reason", "`override_reason` must be a string stating why the case is a distinct pass");
-      else if (text(c.override_reason)) overrideReason = c.override_reason.replace(/\s+/g, " ").trim();
+      else if (text(c.override_reason)) overrideReason = oneLine(c.override_reason);
     }
     if (!Array.isArray(c.roles)) bad("bad_roles", "`roles` must be a list, empty when no role matters");
     else {
@@ -264,10 +326,21 @@ export function design(reply, unit, lastJsonBlock) {
       if (new Set(c.roles).size !== c.roles.length) bad("duplicate_role", "`roles` must list each step actor only once");
     }
     const level = c.level;
-    if (level === null || level === undefined) bad("no_level", "every Test Case names its own `level`");
-    else if (!levels.has(level)) bad("unknown_level", `level ${JSON.stringify(level)} is not in \`project.stack.levels\``);
-    else if (unit.wanted_levels && !unit.wanted_levels.includes(level)) bad("unagreed_level", `level ${JSON.stringify(level)} is not one of the agreed levels`);
+    if (level !== undefined) {
+      if (!(typeof level === "string" || (Array.isArray(level) && level.length > 0 && level.every((v) => typeof v === "string") && new Set(level).size === level.length))) bad("bad_level", "`level` must be a slug or a non-empty list of distinct slugs");
+      else {
+        const bound = caseLevels({ level });
+        const executable = unit.executable_levels ?? [];
+        const fullExecutable = executable.length > 0 && bound.length === executable.length && executable.every((value) => bound.includes(value));
+        for (const value of bound) {
+          if (!levels.has(value)) bad("unknown_level", `level ${JSON.stringify(value)} is not in \`project.stack.levels\``);
+          else if (!fullExecutable && unit.wanted_levels?.length && !unit.wanted_levels.includes(value)) bad("unagreed_level", `level ${JSON.stringify(value)} is not one of the agreed levels`);
+        }
+      }
+      if (!text(c.binding_reason)) bad("binding_reason_required", "a bound case needs a binding reason");
+    }
     if (typeof c.automatable !== "boolean") bad("bad_automatable", "`automatable` must be `true` or `false`");
+    if (c.manual !== undefined && typeof c.manual !== "boolean") bad("bad_manual", "`manual` must be `true` or `false`");
     const preconditions = typeof c.preconditions === "string" ? (text(c.preconditions) ? [c.preconditions] : []) : c.preconditions;
     /** @type {string[] | undefined} */
     let normalizedPreconditions;
@@ -306,7 +379,7 @@ export function design(reply, unit, lastJsonBlock) {
     }
     if (!text(c.expected)) bad("empty_expected", "`expected` must be a non-empty Expected-result paragraph");
     /** @type {DesignCaseDraft} */
-    const out = { summary: String(c.summary ?? "").trim(), covers: c.covers, roles: c.roles, level: /** @type {string} */ (level), automatable: c.automatable };
+    const out = { summary: String(c.summary ?? "").trim(), covers: c.covers, roles: c.roles, ...(level !== undefined && { level: normalizeCaseLevel(level) }), ...(level !== undefined && text(c.binding_reason) && { binding_reason: c.binding_reason.trim() }), automatable: c.automatable, ...(c.manual === false && { manual: false }) };
     if (normalizedReliance.length) out.relies_on = [...new Set(normalizedReliance)];
     if (overrideReason !== undefined) out.override_reason = overrideReason;
     if (normalizedPreconditions?.length) out.preconditions = normalizedPreconditions;
@@ -333,14 +406,40 @@ export function design(reply, unit, lastJsonBlock) {
     proposedProblems.push({ code: "bad_proposed_rule", message: `proposed Rule ${i + 1} is neither a statement nor \`{statement, why}\`: ${JSON.stringify(p)}` });
     return null;
   });
-  const proposalOnly = cases.length === 0 && problems.length === 0 && proposedProblems.length === 0 && proposed.length > 0;
+  const proposalOnly = cases.length === 0 && problems.length === 0 && proposedProblems.length === 0 && (proposed.length > 0 || questions.length > 0);
   if (!proposalOnly && unit.mode !== "expand" && cases.length === 0) problems.push({ code: "no_cases", message: `the reply returns no Test Case, so it ${unit.mode === "fill" ? "fills" : "regenerates"} nothing` });
   problems.push(...proposedProblems);
-  return result(problems, { cases, proposed, dropped: [...dropped], droppedLabels });
+  // A check gap says what checking a case this reply writes needs from the test environment. It
+  // names that case by its summary, so the writer can point at the Key it mints; it is never a
+  // proposed Rule, which states behaviour.
+  /** @type {DesignProblem[]} */
+  const gapProblems = [];
+  /** @type {DesignCheckGap[]} */
+  const checkGaps = [];
+  if (data.check_gaps !== undefined) {
+    if (!Array.isArray(data.check_gaps)) gapProblems.push({ code: "bad_check_gap", message: "`check_gaps` must be a list" });
+    else {
+      const summaries = cases.filter((c) => c !== null).map((c) => oneLine(/** @type {DesignCase} */ (c).summary));
+      for (const g of data.check_gaps) {
+        if (!isObject(g) || !text(g.case) || LINE_BREAK.test(g.case) || !text(g.needs)) {
+          gapProblems.push({ code: "bad_check_gap", message: `a check gap is not an entry with a one-line \`case\` and a \`needs\`: ${JSON.stringify(g)}` });
+          continue;
+        }
+        const named = oneLine(g.case);
+        if (!summaries.includes(named)) {
+          gapProblems.push({ code: "unknown_check_case", message: `a check gap names ${JSON.stringify(named)}, which is no Test Case of this reply` });
+          continue;
+        }
+        checkGaps.push({ case: named, needs: oneLine(g.needs) });
+      }
+    }
+  }
+  problems.push(...gapProblems);
+  return result(problems, { cases, proposed, checks: checkGaps, dropped: [...dropped], droppedLabels, questions });
 }
 
 /** @type {string[]} */
-const FIELDS = ["summary", "covers", "relies_on", "override_reason", "roles", "level", "automatable", "preconditions", "steps", "expected"];
+const FIELDS = ["summary", "covers", "relies_on", "override_reason", "roles", "level", "binding_reason", "automatable", "manual", "preconditions", "steps", "expected"];
 
 /**
  * A non-array object: every case and proposed Rule the reply reads is one after this check.
@@ -356,3 +455,29 @@ const isObject = (v) => v !== null && typeof v === "object" && !Array.isArray(v)
  * @returns {v is string}
  */
 const text = (v) => typeof v === "string" && v.trim() !== "";
+
+/**
+ * Validate the deliberately incomplete proposal without demanding an invented Expected result.
+ * @param {unknown} value
+ * @param {Set<string>} rules
+ * @param {Set<string>} waived
+ * @returns {value is DesignQuestion}
+ */
+function validQuestion(value, rules, waived) {
+  if (!isObject(value) || !text(value.text) || !ruleList(value.rules, rules, waived)) return false;
+  const held = value.held_case;
+  if (!isObject(held) || !text(held.summary) || LINE_BREAK.test(held.summary) || !ruleList(held.covers, rules, waived)) return false;
+  const covers = held.covers;
+  if (!value.rules.every((r) => covers.includes(r))) return false;
+  return [held.steps, held.preconditions].every((items) => items === undefined || (Array.isArray(items) && items.length > 0 && items.every(text)));
+}
+
+/**
+ * @param {unknown} value
+ * @param {Set<string>} rules
+ * @param {Set<string>} waived
+ * @returns {value is string[]}
+ */
+function ruleList(value, rules, waived) {
+  return Array.isArray(value) && value.length > 0 && new Set(value).size === value.length && value.every((r) => typeof r === "string" && rules.has(r) && !waived.has(r));
+}

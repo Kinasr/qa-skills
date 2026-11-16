@@ -24,15 +24,16 @@
 //                             agreement in `--dir`, when there is one, gives each unit its action and
 //                             obligations, and its stale basis refuses the plan.
 //   report                    the closing summary: what each unit wrote, the proposed Rules handed
-//                             to /qa-deep-dive, what is still empty, Run health, the changeset and,
-//                             when the Run recorded an agreement, declared coverage and hand-offs
+//                             to /qa-deep-dive, the check gaps handed to /qa-train design, what is
+//                             still empty, Run health, the changeset and, when the Run recorded an
+//                             agreement, declared coverage and hand-offs
 //
 // What each prints (ADR-0024): data for the model to word (lib/design-json.mjs). A refusal is
 // `{ok: false, refusals: [{code, line, ...}]}`, a code with one factual line.
-//   state    {ok, phase1, no_targets, rules, roles, levels, train, needs_level, coverage}: `train` is
+//   state    {ok, phase1, no_targets, rules, roles, levels, train, coverage}: `train` is
 //            `train/design.md` as lib/training.mjs returns it; `no_targets` is true when a flagged
-//            run has no scenario files to target; `level_question` is present only when
-//            `needs_level` names files; `coverage` is the actual view, whether the Feature has a
+//            run has no scenario files to target; `levels` is the project's vocabulary, never a
+//            question; `coverage` is the actual view, whether the Feature has a
 //            `## Coverage` section, what `/qa-next`'s predicate finds due, and the deep dive next;
 //            `open_findings` is the settle gate: `{open, total, by_kind, features: [{feature, total,
 //            by_kind, cases}]}`; `review` (only with `--review`) is `{feature, cases: [{key, scenario,
@@ -40,8 +41,8 @@
 //   agree    {ok, agreement, views, refusals, gaps} (lib/design-agreement.mjs)
 //   split    {ok, dir, agreement}: `agreement` is the recorded `agreement.json`
 //   plan     {ok, dir, units}: `units` is how many files are dispatched
-//   report   {ok, feature, mode, scenarios, written_markdown, not_automatable, skipped, still_empty,
-//             declared_coverage?, handoffs?, ...}
+//   report   {ok, feature, mode, scenarios, written_markdown, not_automatable, not_manual, skipped, still_empty,
+//             check_gaps, declared_coverage?, handoffs?, ...}
 
 // The mode picks the targets: a bare run fills the empty files, `--expand`
 // adds cases to the populated ones, and `--regenerate` redoes the files holding an unreviewed case
@@ -69,17 +70,20 @@
 //   <key>.brief.md      the brief text alone, which the Delegate is given
 //   <key>.reply.md      the usable reply the delegation layer left (else the last one it got)
 //   <key>.written.json  what the write of its usable reply did; absent = nothing was written
+import { heldCases, readDesignQuestions, writeDesignQuestions } from "./design-questions.mjs";
+import { readQaAt, repositoryOf, resolveRef } from "./git-tree.mjs";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { keyLabel, summaries } from "./labels.mjs";
 import { commitLine } from "./changeset.mjs";
 import { checkReply } from "./check-reply.mjs";
 import { readDispatch } from "./delegation.mjs";
-import { refuse, levelQuestion, reportData } from "./design-json.mjs";
+import { refuse, reportData } from "./design-json.mjs";
 import { agreementBasis, checkAgreement, coverageViews, isNewScenarioKey, readAgreement, staleAgreement } from "./design-agreement.mjs";
 import { agreementBriefPosition } from "./design-agreement-brief.mjs";
 import { designMode, designUnit, loadFeature, modeRefusal } from "./design-unit.mjs";
 import { coverageDue, parseCoverage } from "./coverage.mjs";
+import { missingPermissionLevels, permissionRulesOf } from "./permission-binding.mjs";
 import { effectiveCategories } from "./categories.mjs";
 import { listOf } from "./dialect.mjs";
 import { table } from "./markdown.mjs";
@@ -87,11 +91,13 @@ import { PATTERN } from "./keys.mjs";
 import { checkFile, edit, parse } from "./knowledge-file.mjs";
 import { mint } from "./mint.mjs";
 import { backfill } from "./pin-digest.mjs";
+/** @import { NewProposedRule } from "./proposed-rules.mjs" */
+import { appendProposedRules, normalizeStatement, parseProposedRules, proposedRulesProblems, sameStatement } from "./proposed-rules.mjs";
 import { rootConfig } from "./qa-index.mjs";
 import { newRunDir, openPlan } from "./run-dir.mjs";
 import { localDate } from "./scan.mjs";
 import { refuseUnreadSchema } from "./schema-guard.mjs";
-import { DESIGN_TRAIN_KEY, LEVEL_ON_CASE_SCHEMA_VERSION } from "./schema.mjs";
+import { DESIGN_TRAIN_KEY, LAYER_FREE_CASE_SCHEMA_VERSION, LEVEL_ON_CASE_SCHEMA_VERSION, oneLine } from "./schema.mjs";
 import { DESIGN_SETTLE_ACTIONS, SETTLE_ACTIONS, settleScope } from "./settle-walk.mjs";
 import { linkScope } from "./settle-propose.mjs";
 import { trainFor } from "./training.mjs";
@@ -100,11 +106,11 @@ import { trainFor } from "./training.mjs";
 /** @import { CheckFileResult, DesignBrief, DesignMode, EditResult, FeatureContext, ScenarioState } from "./design-unit.mjs"; */
 /** @import { CaseEntry, ParsedFile as QaFile } from "./knowledge-file.mjs"; */
 /** @import { MintedKeys } from "./mint.mjs"; */
-/** @import { DesignProposedRule, DesignResult } from "./design-contract.mjs"; */
+/** @import { DesignCheckGap, DesignProposedRule, DesignResult } from "./design-contract.mjs"; */
 /** @import { Agreement, AgreementProposedRule, AgreementResult, AgreementScenario, CoverageView } from "./design-agreement.mjs"; */
 /** @import { CoverageDue } from "./coverage.mjs"; */
 /** @import { WrittenRecord } from "./design-write.mjs"; */
-/** @import { DeclaredCoverage, DeclaredOutcome, DesignReportJson, LevelQuestion, ReportHandoffs, ReportProposed, ReportScenario, RunHealth } from "./design-json.mjs"; */
+/** @import { DeclaredCoverage, DeclaredOutcome, DesignReportJson, ReportCheckGap, ReportHandoffs, ReportProposal, ReportProposed, ReportScenario, RunHealth } from "./design-json.mjs"; */
 /** @import { DispatchSpec } from "./dispatch.mjs"; */
 /** @import { CommandContext, CommandDefinition, CommandResult, OptionKind } from "./cli.mjs"; */
 /** @import { OpenPlanResult } from "./run-dir.mjs"; */
@@ -170,13 +176,21 @@ import { trainFor } from "./training.mjs";
  * @property {string} reply - the `<key>.reply.md` path
  * @property {string} written - the `<key>.written.json` path
  */
+
+// Every reason `design plan` records for a scenario file it does not target: a file the mode cannot
+// take, one its check excludes, or one the agreement leaves out. `design report` words each with the
+// `SKIPPED` fact in lib/design-json.mjs, keyed by this same union, so a reason without one fails the
+// type check.
+export const PLAN_SKIP_REASONS = /** @type {const} */ (["populated", "not_populated", "nothing_replaceable", "waived_only", "fails_check", "unaddressable", "not_agreed"]);
+/** @typedef {typeof PLAN_SKIP_REASONS[number]} PlanSkipReason */
+
 /**
  * A scenario file the plan skipped, with why it is no unit of the mode.
  * @typedef {object} PlanSkip
  * @property {string} scenario
  * @property {string} file
  * @property {ScenarioState["status"]} status
- * @property {string} reason
+ * @property {PlanSkipReason} reason
  * @property {string[]} [problems]
  */
 
@@ -231,7 +245,6 @@ const ACTIONS = {
     if (halt) return halt;
     const inScope = scoped(ctx, f);
     if (inScope.refusal) return inScope.refusal;
-    const needsLevel = f.mode === "fill" ? inScope.filter((s) => s.status === "empty").map((s) => /** @type {string} */ (s.scenario)) : [];
     return {
       exit: 0,
       json: {
@@ -246,11 +259,11 @@ const ACTIONS = {
         roles: ctx.roles,
         levels: ctx.levels,
         train: /** @type {TrainModule} */ (trainFor(ctx.index, DESIGN_TRAIN_KEY)),
-        needs_level: needsLevel,
-        ...(needsLevel.length && { level_question: levelQuestion(needsLevel, ctx.levels, summaries(ctx.index).scenario) }),
         coverage: coverageState(ctx, f.slug),
         ...settleScope(root, f.slug, { review }),
         ...linkScope(root, f.slug),
+        // The kept Proposed Rules (ADR-0067), which wait on /qa-deep-dive and block nothing here.
+        proposed_rules: parseProposedRules(ctx.feature?.text ?? ""),
       },
     };
     },
@@ -271,7 +284,7 @@ const ACTIONS = {
       if (args.length !== 1) return refuse("bad_arguments", { action: "agree" });
       const scope = args[0];
       const read = readProposal(stdin, {
-        missing: () => agreementRefused("agreement_not_json", "`design agree` reads the proposed agreement from --stdin, and none was given"),
+        missing: () => agreementRefused("agreement_not_json", "`design agree` reads the proposed agreement from --input <file> or --stdin, and none was given"),
         notJson: () => agreementRefused("agreement_not_json", "the proposed agreement is not JSON"),
         notObject: () => agreementRefused("agreement_not_json", "the proposed agreement must be a JSON object"),
       });
@@ -403,7 +416,7 @@ const ACTIONS = {
       const made = (/** @type {{ make: () => string }} */ (run)).make();
       const held = readOverrides(made);
       if (held.error) return refuse("run_dir", { reason: held.error });
-      const overrides = { ...held.overrides, ...Object.fromEntries(reasons.map(([key, reason]) => [key, /** @type {string} */ (reason).replace(/\s+/g, " ").trim()])) };
+      const overrides = { ...held.overrides, ...Object.fromEntries(reasons.map(([key, reason]) => [key, oneLine(/** @type {string} */ (reason))])) };
       writeFileSync(join(made, OVERRIDES), `${JSON.stringify({ v: 1, overrides }, null, 2)}\n`);
       return { exit: 0, json: { ok: true, dir: made, overrides } };
     },
@@ -489,6 +502,62 @@ const ACTIONS = {
     },
   },
 
+  unbind: {
+    options: { dir: "value" },
+    usage: "--dir <run-dir> <case-key>",
+    /**
+     * Remove a binding only from an uncommitted, unreviewed case this Run wrote.
+     * @param {string[]} args
+     * @param {{ dir?: string }} ctx
+     * @returns {CommandResult}
+     */
+    run(args, { dir: named }) {
+      if (args.length !== 1) return refuse("bad_arguments", { action: "unbind" });
+      /** @type {OpenPlanResult<DesignPlan>} */
+      const { dir, plan, error } = openPlan("design", "unbind", [], named);
+      if (error) return refuse("run_dir", { reason: error });
+      const key = args[0];
+      const unit = /** @type {DesignPlan} */ (plan).units.find((u) => {
+        const written = /** @type {WrittenRecord | null} */ (readJson(u.written));
+        return written?.written && written.keys.includes(key);
+      });
+      if (!unit) return refuse("unbind_not_written", { key });
+      const root = /** @type {DesignPlan} */ (plan).root;
+      const newer = refuseUnreadSchema(root, LAYER_FREE_CASE_SCHEMA_VERSION);
+      if (newer) return newer;
+      const ctx = loadFeature(root, /** @type {DesignPlan} */ (plan).feature);
+      const matches = ctx.files.filter((f) => !f.unreadable).flatMap((file) => file.cases.filter((c) => c.key === key).map((entry) => ({ file, entry })));
+      if (matches.length !== 1) return refuse("unbind_missing", { key });
+      const { file, entry } = matches[0];
+      const repo = repositoryOf(root);
+      const head = resolveRef(root, "HEAD");
+      if (!repo || !head) return refuse("unbind_history", { key });
+      const history = readQaAt(repo, head);
+      const committed = [...history].some(([rel, text]) => parse(rel, text).cases.some((c) => c.key === key));
+      if (Object.hasOwn(entry.data, "review") || committed) return refuse("unbind_kept", { key });
+      /** @type {WrittenRecord} */
+      const record = /** @type {WrittenRecord} */ (readJson(unit.written));
+      const out = edit(file, [{ at: key, set: { level: undefined } }]);
+      if (!out.ok || !checkFile(out.file, rootConfig(root)).ok) return refuse("unbind_check", { key });
+      writeFileSync(join(root, file.rel), backfill(root, file.rel, out.text));
+      record.bindings = (record.bindings ?? []).map((b) => b.key === key ? { ...b, unbound: true } : b);
+      writeFileSync(unit.written, `${JSON.stringify(record, null, 2)}\n`);
+      return { exit: 0, json: { ok: true, dir, key, unbound: true } };
+    },
+  },
+
+  resume: {
+    options: { root: "qa-dir", dir: "value" },
+    usage: "--dir <run-dir> [--root <qa-dir>]",
+    run(args, { root, dir }) {
+      if (args.length !== 0) return refuse("bad_arguments", { action: "resume" });
+      if (!dir) return refuse("run_dir", { reason: "design resume needs --dir <run-dir>" });
+      const read = readDesignQuestions(dir);
+      if (read.error || !read.data) return refuse("run_dir", { reason: read.error ?? "no design questions: run design report first" });
+      return { exit: 0, json: { ok: true, feature: read.data.feature, held_cases: heldCases(read.data, /** @type {string} */ (root)) } };
+    },
+  },
+
   report: {
     options: { dir: "value" },
     usage: "--dir <run-dir>",
@@ -516,6 +585,63 @@ const ACTIONS = {
           intended.agreement ?? null,
         ),
       };
+    },
+  },
+
+  keep: {
+    options: { stdin: "flag", dir: "value" },
+    usage: "--dir <run-dir> --stdin",
+    /**
+     * `design keep` (ADR-0067): append the Proposed Rules the engineer kept at this Run's report to
+     * the Feature's `## Proposed Rules`, the one Feature write /qa-design makes. Reads
+     * `{"keep": [{"item": <n>, "statement"?: "<rewording>"}]}`, numbered as the report numbers its
+     * `proposals`; a statement already held is reported, never written twice. It writes no Rule.
+     * @param {string[]} args
+     * @param {CommandContext} ctx
+     * @returns {CommandResult}
+     */
+    run(args, { stdin, dir: named }) {
+      if (args.length !== 0) return refuse("bad_arguments", { action: "keep" });
+      const read = readProposal(stdin, { missing: () => refuse("no_keep"), notJson: () => refuse("bad_keep"), notObject: () => refuse("bad_keep") });
+      if (read.refusal) return read.refusal;
+      const items = keptItems(/** @type {Record<string, unknown>} */ (read.proposal).keep);
+      if (!items) return refuse("bad_keep");
+      /** @type {OpenPlanResult<DesignPlan>} */
+      const { dir, plan, error } = openPlan("design", "keep", [], named);
+      if (error) return refuse("run_dir", { reason: error });
+      const intended = runAgreement(/** @type {string} */ (dir));
+      if (intended.refusal) return intended.refusal;
+      const { proposals, changeset } = report(/** @type {string} */ (dir), /** @type {DesignPlan} */ (plan), /** @type {DispatchReadback | null} */ (readDispatch(/** @type {string} */ (dir))), intended.agreement ?? null);
+      const unknown = items.filter((k) => !proposals.some((p) => p.item === k.item)).map((k) => k.item);
+      if (unknown.length) return refuse("unknown_proposal", { items: unknown });
+      const root = /** @type {DesignPlan} */ (plan).root;
+      const feature = loadFeature(root, /** @type {DesignPlan} */ (plan).feature).feature;
+      if (!feature || feature.unreadable) return refuse("keep_no_feature");
+      const held = parseProposedRules(feature.text).map((h) => h.statement);
+      /** @type {(NewProposedRule & { item: number })[]} */
+      const kept = [];
+      /** @type {{ item: number, statement: string }[]} */
+      const already = [];
+      for (const k of items) {
+        const p = /** @type {ReportProposal} */ (proposals.find((x) => x.item === k.item));
+        const statement = normalizeStatement(k.statement ?? p.statement);
+        if ([...held, ...kept.map((a) => a.statement)].some((h) => sameStatement(h, statement))) already.push({ item: k.item, statement });
+        else kept.push({ item: k.item, statement, why: p.why ?? null, scenario: p.scenario });
+      }
+      const text = appendProposedRules(feature.text, kept);
+      const problems = proposedRulesProblems({ text });
+      if (problems.length) return refuse("keep_check", { problems });
+      const file = repoPath(root, feature.rel);
+      if (kept.length) {
+        writeFileSync(join(root, feature.rel), text);
+        // The report item each kept statement came from, so a re-run report reads a reworded one as kept.
+        const from = keptFrom(/** @type {string} */ (dir));
+        for (const k of kept) from.push({ from: /** @type {ReportProposal} */ (proposals.find((x) => x.item === k.item)).statement, statement: k.statement });
+        writeFileSync(join(/** @type {string} */ (dir), KEPT_FILE), `${JSON.stringify({ v: 1, kept: from }, null, 2)}\n`);
+      }
+      // The keep's commit covers the Run's changeset and the Feature it wrote, so one commit holds both.
+      const commit = kept.length ? commitLine([...new Set([...changeset.paths, file])], designCommitMessage(/** @type {DesignPlan} */ (plan))) : null;
+      return { exit: 0, json: { ok: true, dir, file, kept, already_kept: already, commit } };
     },
   },
 
@@ -679,7 +805,7 @@ const AGREED_ACTIONS = {
  * @param {DesignMode} mode
  * @param {AgreementScenario | undefined} entry
  * @param {boolean} onlyUncoveredRulesAreWaived
- * @returns {{ action: DesignMode, reason?: undefined } | { action?: undefined, reason: string }}
+ * @returns {{ action: DesignMode, reason?: undefined } | { action?: undefined, reason: PlanSkipReason }}
  */
 function planTarget(s, mode, entry, onlyUncoveredRulesAreWaived) {
   const action = entry?.action ?? mode;
@@ -880,6 +1006,25 @@ const readJson = (path) => {
   }
 };
 
+// The kept statements `design keep` wrote, each with the report statement it came from.
+const KEPT_FILE = "kept.json";
+/** @typedef {{ from: string, statement: string }} KeptFrom */
+/**
+ * @param {string} dir
+ * @returns {KeptFrom[]}
+ */
+function keptFrom(dir) {
+  const kept = /** @type {{ kept?: unknown } | null} */ (readJson(join(dir, KEPT_FILE)))?.kept;
+  return Array.isArray(kept) ? kept.filter((k) => k && typeof k.from === "string" && typeof k.statement === "string") : [];
+}
+
+// The Run's commit message, the same for the report's changeset and a keep's.
+/**
+ * @param {DesignPlan} plan
+ * @returns {string}
+ */
+const designCommitMessage = (plan) => `qa(${plan.feature}): /qa-design${plan.mode === "fill" ? "" : ` --${plan.mode}`}`;
+
 // The closing summary as data (lib/design-json.mjs `reportData`).
 /**
  * @param {string} dir
@@ -892,6 +1037,12 @@ function report(dir, plan, dispatch, agreement) {
   const failures = new Map((dispatch?.failed ?? []).map((f) => [f.unit, f]));
   /** @type {ReportProposed[]} */
   const proposed = [];
+  /** @type {{ scenario: string, case: string, needs: string }[]} */
+  const rawGaps = [];
+  /** @type {import("./design-questions.mjs").RunQuestion[]} */
+  const questions = [];
+  /** @type {import("./design-json.mjs").ReportBinding[]} */
+  const bindings = [];
   /** @type {AgreementProposedRule[]} */
   const awaitingProposals = [];
   /** @type {Map<string, UnitOutcome>} */
@@ -904,12 +1055,14 @@ function report(dir, plan, dispatch, agreement) {
   const scenarios = plan.units.map((u) => {
     const w = /** @type {WrittenRecord | null} */ (readJson(u.written));
     const entry = { scenario: u.scenario, file: u.file };
+    questions.push(...(w?.questions ?? []).map(q => ({ ...q, scenario: u.scenario, basis: w?.question_basis ?? {} })));
     // A usable reply names its proposed Rules (design-contract.mjs), handed on whether or not its
     // cases were written.
     const brief = /** @type {DesignBrief | null} */ (readJson(u.brief_json));
     const reply = existsSync(u.reply) ? readFileSync(u.reply, "utf8") : null;
     const checked = brief && reply !== null ? /** @type {DesignResult} */ (checkReply("design", reply, brief)) : null;
     for (const p of checked?.usable ? /** @type {DesignProposedRule[]} */ (checked.proposed_rules) : []) proposed.push({ scenario: u.scenario, ...p });
+    for (const g of checked?.usable ? /** @type {DesignCheckGap[]} */ (checked.check_gaps) : []) rawGaps.push({ scenario: u.scenario, ...g });
     // A proposal-only reply writes nothing and is a hand-off to the deep dive, never a design retry.
     if (w?.outcome === "awaiting_rules") {
       outcomes.set(u.scenario, "awaiting");
@@ -918,7 +1071,8 @@ function report(dir, plan, dispatch, agreement) {
     }
     if (w?.written) {
       outcomes.set(u.scenario, "written");
-      return { ...entry, status: "written", cases_written: w.cases_written, cases: w.keys, not_automatable: w.not_automatable ?? [], replaced: w.replaced ? u.replace : [], ...(w.overridden && { overridden: w.overridden }), ...(w.duplicates && { duplicates: w.duplicates }), ...(w.dropped_labels && { dropped_labels: w.dropped_labels }), ...(w.lost_labels && { lost_labels: w.lost_labels }) };
+      bindings.push(...(w.bindings ?? []).map((b) => ({ ...b, scenario: u.scenario, file: u.file })));
+      return { ...entry, status: "written", cases_written: w.cases_written, cases: w.keys, not_automatable: w.not_automatable ?? [], not_manual: w.not_manual ?? [], replaced: w.replaced ? u.replace : [], ...(w.overridden && { overridden: w.overridden }), ...(w.duplicates && { duplicates: w.duplicates }), ...(w.dropped_labels && { dropped_labels: w.dropped_labels }), ...(w.lost_labels && { lost_labels: w.lost_labels }) };
     }
     // A record that wrote nothing names its reason and its problems (lib/design-write.mjs `refused`).
     if (w) {
@@ -934,9 +1088,15 @@ function report(dir, plan, dispatch, agreement) {
   });
 
   const ctx = loadFeature(plan.root, plan.feature);
+  /** @type {ReportCheckGap[]} */
+  const checkGaps = rawGaps.map((g) => ({ scenario: g.scenario, key: checkGapKey(ctx, g.scenario, g.case), case: g.case, needs: g.needs }));
+  const writtenKeys = new Set(scenarios.flatMap((s) => (s.status === "written" ? s.cases : [])));
+  const caseWarnings = permissionWarnings(ctx, writtenKeys);
+  writeDesignQuestions(dir, { v: 1, feature: plan.feature, references: listOf(ctx.feature?.data.sources), questions });
   // An awaiting unit is not "still empty": its file waits on /qa-deep-dive, not on another fill.
-  const stillEmpty = ctx.scenarios.filter((s) => s.status === "empty" && outcomes.get(/** @type {string} */ (s.scenario)) !== "awaiting").map((s) => ({ scenario: /** @type {string} */ (s.scenario), file: repoPath(ctx.root, s.file), needs_level: !agreement?.scenarios[/** @type {string} */ (s.scenario)]?.levels.length }));
+  const stillEmpty = ctx.scenarios.filter((s) => s.status === "empty" && outcomes.get(/** @type {string} */ (s.scenario)) !== "awaiting").map((s) => ({ scenario: /** @type {string} */ (s.scenario), file: repoPath(ctx.root, s.file) }));
   const changed = scenarios.filter((s) => s.status === "written" && (s.cases_written > 0 || s.replaced.length));
+  const proposals = proposalList(ctx.feature?.text ?? "", proposed, agreement, keptFrom(dir));
   const knowledge = [...new Set([
     ...(agreement !== null ? agreementPaths(ctx, plan, agreement, scenarios) : (/** @type {SplitRecord | null} */ (readJson(join(dir, "split.json")))?.written ?? []).map((w) => w.file)),
     ...changed.map((s) => s.file),
@@ -964,13 +1124,21 @@ function report(dir, plan, dispatch, agreement) {
       dispatched: plan.units.length > 0,
       delegate: dispatch?.delegates,
       scenarios,
+      bindings,
+      case_warnings: caseWarnings,
       missing_levels: agreement === null ? [] : Object.entries(agreement.scenarios).flatMap(([scenario, entry]) => {
         const state = ctx.scenarios.find((s) => s.scenario === scenario);
         return entry.levels.filter((level) => !state?.levels.includes(level)).map((level) => ({ code: "agreed_level_without_cases", scenario, level, file: state ? repoPath(ctx.root, state.file) : "" }));
       }),
       skipped: plan.skipped,
       cases_written: scenarios.reduce((n, s) => n + s.cases_written, 0),
+      questions,
+      question_handoff: questions.length ? `/qa-deep-dive ${plan.feature} --dir ${dir}` : null,
+      check_gaps: checkGaps,
+      check_handoff: checkGaps.length ? "/qa-train design" : null,
       proposed_rules: proposed,
+      proposals,
+      keep: proposals.some((p) => !p.kept) ? `design keep --dir ${dir} --input <file>` : null,
       handoff: `/qa-deep-dive ${plan.feature}`,
       still_empty: stillEmpty,
       rerun: mode === "fill" && stillEmpty.length ? ["/qa-design", plan.feature, ...flags].join(" ") : null,
@@ -978,7 +1146,7 @@ function report(dir, plan, dispatch, agreement) {
       run_health: dispatch && { run: dispatch.run, calls: dispatch.calls, announcements: dispatch.announcements, retried: dispatch.retried, notes: dispatch.notes },
       changeset: {
         paths,
-        commit: paths.length ? commitLine(paths, `qa(${plan.feature}): /qa-design${mode === "fill" ? "" : ` --${mode}`}`) : null,
+        commit: paths.length ? commitLine(paths, designCommitMessage(plan)) : null,
       },
       ...(agreement === null ? {} : {
         declared_coverage: declaredCoverage(ctx, plan, agreement, outcomes),
@@ -987,6 +1155,48 @@ function report(dir, plan, dispatch, agreement) {
     },
     summaries(ctx.index),
   );
+}
+
+// The Permissions drift warnings for the cases this Run wrote, as the scan reports them: a case
+// covering a Permissions Rule is bound to no level or not to every executable one. Binding review
+// shows them before Review, never only after the cases are kept.
+/**
+ * @param {FeatureContext} ctx
+ * @param {ReadonlySet<string>} writtenKeys
+ * @returns {{ code: string, scenario: string, key: string, file: string, missing_levels: string[] }[]}
+ */
+function permissionWarnings(ctx, writtenKeys) {
+  const rules = permissionRulesOf(ctx.feature);
+  if (rules.size === 0) return [];
+  const config = rootConfig(ctx.root);
+  /** @type {{ code: string, scenario: string, key: string, file: string, missing_levels: string[] }[]} */
+  const out = [];
+  for (const f of ctx.files) {
+    if (f.unreadable || f.type !== "scenario") continue;
+    for (const c of f.cases) {
+      if (!writtenKeys.has(c.key)) continue;
+      const missing = missingPermissionLevels(c, f, rules, config);
+      if (missing.length === 0) continue;
+      out.push({ code: "partial_permission_binding", scenario: String(f.data.key), key: c.key, file: repoPath(ctx.root, f.rel), missing_levels: missing });
+    }
+  }
+  return out;
+}
+
+// The Key of the stored case one reply's check gap named, in that unit's scenario file. Null when
+// the case was never written (a refused repeat, a file that changed), so the report still names it
+// by the summary the reply gave.
+/**
+ * @param {FeatureContext} ctx
+ * @param {string} scenario
+ * @param {string} summary
+ * @returns {string | null}
+ */
+function checkGapKey(ctx, scenario, summary) {
+  const state = ctx.scenarios.find((s) => s.scenario === scenario);
+  const file = state === undefined ? undefined : ctx.files.find((f) => f.rel === state.file);
+  const named = oneLine(summary);
+  return (file?.cases ?? []).find((c) => oneLine(c.summary) === named)?.key ?? null;
 }
 
 // The scenario files the agreement's in-scope entries account for: the ones split wrote (an empty
@@ -1077,6 +1287,44 @@ function declaredMarkdown(scenarios) {
     ? s.obligations.map((o) => [s.scenario, s.action, o.rule, o.outcome])
     : [[s.scenario, s.action, null, null]]));
   return table(["Scenario", "Action", "Rule", "Outcome"], rows);
+}
+
+// The items `design keep` reads: a non-empty list of `{item, statement?}`, each item a report number
+// and each statement, when given, one non-blank line. Null when the list is not that shape.
+/**
+ * @param {unknown} keep
+ * @returns {{ item: number, statement?: string }[] | null}
+ */
+function keptItems(keep) {
+  if (!Array.isArray(keep) || keep.length === 0) return null;
+  const ok = keep.every((k) => k !== null && typeof k === "object" && Number.isInteger(k.item)
+    && (k.statement === undefined || (typeof k.statement === "string" && k.statement.trim() !== "" && !/[\r\n]/.test(k.statement))));
+  return ok ? keep : null;
+}
+
+// The report's one numbered list of Proposed Rules the engineer may keep (ADR-0067): every
+// Delegate's, an awaiting unit's included, then the agreement's, each statement once in that order.
+// `design keep` rebuilds it the same way, so an item number names the same proposal there.
+// A proposal is kept when the Feature holds its statement, or the rewording `design keep` recorded
+// for it (`from`).
+/**
+ * @param {string} featureText
+ * @param {ReportProposed[]} proposed
+ * @param {Agreement | null} agreement
+ * @param {KeptFrom[]} [from]
+ * @returns {ReportProposal[]}
+ */
+function proposalList(featureText, proposed, agreement, from = []) {
+  const held = parseProposedRules(featureText);
+  /** @type {ReportProposal[]} */
+  const out = [];
+  /** @type {{ statement: string, why?: string, scenario: string | null }[]} */
+  const all = [...proposed, ...(agreement?.handoffs.proposed_rules ?? []).map((p) => ({ ...p, scenario: null }))];
+  for (const p of all) {
+    if (out.some((o) => sameStatement(o.statement, p.statement))) continue;
+    out.push({ item: out.length + 1, statement: p.statement, ...(p.why === undefined ? {} : { why: p.why }), scenario: p.scenario, kept: held.some((h) => sameStatement(h.statement, p.statement) || from.some((k) => sameStatement(k.from, p.statement) && sameStatement(h.statement, k.statement))) });
+  }
+  return out;
 }
 
 // The agreement's pre-dispatch hand-offs plus each awaiting unit's proposals.

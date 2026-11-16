@@ -3,8 +3,11 @@
 // annotations: its Key carriers are places in its own call, read and written with the parser of the
 // repository's own `typescript`, loaded through `createRequire` anchored in the repository. With
 // none installed the adapter is unavailable, and code binding is skipped: never a guessed parse.
+// One that resolves without the compiler API is unavailable too, with a note naming what it found
+// and the version to install; its other surfaces are never read.
 //
-// Carriers, as `annotation_map` names them:
+// Carriers, as `annotation_map` names them (declared in `descriptors.mjs`, so they hold while this
+// adapter cannot load):
 //   tag                 each tag of the details object (`{ tag: '@x' }` or `{ tag: ['@x', …] }`),
 //                       read without its `@`, and each `@word` of the title (read only)
 //   annotation.<type>   the `description` of each `{ type, description }` in `annotation`
@@ -18,7 +21,7 @@ import { createRequire } from "node:module";
 import { existsSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { splice } from "./splice.mjs";
-import { isTsPlaywrightStack } from "./descriptors.mjs";
+import { carrierSupported, isTsPlaywrightStack, TS_PLAYWRIGHT_CARRIERS } from "./descriptors.mjs";
 
 /**
  * @import { SpliceEdit } from "./splice.mjs"
@@ -143,6 +146,8 @@ import { isTsPlaywrightStack } from "./descriptors.mjs";
  * @property {(node: TsNode) => node is TsPropertyAssignment} isPropertyAssignment
  * @property {(node: TsNode) => node is TsArrayLiteralExpression} isArrayLiteralExpression
  * @property {(node: TsNode) => node is TsObjectLiteralExpression} isObjectLiteralExpression
+ * @property {(node: TsNode) => boolean} isAwaitExpression
+ * @property {(node: TsNode) => boolean} isParenthesizedExpression
  * @property {{ TS: number, TSX: number, JS: number, JSX: number }} ScriptKind
  * @property {{ Latest: number }} ScriptTarget
  * @property {{ SingleLineCommentTrivia: number }} SyntaxKind
@@ -225,6 +230,7 @@ import { isTsPlaywrightStack } from "./descriptors.mjs";
  *   generated: boolean,
  *   template: boolean,
  *   call: { start: number },
+ *   end: number,
  * }} TsFunction
 
 /**
@@ -238,6 +244,7 @@ import { isTsPlaywrightStack } from "./descriptors.mjs";
  *   generated: boolean,
  *   template: boolean,
  *   call: { start: number },
+ *   end: number,
  * }} TsTest
 
 /**
@@ -369,11 +376,13 @@ import { isTsPlaywrightStack } from "./descriptors.mjs";
  * }} TsAdapter
 
 /**
- * The tokens and assertion counter the shared test-code edit guards use: what a fix may never add,
- * and how many assertions a file holds.
+ * The tokens and assertion helpers the shared test-code edit guards use: what a fix may never add,
+ * how many assertions a file holds, whether a 1-based line belongs to an assertion statement, and
+ * the file's assertion contracts.
  * @typedef {{
  *   never: readonly { id: string, pattern: RegExp }[],
  *   assertions: (text: string) => number,
+ *   assertionAt: (text: string, line: number) => boolean,
  *   contracts: (text: string) => import("../fix-assertions.mjs").AssertionContract[],
  * }} TsGuard
  */
@@ -413,6 +422,12 @@ import { isTsPlaywrightStack } from "./descriptors.mjs";
  *   fits: (stack: TsStackDescriptor) => boolean,
  *   load: (repo: string) => TsAdapterLoad,
  * }} TsStackEntry
+ */
+
+// The `typescript` this adapter is tested with: the version the plugin's own devDependency and the
+// adapter's test fixture pin, which its unavailable note names so the fix cannot drift from them.
+/** @type {string} */
+export const TESTED_TYPESCRIPT = "5.8.3";
 
 // The stack's entry (lib/stack.mjs). Playwright Test in TypeScript or JavaScript; a framework that
 // names JUnit belongs to the Kotlin stack, never this.
@@ -427,8 +442,11 @@ export const TS_PLAYWRIGHT = {
     } catch {
       ts = null;
     }
-    if (typeof ts?.createSourceFile !== "function") {
+    if (!ts) {
       return { unavailable: { reason: "no_typescript", message: "the repository has no `typescript` installed to read its tests with", fix: "install the project's dependencies" } };
+    }
+    if (typeof ts.createSourceFile !== "function") {
+      return { unavailable: { reason: "typescript_no_compiler_api", message: `the repository's \`typescript\` ${ts.version} has no compiler API to read its tests with`, fix: `install \`typescript\` ${TESTED_TYPESCRIPT}, the version this plugin is tested with` } };
     }
     return { adapter: adapterWith(ts), version: `typescript ${ts.version}` };
   },
@@ -447,9 +465,17 @@ const HEADER = /^\/\/[ \t]*qa-key-prefix:[ \t]*(\S+)[ \t]*$/;
  */
 const headerText = (prefix) => `// qa-key-prefix: ${prefix}`;
 
+// Assertion call prefixes shared between `guard.assertions` (file-wide count) and `guard.assertionAt`
+// (AST statement-span lookup).
+/** @type {readonly RegExp[]} */
+const ASSERTION_PATTERNS = [
+  /\bexpect(?:\s*\.\s*(?:soft|poll))?\s*\(/,
+  /\bassert(?:\s*\.\s*[A-Za-z_$][\w$]*)?\s*\(/,
+];
+
 // The tokens a fix may never add, in the language this adapter reads. They are matched on added
 // lines only, so an existing skip elsewhere in the file is not a new one.
-/** @type {Omit<TsGuard, "contracts">} */
+/** @type {Omit<TsGuard, "contracts" | "assertionAt">} */
 const GUARD = {
   never: [
     { id: "disable", pattern: /\b(?:test|describe)(?:\s*\.\s*[A-Za-z_$][\w$]*)*\s*\.\s*(?:skip|fixme)\b/ },
@@ -461,8 +487,9 @@ const GUARD = {
   ],
   assertions: (text) => {
     let count = 0;
-    for (const _ of text.matchAll(/\bexpect(?:\s*\.\s*(?:soft|poll))?\s*\(/g)) count++;
-    for (const _ of text.matchAll(/\bassert(?:\s*\.\s*[A-Za-z_$][\w$]*)?\s*\(/g)) count++;
+    for (const pattern of ASSERTION_PATTERNS) {
+      for (const _ of text.matchAll(new RegExp(pattern.source, "g"))) count++;
+    }
     return count;
   },
 };
@@ -504,7 +531,11 @@ function adapterWith(ts) {
       keyCarrierTitle: "Automation key's Key carrier",
       write: "mark",
     },
-    guard: { ...GUARD, contracts: (text) => assertionContracts(ts, text) },
+    guard: {
+      ...GUARD,
+      assertionAt: (text, line) => assertionAt(ts, text, line),
+      contracts: (text) => assertionContracts(ts, text),
+    },
     render: (text, ops, carrier, file) => render(ts, text, ops, carrier, file),
     carrierText,
     codegen: codegenWith(ts),
@@ -844,6 +875,7 @@ function parseWith(ts, text, file = "x.ts") {
       generated: scope.generated,
       template: title.template,
       call: { start: call.getStart(sf) },
+      end: lineOf(call.end - 1),
     });
   };
 
@@ -1071,7 +1103,7 @@ function render(ts, text, { annotate, rekey, prefix, header = [] }, { name, name
  * @returns {TsCarrierEdit}
  */
 function carrierEdit(ts, sf, call, carrier, value) {
-  if (carrier !== "tag" && !carrier.startsWith("annotation.")) return { problem: `a test's \`${carrier}\` is never written: keys are written in \`tag\` or an \`annotation.<type>\`` };
+  if (!carrierSupported(TS_PLAYWRIGHT_CARRIERS, carrier, "write")) return { problem: `a test's \`${carrier}\` is never written: keys are written in \`tag\` or an \`annotation.<type>\`` };
   const [title] = /** @type {TsCallExpression} */ (call).arguments;
   const details = detailsOf(ts, /** @type {TsCallExpression} */ (call));
   const first = title.getText(sf)[0];
@@ -1126,4 +1158,50 @@ function assertionContracts(ts, text) {
   }
   visit(sf);
   return checks;
+}
+
+/**
+ * Whether `line` (1-based) falls inside an assertion call or its fluent matcher chain.
+ * @param {TsApi} ts
+ * @param {string} text
+ * @param {number} line
+ * @returns {boolean}
+ */
+function assertionAt(ts, text, line) {
+  if (!Number.isInteger(line) || line < 1) return false;
+  const sf = sourceFile(ts, text, "assertions.ts");
+  /** @type {Map<TsNode, TsNode>} */
+  const parents = new Map();
+  /** @type {TsCallExpression[]} */
+  const roots = [];
+  /** @param {TsNode} node @param {TsNode | null} parent @returns {void} */
+  const walk = (node, parent) => {
+    if (parent) parents.set(node, parent);
+    if (ts.isCallExpression(node)) {
+      const direct = callee(ts, node.expression);
+      if (direct) {
+        const head = `${[direct.root, ...direct.chain].join(".")}(`;
+        if (ASSERTION_PATTERNS.some((p) => p.exec(head)?.index === 0)) roots.push(node);
+      }
+    }
+    ts.forEachChild(node, (child) => walk(child, node));
+  };
+  walk(sf, null);
+  /** @param {number} pos */
+  const lineOf = (pos) => sf.getLineAndCharacterOfPosition(pos).line + 1;
+  for (const root of roots) {
+    /** @type {TsNode} */
+    let outer = root;
+    for (;;) {
+      const parent = parents.get(outer);
+      if (!parent) break;
+      if ((ts.isPropertyAccessExpression(parent) || ts.isCallExpression(parent)) && parent.expression === outer) outer = parent;
+      else if (ts.isAwaitExpression(parent) || ts.isParenthesizedExpression(parent)) outer = parent;
+      else break;
+    }
+    const start = lineOf(outer.getStart(sf));
+    const end = lineOf(Math.max(outer.getStart(sf), outer.end - 1));
+    if (line >= start && line <= end) return true;
+  }
+  return false;
 }

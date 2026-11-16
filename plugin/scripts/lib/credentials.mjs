@@ -20,19 +20,93 @@ const CREDENTIAL_WORDS = new Set([
 ]);
 /**
  * @param {string} key
- * @returns {boolean}
+ * @returns {string[]}
  */
-export const credentialNamed = (key) => {
+const credentialWords = (key) => {
   const cased = key
     .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
     .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2");
   // Also match separator-delimited words before splitting casing, so `cOoKiE` remains a word.
-  return [key, cased].some((name) => {
+  return [key, cased].flatMap((name) => {
     const words = name.toLowerCase().split(/[^a-z0-9]+/);
-    return words.some((word, i) => CREDENTIAL_WORDS.has(word) || word.endsWith("sessionid") || word === "phpsessid" ||
-      ((word === "api" || word === "private") && (words[i + 1] === "key" || words[i + 1] === "keys")));
+    return words.flatMap((word, i) => CREDENTIAL_WORDS.has(word) || word.endsWith("sessionid") || word === "phpsessid" ? [word] :
+      ((word === "api" || word === "private") && (words[i + 1] === "key" || words[i + 1] === "keys")) ? [`${word}key`] : []);
   });
 };
+
+/** @param {string} key @returns {boolean} */
+export const credentialNamed = (key) => credentialWords(key).length > 0;
+
+// The only credential words an engineer may exempt from body and page-text redaction.
+const EXEMPTABLE_WORDS = new Set(["session", "sessions", "cookie", "cookies", "token", "tokens"]);
+
+/** @param {string} key @returns {boolean} */
+export const redactionExemptName = (key) => {
+  const words = credentialWords(key);
+  return words.length > 0 && words.every((word) => EXEMPTABLE_WORDS.has(word));
+};
+
+/**
+ * @param {string} key
+ * @param {unknown} value
+ * @param {ReadonlySet<string> | undefined} exempt
+ * @returns {boolean}
+ */
+const exemptLeaf = (key, value, exempt) => Boolean(exempt?.has(key.toLowerCase())) && (value === null || typeof value !== "object");
+
+// Page labels prefix a count; anything else may qualify a credential, so fail closed.
+const QUANTITY_WORDS = new Set([
+  "total", "number", "of", "count", "max", "maximum", "min", "minimum", "average", "avg",
+  "daily", "weekly", "monthly",
+]);
+
+/**
+ * A page label may drop only allowlisted leading count words to match a declared name.
+ * @param {string} key
+ * @param {ReadonlySet<string> | undefined} exempt
+ * @returns {boolean}
+ */
+function exemptPageKey(key, exempt) {
+  if (!exempt?.size) return false;
+  let suffix = key;
+  for (;;) {
+    if (exempt.has(suffix.toLowerCase())) return true;
+    const space = suffix.indexOf(" ");
+    if (space === -1 || !QUANTITY_WORDS.has(suffix.slice(0, space).toLowerCase())) return false;
+    suffix = suffix.slice(space + 1);
+  }
+}
+
+// A boolean or null carries no secret, so every scrub keeps it under a credential-named key
+// (`redactValue` on parsed values; `literalEnd` on text). A quoted `"true"` is a string and goes.
+/**
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+const carriesNoSecret = (value) => value === null || typeof value === "boolean";
+
+// What may follow a kept literal. In JSON text it must end its member: closers, then the line's or
+// text's end, or a comma before the next key (a cut text may end anywhere after the comma). Prose
+// after it (`password: true, hunter2`, `token: null} s3cret`) means it is not a JSON value, so the
+// whole value goes. A `=` value is a run, so its literal ends at the run's terminator.
+const MEMBER_END = /^\s*[}\]\s]*(?:$|,\s*(?:$|"(?:[^"\\\n]|\\.)*"\s*:))/;
+const CUT_MEMBER_END = /^\s*[}\]\s]*(?:$|,\s*(?:$|["{[]))/;
+const RUN_END = /^(?:[\s&#<>"']|$)/;
+
+// The index just past the unquoted literal `true`, `false` or `null` at `at` in `text` when `ends`
+// accepts what follows it, or -1: `nullable` and `TRUE` are not the literal.
+/**
+ * @param {string} text
+ * @param {number} at
+ * @param {RegExp} ends
+ * @returns {number}
+ */
+function literalEnd(text, at, ends) {
+  const word = /^(?:true|false|null)/.exec(text.slice(at, at + 5))?.[0];
+  if (!word) return -1;
+  const past = at + word.length;
+  return ends.test(text.slice(past)) ? past : -1;
+}
 
 // Values in a known token format.
 const TOKEN_SIGNATURES = [
@@ -106,14 +180,16 @@ export function redactCredentials(text) {
 // (`redactPageText`), so a `password: x` pair or a credential-named URL parameter inside one goes
 // too. A `{name, value}` entry whose `name` is credential-named loses its `value`: the shape of a
 // storage state's `localStorage` item and a HAR header (`redactPairs` does the same in JSON text).
+// A boolean or null is kept under any key (`carriesNoSecret`).
 /**
  * @param {unknown} value
+ * @param {ReadonlySet<string>} [exempt] Exact lower-case JSON body keys whose leaf values are kept.
  * @returns {unknown}
  */
-export function redactValue(value) {
+export function redactValue(value, exempt) {
   const redacted = "<redacted>";
   if (typeof value === "string") return credentialIn(value) ? redacted : redactPageText(value);
-  if (Array.isArray(value)) return value.map(redactValue);
+  if (Array.isArray(value)) return value.map((item) => redactValue(item, exempt));
   if (value === null || typeof value !== "object") return value;
   const name = /** @type {Record<string, unknown>} */ (value).name;
   const namesCredential = typeof name === "string" && credentialNamed(name);
@@ -122,7 +198,7 @@ export function redactValue(value) {
   for (const [k, v] of Object.entries(value)) {
     let key = tokenIn(k) || credentialIn(k) ? redacted : k;
     for (let n = 2; Object.hasOwn(out, key); n++) key = `${redacted}-${n}`;
-    out[key] = credentialNamed(k) || (namesCredential && k === "value") ? redacted : redactValue(v);
+    out[key] = !carriesNoSecret(v) && ((credentialNamed(k) && !exemptLeaf(k, v, exempt)) || (namesCredential && k === "value")) ? redacted : redactValue(v, exempt);
   }
   return out;
 }
@@ -189,12 +265,15 @@ export function redactQueryParams(href) {
 // quoted name and attributes stay, and a control with nothing behind the `:` (`- button "Reset
 // password" [ref=e7]`, `- heading "Password" [level=2]`) is not a value pair and survives, as do
 // benign names (`- textbox "Username" [ref=e3]: bob`). Pair-shaped prose follows the same predicate
-// as JSON scrubbing, which deliberately over-redacts: `sessions=3`, `cookies=2`, `apiKeys=1` and
+// as JSON scrubbing, which deliberately over-redacts by default: `sessions=3`, `cookies=2`, `apiKeys=1` and
 // `Total session count: 42` go, `tokenizer: on` and `Password reset link sent` (no pair shape)
 // survive. Quoted keys and values follow the same rule, with the quotes kept: `password="hunter2"`
 // becomes `password="<redacted>"`, and `{"token": "abc"}` loses `abc` too. A JSON `{"name": ...,
 // "value": ...}` entry whose name is credential-named (`{"name":"authToken","value":"abc"}`, a
 // storage state's `localStorage` item) loses its value the same way.
+// Exempt names match a trailing run of space-separated words only after allowlisted count
+// words and an unambiguous key boundary. Leaf pair values survive; objects and arrays,
+// name/value entries, URL query parameters and token-format values keep their usual scrubs.
 const KEY_CHAR = /[A-Za-z0-9_.\/-]/;
 
 // The form-control line of a snapshot: a role in lower case, the accessible name quoted (a `\"`
@@ -209,14 +288,15 @@ const VALUE_FIRST = new RegExp(`("value"\\s*:\\s*")((?:[^"\\\\\\n]|\\\\.)*)("\\s
 
 /**
  * @param {string} text
+ * @param {ReadonlySet<string>} [exempt] Lower-case names matched against trailing page-key words.
  * @returns {string}
  */
-export function redactPairs(text) {
+export function redactPairs(text, exempt) {
   text = text
     .replace(NAME_FIRST, (pair, head, name, value, tail) => (credentialNamed(name) ? `${head}<redacted>${tail}` : pair))
     .replace(VALUE_FIRST, (pair, head, value, tail, name) => (credentialNamed(name) ? `${head}<redacted>${tail}` : pair));
   text = text.replace(CONTROL_LINE, (line, prefix, quoted, name, attrs, colon, value) => {
-    if (!credentialNamed(name) || !value.trim()) return line;
+    if (!credentialNamed(name) || !value.trim() || exemptPageKey(name, exempt)) return line;
     return `${prefix}${quoted}${attrs}${colon} <redacted>`;
   });
   let out = "";
@@ -229,7 +309,29 @@ export function redactPairs(text) {
     let start = sep;
     while (start > at && (text[start - 1] === " " || text[start - 1] === "\t")) start--;
     let key = start;
-    while (key > at && (KEY_CHAR.test(text[key - 1]) || text[key - 1] === " ")) key--;
+    let keyAtLineStart = false;
+    let exemptBoundary = false;
+    for (;;) {
+      if (key === at || text[key - 1] === "\n") {
+        // Mid-line, the scan resumes after an earlier separator (`Access: token: abc`), which may qualify the key.
+        keyAtLineStart = exemptBoundary = key === 0 || text[key - 1] === "\n";
+        break;
+      }
+      const previous = text[key - 1];
+      if (KEY_CHAR.test(previous) || previous === " ") {
+        key--;
+        continue;
+      }
+      if (/\s/.test(previous) || previous === "|") {
+        // Non-plain gaps are allowed only as indentation, never inside a label's word run.
+        let indent = key - 1;
+        while (indent > at && text[indent - 1] !== "\n" && /\s/.test(text[indent - 1])) indent--;
+        keyAtLineStart = exemptBoundary = indent === 0 || text[indent - 1] === "\n";
+      } else {
+        exemptBoundary = /[([{"']/.test(previous);
+      }
+      break;
+    }
     let named = text.slice(key, start).trim();
     // A quoted key is a key too: JSON's `"token": "abc"`.
     if (!named && start > at && (text[start - 1] === '"' || text[start - 1] === "'")) {
@@ -245,8 +347,24 @@ export function redactPairs(text) {
     }
     let value = sep + 1;
     while (value < text.length && (text[value] === " " || text[value] === "\t")) value++;
+    const pageKey = keyAtLineStart && named.startsWith("- ") ? named.slice(2).trimStart() : named;
+    const exemptPair = exemptBoundary && exemptPageKey(pageKey, exempt);
+    if (exemptPair && text[value] !== "{" && text[value] !== "[") {
+      // Keep scanning inside the leaf: a nested password pair or URL still needs its scrub.
+      out += text.slice(at, sep + 1);
+      at = sep + 1;
+      continue;
+    }
     const nl = text.indexOf("\n", sep + 1);
     const lineEnd = nl === -1 ? text.length : nl;
+    // An unquoted `true`, `false` or `null` is kept: as a `=` value's whole run, or as a `:` value
+    // ending its line or its JSON member (`"remember_token": null,`). `password: true story` still goes.
+    const past = literalEnd(text.slice(0, lineEnd), value, text[sep] === "=" ? RUN_END : MEMBER_END);
+    if (past !== -1) {
+      out += text.slice(at, past);
+      at = past;
+      continue;
+    }
     // A quoted value is scrubbed inside its quotes, which stay: `password="hunter2"`.
     if (value < lineEnd && (text[value] === '"' || text[value] === "'")) {
       const quote = text[value];
@@ -273,6 +391,179 @@ export function redactPairs(text) {
   }
 }
 
+// The index just past the JSON string that opens at `at`, or the text's end when the cut fell inside it.
+/**
+ * @param {string} text
+ * @param {number} at
+ * @returns {number}
+ */
+function jsonStringEnd(text, at) {
+  let j = at + 1;
+  while (j < text.length && text[j] !== '"') j += text[j] === "\\" ? 2 : 1;
+  return Math.min(j + 1, text.length);
+}
+
+// A cut JSON body closed so it parses: everything up to the last whole member, then the closers its
+// open containers need. `undefined` when it does not open as JSON or still does not parse.
+/**
+ * @param {string} text
+ * @returns {unknown}
+ */
+function closedJson(text) {
+  const start = text.search(/\S/);
+  if (start === -1 || (text[start] !== "{" && text[start] !== "[")) return undefined;
+  const { safe } = scanJson(text, start, text.length);
+  const tail = scanJson(text, start, safe).closers.toReversed().join("");
+  try {
+    return JSON.parse(text.slice(start, safe) + tail);
+  } catch {
+    return undefined;
+  }
+}
+
+// From `start` to `end` (or the top container's close): the closers still open at `end`, and the last
+// index (`safe`) the text can be cut at to keep only whole members.
+/**
+ * @param {string} text
+ * @param {number} start
+ * @param {number} end
+ * @returns {{ closers: string[], safe: number }}
+ */
+function scanJson(text, start, end) {
+  /** @type {string[]} */
+  const closers = [];
+  let safe = start;
+  for (let i = start; i < end && (i === start || closers.length > 0); ) {
+    const c = text[i];
+    if (c === '"') {
+      i = jsonStringEnd(text, i);
+      continue;
+    }
+    if (c === "{" || c === "[") closers.push(c === "{" ? "}" : "]");
+    else if (c === "}" || c === "]") closers.pop();
+    if ("{[}],".includes(c)) safe = c === "," ? i : i + 1;
+    i++;
+  }
+  return { closers, safe };
+}
+
+// A response body cut at the return limit, redacted as a parsed one is: closed and given to
+// `redactValue` when it opens as JSON, so every rule (credential-named subtrees, a credential `name`'s
+// `value`) holds at any depth; otherwise the structural text scrub, then the page scrub.
+/**
+ * @param {string} text
+ * @param {ReadonlySet<string>} [exempt] Exact lower-case JSON body keys whose leaf values are kept.
+ * @returns {unknown}
+ */
+export function redactCutBody(text, exempt) {
+  const closed = closedJson(text);
+  if (closed !== undefined) return redactValue(closed, exempt);
+  // Protect only already-scrubbed JSON leaves from the page scrub's credential pair rules.
+  let prefix = "__qa_leaf_";
+  while (text.includes(prefix)) prefix += "_";
+  /** @type {string[]} */
+  const leaves = [];
+  const masked = cutJson(text, exempt, (leaf) => {
+    const marker = `${prefix}${leaves.length}__`;
+    leaves.push(leaf);
+    return marker;
+  });
+  let out = redactPageText(masked, exempt);
+  for (const [i, leaf] of leaves.entries()) out = out.replaceAll(`${prefix}${i}__`, () => leaf);
+  return out;
+}
+
+// JSON text that may stop anywhere (a response body cut before it parsed), with the whole value of
+// every credential-named key replaced by `"<redacted>"`, at any depth: a nested object or array to its
+// matching close, or to the end of the text when the cut fell inside it. `redactValue` does the same
+// to a parsed body; the line-based `redactPairs` would keep a nested subtree's children.
+/**
+ * @param {string} text
+ * @param {ReadonlySet<string>} [exempt] Exact lower-case JSON body keys whose leaf values are kept.
+ * @returns {string}
+ */
+export function redactCutJson(text, exempt) {
+  return cutJson(text, exempt, (leaf) => leaf);
+}
+
+/**
+ * @param {string} text
+ * @param {ReadonlySet<string> | undefined} exempt
+ * @param {(leaf: string) => string} keepLeaf
+ * @returns {string}
+ */
+function cutJson(text, exempt, keepLeaf) {
+  const n = text.length;
+  const stringEnd = (/** @type {number} */ at) => jsonStringEnd(text, at);
+  const skipSpace = (/** @type {number} */ at) => {
+    while (at < n && /\s/.test(text[at])) at++;
+    return at;
+  };
+  const valueEnd = (/** @type {number} */ at) => {
+    if (text[at] === '"') return stringEnd(at);
+    if (text[at] !== "{" && text[at] !== "[") {
+      while (at < n && !/[,}\]\s]/.test(text[at])) at++;
+      return at;
+    }
+    let depth = 0;
+    for (let j = at; j < n; ) {
+      const c = text[j];
+      if (c === '"') {
+        j = stringEnd(j);
+        continue;
+      }
+      if (c === "{" || c === "[") depth++;
+      else if ((c === "}" || c === "]") && --depth === 0) return j + 1;
+      j++;
+    }
+    return n;
+  };
+  let out = "";
+  let at = 0;
+  for (;;) {
+    const open = text.indexOf('"', at);
+    if (open === -1) return out + text.slice(at);
+    const keyEnd = stringEnd(open);
+    const colon = skipSpace(keyEnd);
+    let key = text.slice(open + 1, keyEnd - 1);
+    try {
+      key = JSON.parse(text.slice(open, keyEnd));
+    } catch {
+      // A key the cut fell inside, or a bad escape, is judged as its raw text.
+    }
+    // A string that is not a key (no colon follows) is a value, passed through as it is.
+    if (text[colon] !== ":" || !credentialNamed(key)) {
+      out += text.slice(at, keyEnd);
+      at = keyEnd;
+      continue;
+    }
+    const valueStart = skipSpace(colon + 1);
+    const end = valueEnd(valueStart);
+    // A cheap name check first, so a redacted subtree is never parsed.
+    if (exempt?.has(key.toLowerCase()) && CUT_MEMBER_END.test(text.slice(end))) {
+      try {
+        const leaf = JSON.parse(text.slice(valueStart, end));
+        if (exemptLeaf(key, leaf, exempt)) {
+          out += text.slice(at, open) + keepLeaf(`${text.slice(open, valueStart)}${JSON.stringify(redactValue(leaf))}`);
+          at = end;
+          continue;
+        }
+      } catch {
+        // An incomplete leaf has no value safe to keep.
+      }
+    }
+    // A boolean or null is kept, as `redactValue` keeps it; a literal the cut fell inside goes.
+    const past = literalEnd(text, valueStart, CUT_MEMBER_END);
+    if (past !== -1) {
+      out += text.slice(at, past);
+      at = past;
+      continue;
+    }
+    out += `${text.slice(at, valueStart)}"<redacted>"`;
+    at = end;
+  }
+}
+
 // The URL queries of every http(s) URL in `text`, scrubbed like a page URL or a `Location` is: the
 // match runs through the query, so a percent-encoded name (`access%5Ftoken`) is decoded and judged.
 const URL_QUERY = /https?:\/\/[^\s<>`"']*/g;
@@ -286,9 +577,10 @@ export const redactQueryText = (text) => text.replace(URL_QUERY, (url) => redact
  * What the Tester shows of a page as text: pairs first, then the URLs in it, then the whole-form
  * redaction a response body gets.
  * @param {string} text
+ * @param {ReadonlySet<string>} [exempt] Lower-case names matched against trailing page-key words.
  * @returns {string}
  */
-export const redactPageText = (text) => redactCredentials(redactQueryText(redactPairs(text)));
+export const redactPageText = (text, exempt) => redactCredentials(redactQueryText(redactPairs(text, exempt)));
 
 // The two scrub strengths an outward text uses. The record strength redacts known credential shapes
 // and cuts URL queries, leaving ordinary page pairs alone; the page strength also redacts
@@ -317,7 +609,7 @@ export function scrubPageText(text) {
 // This scrubbing covers only what the Tester returns (its text, a page URL, a request's `Location`)
 // and the surfaces it writes (saved responses, guard logs) — read on before promising more. It does
 // not reach the raw artifacts `playwright-cli` writes by itself, which `Read` may admit whole: the
-// session's earlier page snapshots (`report.md` and the `.playwright-cli/` directory's `page-*.yml`
+// session's earlier page snapshots (`tester.report.md` and the `.playwright-cli/` directory's `page-*.yml`
 // snapshot files, screenshots and trace files), the CLI's own logs, and anything else under the
 // Execution dir the Tester never passes through here. Values visible in those files are not
 // scrubbed; the support document's data-handling statement must list them as excluded.

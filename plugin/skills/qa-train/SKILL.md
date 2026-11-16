@@ -33,7 +33,7 @@ A Practice that contradicts an Invariant is void.
 
 - **Run it yourself, in this conversation.** The gate is a dialogue with the engineer, so never
   hand it to a Delegate or a background worker.
-- **Write exactly one file**: `.qa/train/<target>.md`, and only through the gate (§2). For Access, the sole exception is an explicitly approved `.gitignore` line, appended as a second write after the training file.
+- **Write exactly one file**: `.qa/train/<target>.md`, and only through the gate (§2). For Access, the sole exception is an explicitly approved `.gitignore` line, appended as a second write after the training file by `train auth-ignore`. The CLI's `auth_template` goes in the same gate write.
 - **Write only a draft that passes `train check`.**
 - **Training makes no claim about the system under test.** That is a Rule, and Rules enter only
   through `/qa-deep-dive`. Never soften a claim into "style" or a "practice" to get it past the gate.
@@ -45,7 +45,8 @@ A Practice that contradicts an Invariant is void.
 - **A credential lives outside `.qa/`'s committed files.** A Practice or Access note names the env
   var, connector, CLI, or git-ignored login-state or password file that carries it; never ask for a credential,
   and never write one.
-- **Never stage or commit.** A dirty working tree is fine.
+- **Never run git to stage or commit yourself.** The commit follows the project's Commit mode through
+  `scan.mjs commit` (ADR-0062), never retried with `--no-verify`. A dirty working tree is fine.
 
 ## Arguments
 
@@ -58,13 +59,14 @@ first argument on that list is always the target, never a scenario key. Each run
 - **`/qa-train design`, alone**: a conversation run on design's file, learning Practices for
   `/qa-design` and any Convention the engineer dictates. It is **not** bare `/qa-train`: it reads no
   scenario changes. Read [the Practices reference](references/practices.md) for §1; it says when to
-  open the Conventions reference too.
+  open the Conventions reference too. Route layer/speed entries to `/qa-train execute` or
+  `/qa-train codegen`, and re-check existing entries.
 - **`/qa-train <command>`** (`deep-dive`, `sync`, `init`, `impact`, `publish`, `next`, `ask`): learns that command's
   Practices. Read [the Practices reference](references/practices.md) for §1.
 - **`/qa-train access`** (Access notes): learns how to reach References behind a login, and the
-  application `observe:` and `/qa-execute` drive, one test account per Role. Read
-  [the Access reference](references/access.md) for §1 and for what is specific to access in §2 and
-  §3.
+  application `observe:` and `/qa-execute` drive, one login or signed-out session per Role. Read
+  [the Access reference](references/access.md) for §1 and for what is specific to access in §2 to
+  §4.
 - **`/qa-train execute`**: learns Practices, data recipes, API actions, upload fixtures and a setup
   Role for operating the app. Read [the Execute reference](references/execute.md) for §1 and its
   additions to §2 and §3, including execute's entry shapes and frontmatter.
@@ -90,6 +92,8 @@ directory:
 node <this skill's directory>/../../scripts/scan.mjs train <action> ... [--root <qa-dir>]
 ```
 
+Commands that read input take it from a file: write it outside the repository (the run dir or your scratch directory) and pass its absolute path as `--input <file>`. Run each command as one plain `node` line, with no pipe, heredoc, `&&` or `;` chain, variable prefix or `cd`.
+
 `--root` defaults to `./.qa`, so run it from the repository root. Each call prints one JSON object
 on stdout. Read it, and never re-derive its results by grep or prose.
 
@@ -101,8 +105,8 @@ on stdout. Read it, and never re-derive its results by grep or prose.
 | `evidence <target>` | the target's training alone (`source: target`) |
 | `evidence codegen --from-code [<path>...] [--relearn [--facet <facet>]]` | the sample, corpus summary and gate signals from the project's test code (`source: code`) |
 | `evidence categories` | the shared file's extension `categories` in walk order and its `retired` keys |
-| `check [<target>] --stdin` | the drafted file: `check-file`, the entries it adds, edits and removes (`conventions` and `practices`, or `access_notes` for `access`), the `statability` hits; when `ok`, the `changeset` and `commit`, and for `access` the `access_files` report |
-| `check categories [--stdin]` | the categories draft: its `errors`, the floor plus the `effective` list, the `categories` added, edited and removed, the `statability` hits; when `ok`, the `changeset` and `commit` |
+| `check [<target>] --input <file>` | the drafted file: `check-file`, the entries it adds, edits and removes (`conventions` and `practices`, or `access_notes` for `access`), the `statability` hits; when `ok`, the `changeset` and `commit`, and for `access` the `access_files` report |
+| `check categories [--input <file>]` | the categories draft: its `errors`, the floor plus the `effective` list, the `categories` added, edited and removed, the `statability` hits; when `ok`, the `changeset` and `commit` |
 
 Every `evidence` also returns `train` (the target's file, whether it `exists`, its entries with
 their `sources` and `added`: `conventions` and `practices`, `access_notes` for `access`, or
@@ -175,9 +179,9 @@ added: <YYYY-MM-DD, today>
 ```
 ````
 
-- The frontmatter is `type: train` and `key: <target>`; execute may also carry `setup_role` and
+- Frontmatter: `type: train` and `key: <target>`; execute also allows `setup_role`, `redaction_exempt` and
   `automation_retries`, codegen may also carry `pr`, `trained_stacks`, `codegen_repeats` and
-  `codegen_attempts`, and categories may also carry `retired`.
+  `codegen_attempts` and `approaches`, and categories may also carry `retired`.
 - A `cnv_` entry takes the same shape and goes in `design` or `codegen` only; codegen's also carries
   `stack`, `facet`, and optional `refs` and `signal`, as its reference says. An `acc_` entry's
   shape is in the Access reference, and goes in `access` only. A categories draft is the whole
@@ -185,7 +189,7 @@ added: <YYYY-MM-DD, today>
 - Only the first `yaml` fence after a heading is metadata. Every later fence is an example.
 - Leave every entry the engineer did not change exactly as it was.
 
-Pipe the draft into `train check <target> --stdin`:
+Pass the draft to `train check <target> --input <file>`:
 
 - **`ok: false`**: fix every `errors` entry and check again.
 - **`statability`** hits (Conventions only) are settled as the Conventions reference says.
@@ -202,5 +206,4 @@ Print, in this order:
 3. When the conversation taught other targets, the next runs: one `/qa-train <target>` line each,
    with what it would learn (`/qa-train access` when it showed how a Reference was reached). Each
    is its own run: offer the first and, on yes, invoke it.
-4. The `changeset` and the suggested `commit`, as
-   a command for the engineer to run from the repository root.
+4. The `changeset` and its commit, made as [the commit reference](../references/commit.md) says.

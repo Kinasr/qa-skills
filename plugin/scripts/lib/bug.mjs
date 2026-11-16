@@ -19,8 +19,9 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, w
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { execFileSync } from "node:child_process";
 import { noArguments, orThrow, requireOption, UsageError } from "./cli.mjs";
-import { casePreconditions, caseSteps } from "./case-fields.mjs";
-import { latestExecutionResults } from "./execution-results.mjs";
+import { caseLevels, casePreconditions, caseSteps } from "./case-fields.mjs";
+import { caseOutcome } from "./case-outcome.mjs";
+import { latestCaseOutcomes } from "./execution-results.mjs";
 import { scrubRecordText } from "./credentials.mjs";
 import { readPlan, scrubber } from "./execute-blocks.mjs";
 import { fixWorkRemains } from "./follow-ups.mjs";
@@ -59,11 +60,15 @@ import { digests } from "./pin-digest.mjs";
  *   data: Record<string, unknown> & {
  *     result?: string,
  *     roles?: string[],
+ *     routes?: string[],
  *     reached?: number,
  *     preconditions?: Array<{ text?: string, status?: string, how?: string }>,
  *     automation?: Array<{ id?: string, result?: string, reason?: string, diagnostics?: string[] }>,
  *   },
  *   prose: Array<{ text: string }>,
+ *   sections?: Array<{ kind: import("./case-sections.mjs").CaseSectionKind, line: number, end: number, text: string }>,
+ *   levels?: RecordBlock[],
+ *   outcome?: import("./case-outcome.mjs").CaseOutcome,
  * }} RecordBlock
  */
 
@@ -130,6 +135,13 @@ const { stop } = refusalsFor({
 });
 
 const DAY = (/** @type {Date} */ d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+
+/**
+ * The strings in a list value, in order.
+ * @param {unknown} value
+ * @returns {string[]}
+ */
+const strings = (value) => Array.isArray(value) ? /** @type {string[]} */ (value.filter((v) => typeof v === "string")) : [];
 
 /**
  * A refusal whose one factual line names the Key or the command the engineer needs.
@@ -213,19 +225,40 @@ function recordRel(rel) {
  * @param {string} root the `.qa/` directory
  * @param {string} rel the record's repository-relative path
  * @param {string} key
+ * @param {string} digest
  * @returns {RecordBlock | null}
  */
-function recordBlock(root, rel, key) {
+function recordBlock(root, rel, key, digest) {
   const path = join(root, recordRel(rel));
   if (!existsSync(path)) return null;
   try {
     const file = parse(recordRel(rel), readFileSync(path, "utf8"));
     if (file.type !== "execution") return null;
-    const entry = file.executions.find((candidate) => candidate.key === key);
-    return entry ? /** @type {RecordBlock} */ (entry) : null;
+    return caseRecordBlock(file, key, digest);
   } catch {
     return null;
   }
+}
+
+/**
+ * Read the whole case claim in one Run, preserving each level's observations for the Bug draft.
+ * @param {ParsedFile} file
+ * @param {string} key
+ * @param {string} digest
+ * @returns {RecordBlock | null}
+ */
+function caseRecordBlock(file, key, digest) {
+  const entries = file.executions.filter((e) => e.key === key && e.data.digest === digest);
+  if (!entries.length) return null;
+  const identity = { key, digest, run: String(file.data.run), target: String(file.data.target) };
+  const outcome = caseOutcome(identity, caseLevels({ level: entries[0].data.bound_levels }), entries.map((e) => ({
+    ...identity, level: /** @type {string | undefined} */ (e.data.level),
+    result: /** @type {string | undefined} */ (e.data.result),
+    automation: /** @type {Array<{ result?: string }> | undefined} */ (e.data.automation),
+  })));
+  const representative = entries.find((e) => e.data.result === outcome.result) ?? entries[0];
+  return { .../** @type {RecordBlock} */ (representative), outcome,
+    ...(entries.length > 1 && { levels: /** @type {RecordBlock[]} */ (entries) }) };
 }
 
 /**
@@ -241,7 +274,8 @@ function pinnedCase(ex) {
 }
 
 /**
- * A record block's prose, by its bold label. The folded element evidence stays inside `Trace`.
+ * A record block's prose, by its bold label. A fenced line is never prose, so a section that folds
+ * one is read by `traceSection` instead.
  * @param {RecordBlock} block
  * @returns {Map<string, string>}
  */
@@ -294,6 +328,10 @@ function stepLines(entry, block) {
 function actualText(block, sections, item) {
   /** @type {string[]} */
   const parts = [];
+  if (block.levels) return block.levels.map((level) => {
+    const observed = proseSections(level);
+    return `${level.data.level}: ${level.data.result ?? 'Automation evidence'}${observed.size ? `\n${actualText(level, observed, item)}` : ''}`;
+  }).join("\n\n");
   const seen = sections.get("seen");
   const why = sections.get("why");
   if (seen) parts.push(seen);
@@ -306,6 +344,21 @@ function actualText(block, sections, item) {
 }
 
 /**
+ * A record block's `Trace` section with its fenced lines kept, the folded Element evidence included.
+ * The block's prose leaves every fenced line out, so the evidence is only here.
+ * @param {RecordBlock} block
+ * @returns {string | undefined}
+ */
+function traceSection(block) {
+  for (const section of block.sections ?? []) {
+    const [first, ...rest] = section.text.split("\n");
+    const label = /^\*\*([^*]+?)\.\*\*\s*/.exec(first);
+    if (label && label[1].toLowerCase() === "trace") return [first.slice(label[0].length), ...rest].join("\n").trim();
+  }
+  return undefined;
+}
+
+/**
  * The Evidence section, only when an Execution ran: the record's Evidence, Trace and the folded
  * Element evidence.
  * @param {RecordBlock} block
@@ -313,9 +366,26 @@ function actualText(block, sections, item) {
  * @returns {string[]}
  */
 function evidenceText(block, sections) {
+  if (block.levels) return block.levels.flatMap((level) => evidenceText(level, proseSections(level)).map((text) => `${level.data.level}:\n${text}`));
   if (block.data.result === undefined) return [];
-  const parts = [sections.get("evidence"), sections.get("trace")].filter((part) => typeof part === "string" && part !== "");
+  const parts = [sections.get("evidence"), traceSection(block)].filter((part) => typeof part === "string" && part !== "");
   return parts.length ? parts.map(String) : [];
+}
+
+/**
+ * The routes the record's blocks mocked, each level in record order, so a developer sees every
+ * route/unroute sequence and never chases a mock as the server. A case that ran at several levels
+ * labels each level's routes, so one level's mocks cannot read as another's.
+ * @param {RecordBlock} block
+ * @returns {string[]}
+ */
+function mockedResponses(block) {
+  if (!block.levels) return strings(block.data.routes);
+  return block.levels.flatMap((level) => {
+    const routes = strings(level.data.routes);
+    const label = typeof level.data.level === "string" && level.data.level ? `${level.data.level}: ` : "";
+    return routes.map((route) => `${label}${route}`);
+  });
 }
 
 /**
@@ -329,10 +399,12 @@ function evidenceText(block, sections) {
  */
 function environmentLines(block, ex, state, plan, item) {
   const roles = Array.isArray(block.data.roles) ? block.data.roles : ex.roles ?? [];
-  const automations = (block.data.automation ?? []).map((entry) => `${entry.id} ${entry.result}${entry.reason ? `: ${entry.reason}` : ""}`);
+  const automations = (block.levels ?? [block]).flatMap((level) =>
+    (level.data.automation ?? []).map((entry) => `${entry.id} ${entry.result}${entry.reason ? `: ${entry.reason}` : ""}`));
   const recorded = automations.length ? automations : item.automations.map((id) => `${id} (no result recorded)`);
   return [
     `- Target: ${state.target.slug}`,
+    ...(block.outcome?.failing_levels.length ? [`- Failing levels: ${block.outcome.failing_levels.join(", ")}`] : []),
     `- Roles: ${roles.length ? roles.join(", ") : "none"}`,
     `- Commit: ${state.commit}`,
     `- Browser: ${plan?.playwright_cli ?? "not recorded"}`,
@@ -350,11 +422,12 @@ function environmentLines(block, ex, state, plan, item) {
  *   expected: string,
  *   actual: string,
  *   evidence: string[],
+ *   mocked: string[],
  *   environment: string[],
  * }} sections
  * @returns {string}
  */
-export function draftBody(key, summary, description, { steps, expected, actual, evidence, environment }) {
+export function draftBody(key, summary, description, { steps, expected, actual, evidence, mocked, environment }) {
   /** @type {string[]} */
   const lines = [`# ${key}: ${summary}`, ""];
   if (description.length) lines.push("**Description.**", ...description, "");
@@ -362,6 +435,7 @@ export function draftBody(key, summary, description, { steps, expected, actual, 
   lines.push("**Expected.**", expected || "The case's Expected-result paragraph did not hold.", "");
   lines.push("**Actual.**", actual, "");
   if (evidence.length) lines.push("**Evidence.**", ...evidence, "");
+  if (mocked.length) lines.push("**Mocked responses.**", ...mocked.map((route) => `- ${route}`), "");
   lines.push("**Environment.**", ...environment);
   return `${lines.join("\n").replace(/\n+$/, "")}\n`;
 }
@@ -385,7 +459,8 @@ function draftText({ key, summary, description, item, ex, block, state, plan, re
   const entry = pinnedCase(ex);
   const sections = proseSections(block);
   const roles = Array.isArray(block.data.roles) ? block.data.roles : ex.roles ?? [];
-  const automations = item.automations.length ? item.automations : (block.data.automation ?? []).flatMap((entry) => entry.id ? [entry.id] : []);
+  const automations = item.automations.length ? item.automations : (block.levels ?? [block]).flatMap((level) =>
+    (level.data.automation ?? []).flatMap((entry) => entry.id ? [entry.id] : []));
   /** @type {BugFrontmatter} */
   const front = {
     type: "bug", key, status: "draft", case: item.case, feature: ex.feature, case_digest: ex.digest,
@@ -405,6 +480,7 @@ function draftText({ key, summary, description, item, ex, block, state, plan, re
     expected: sections.get("expected") ?? "",
     actual: actualText(block, sections, item),
     evidence: evidenceText(block, sections),
+    mocked: mockedResponses(block),
     environment: environmentLines(block, ex, state, plan, item),
   });
   return ["---", ...frontLines, "---", "", body].join("\n");
@@ -463,8 +539,16 @@ function imagePath(value) {
  * @returns {string[]}
  */
 export function attachableScreenshots(runDir, plan, key) {
-  const ex = plan?.executions.find((candidate) => candidate.key === key);
-  if (!ex) return [];
+  return [...new Set((plan?.executions ?? []).filter((ex) => ex.key === key).flatMap((ex) => executionScreenshots(runDir, ex)))];
+}
+
+/**
+ * Attachments observed by one level's Execution.
+ * @param {string} runDir
+ * @param {BugExecution} ex
+ * @returns {string[]}
+ */
+function executionScreenshots(runDir, ex) {
   const execDir = join(runDir, "executions", ex.id);
   /** @type {{ login_sessions?: string[], log?: Array<Record<string, unknown>> } | null} */
   let guard = null;
@@ -587,7 +671,7 @@ function caseContext(state, plan, item, root) {
     if (item.route === "fix-handoff") return { ex, block: { key: item.case, summary: ex.summary, data: {}, prose: [] } };
     return { refusal: stop("no_record", { case: item.case }) };
   }
-  const block = recordBlock(root, state.record, item.case);
+  const block = recordBlock(root, state.record, item.case, ex.digest);
   if (!block) return { refusal: stop("no_case_block", { case: item.case, record: state.record }) };
   return { ex, block };
 }
@@ -633,16 +717,18 @@ function standaloneContext(key, root, cause) {
     item = { id: `bug_${key}`, kind: "bug", case: key, automations: [], route: "fix-handoff", state: "pending", app_cause: String(cause).trim() };
     plan = { executions: [ex] };
   } else {
-    const latest = latestExecutionResults(files, index).get(key);
+    const latest = latestCaseOutcomes(files, index).get(key);
     if (!latest || latest.result !== "failed") return { refusal: stop("no_latest_failure", { case: key, result: latest?.result }) };
     const record = files.find((file) => file.rel === latest.file && file.type === "execution");
-    const recordEntry = record?.executions?.find((candidate) => candidate.key === key);
+    const recordedKey = record?.executions.find((candidate) => candidate.line === latest.line)?.key;
+    const recordEntry = record && recordedKey ? caseRecordBlock(record, recordedKey, String(latest.digest)) : null;
     if (!record || !recordEntry) return { refusal: stop("no_latest_failure", { case: key }) };
     const runId = String(record.data.run);
     state = { run: runId, commit: String(record.data?.commit), target: { slug: String(record.data?.target), origin: "" }, record: latest.file, created_at: now, dirty: [], items: [], unresolved: [], suppressed: [] };
     ex = { key, summary: String(declarations[0].entry.summary ?? ""), feature: String(feature), text, digest: String(recordEntry.data.digest ?? digest), roles: Array.isArray(recordEntry.data.roles) ? recordEntry.data.roles : [], id: "standalone" };
     block = /** @type {RecordBlock} */ (recordEntry);
-    const automations = (block.data.automation ?? []).flatMap((entry) => entry.id ? [entry.id] : []);
+    const automations = [...new Set((block.levels ?? [block]).flatMap((level) =>
+      (level.data.automation ?? []).flatMap((entry) => entry.id ? [entry.id] : [])))];
     item = { id: `bug_${key}`, kind: "bug", case: key, automations, route: "execution-failed", state: "pending" };
     plan = { executions: [ex] };
   }

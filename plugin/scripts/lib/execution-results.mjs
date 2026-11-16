@@ -1,7 +1,8 @@
 // @ts-check
 // The latest Execution result of each live case, read from every Execution record in the
 // working tree, committed or not. `/qa-next` shows these as information and `train evidence
-// execute` mines them, so both read through `latestExecutionResults`.
+// execute` mines them, so both read through `latestExecutionResults`; `/qa-next` and standalone
+// bug drafting read the per-level Case outcome through `latestCaseOutcomes`.
 //
 // A block's key resolves to a live case by its exact key, else through a case's `formerly:`. A key
 // a Feature retired (a Merge loser, a deleted case) and a key nothing holds are ignored, and so is
@@ -14,6 +15,7 @@
  * @import { KeyIndex, CaseDecl } from "./qa-index.mjs"
  * @import { PinDigests } from "./pin-digest.mjs"
  */
+import { caseOutcome } from "./case-outcome.mjs";
 import { checkExecution } from "./check-file.mjs";
 import { digests } from "./pin-digest.mjs";
 
@@ -208,4 +210,109 @@ export function latestAutomationResults(files, index) {
     });
   }
   return results;
+}
+
+/**
+ * Latest Case outcome for each live case. Each projection reads only one record (one Run and
+ * Application target) and one claim digest. Legacy level-less records remain readable.
+ * @param {readonly (ParsedFile & { unreadable?: unknown })[]} files
+ * @param {KeyIndex} index
+ * @returns {Map<string, ExecutionResult & import("./case-outcome.mjs").CaseOutcome>}
+ */
+export function latestCaseOutcomes(files, index) {
+  const latest = latestBlocks(files, index, (data) => data.result !== undefined || Array.isArray(data.automation));
+  const current = digests(files);
+  /** @type {Map<string, ExecutionResult & import("./case-outcome.mjs").CaseOutcome>} */
+  const results = new Map();
+  for (const [key, declarations] of index.cases) {
+    const hit = latest.get(key);
+    if (!hit) continue;
+    const { file, entry } = hit;
+    const identity = { key, run: String(file.data.run), target: String(file.data.target), digest: String(entry.data.digest) };
+    const entries = file.executions.filter((e) => e.key === entry.key && e.data.digest === entry.data.digest);
+    const outcome = caseOutcome(identity, strings(entry.data.bound_levels), entries.map((e) => ({
+      ...identity, level: /** @type {string | undefined} */ (e.data.level),
+      result: /** @type {string | undefined} */ (e.data.result),
+      automation: /** @type {Array<{ result?: string }> | undefined} */ (e.data.automation),
+    })));
+    const representative = entries.find((e) => e.data.result === outcome.result) ?? entry;
+    const d = representative.data;
+    results.set(key, {
+      key, feature: declarations[0].feature, summary: declarations[0].entry.summary, ...outcome,
+      ...(typeof d.reason === "string" && { reason: d.reason }),
+      executed_at: String(file.data.executed_at), date: String(file.data.executed_at).slice(0, 10),
+      target: file.data.target, digest: d.digest, out_of_date: d.digest !== current.review(key),
+      ...(d.at_login === true && { at_login: /** @type {true} */ (true) }),
+      ...(Array.isArray(d.interpretations) && { interpretations: d.interpretations }),
+      ...(Array.isArray(d.preconditions) && { preconditions: d.preconditions }),
+      why: outcome.result === "blocked" ? whyOf(representative) : null,
+      file: file.rel, line: representative.line,
+    });
+  }
+  return results;
+}
+
+/**
+ * Latest failed or blocked Execution result per level for each live case.
+ * @typedef {{ level: string, result: "failed" | "blocked", reason?: string }} LevelFailure
+ */
+
+/**
+ * @param {readonly (ParsedFile | import("./knowledge-file.mjs").UnreadableFile)[]} files
+ * @param {{ cases: ReadonlyMap<string, ReadonlyArray<{ entry?: { data: Record<string, unknown> } }>> }} index
+ * @param {string | null} [defaultLevel]
+ * @returns {Map<string, LevelFailure[]>}
+ */
+export function latestLevelFailures(files, index, defaultLevel = null) {
+  const retired = new Set(files.flatMap((f) => !("unreadable" in f && f.unreadable) && f.type === "feature" ? strings(f.data.retired) : []));
+  const former = new Map();
+  for (const [key, declarations] of index.cases) {
+    for (const old of strings(declarations[0]?.entry?.data.formerly)) {
+      if (!former.has(old)) former.set(old, new Set());
+      former.get(old).add(key);
+    }
+  }
+  /** @param {string} key */
+  const resolve = (key) => {
+    if (index.cases.has(key)) return { key, exact: 1 };
+    if (retired.has(key)) return null;
+    const successors = former.get(key);
+    return successors?.size === 1 ? { key: [...successors][0], exact: 0 } : null;
+  };
+  /** @type {Map<string, Map<string, { rank: (number | string)[], entry: ParsedEntry }>>} */
+  const latest = new Map();
+  for (const file of files) {
+    if (("unreadable" in file && file.unreadable) || file.type !== "execution" || !checkExecution(file).ok) continue;
+    const at = Date.parse(/** @type {string} */ (file.data.executed_at));
+    for (const entry of file.executions) {
+      if (entry.data.result === undefined) continue;
+      const level = typeof entry.data.level === "string" ? entry.data.level : defaultLevel;
+      if (!level) continue;
+      const found = resolve(entry.key);
+      if (!found) continue;
+      const rank = [at, file.rel, found.exact, entry.line];
+      let byLevel = latest.get(found.key);
+      if (!byLevel) {
+        byLevel = new Map();
+        latest.set(found.key, byLevel);
+      }
+      const before = byLevel.get(level);
+      if (before && !later(rank, before.rank)) continue;
+      byLevel.set(level, { rank, entry });
+    }
+  }
+  /** @type {Map<string, LevelFailure[]>} */
+  const out = new Map();
+  for (const [key, byLevel] of latest) {
+    /** @type {LevelFailure[]} */
+    const failures = [];
+    for (const [level, { entry }] of byLevel) {
+      const r = entry.data.result;
+      if (r === "failed" || r === "blocked") {
+        failures.push({ level, result: r, ...(typeof entry.data.reason === "string" && { reason: entry.data.reason }) });
+      }
+    }
+    if (failures.length) out.set(key, failures);
+  }
+  return out;
 }

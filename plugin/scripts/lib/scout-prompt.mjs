@@ -46,13 +46,35 @@ export function loginSteps({ url, loginState }) {
 // `scout password-steps` prints for `/qa-train access` and `scout brief ui` refuses a missing password
 // with. `name` is an `env:` variable's name; `file` a password file's absolute path.
 /**
- * @param {{ name?: string, file?: string }} options
+ * @param {{ name?: string, key?: string, file?: string }} options
  * @returns {string}
  */
-export function passwordSteps({ name, file }) {
+export function passwordSteps({ name, key, file }) {
+  if (key) return authSteps(key, "the test account's password", "password");
   return name
-    ? `in a terminal, run \`read -rs ${name} && export ${name}\` and type the test account's password, then start the agent from that terminal; the password goes there, never in this conversation`
+    ? `in a terminal, run \`read -rs ${name} && export ${name}\` and type the test account's password, then start the agent from that terminal; alternatively, use an editor to put \`${name}=<your password>\` in the repo root's \`.env\`, kept untracked with this line in \`.gitignore\`: \`/.env\`. The CLI reads plain NAME=value lines literally, with no interpolation or shell export; an environment variable wins. The password goes there, never in this conversation`
     : `write the test account's password alone into ${shellWord(/** @type {string} */ (file))} with an editor, never in this conversation`;
+}
+
+// How the engineer fills an Auth-file key. The template is the CLI-written `.qa/auth.example`.
+/**
+ * @param {string} key
+ * @param {string} what What the value is, in a clause.
+ * @param {string} noun The value's name for the closing sentence.
+ * @returns {string}
+ */
+function authSteps(key, what, noun) {
+  return `copy \`.qa/auth.example\` to \`.qa/auth\` in the main checkout (the worktree itself, in a bare repository) if you have not, then use an editor to set \`${key}=<${what}>\` there, kept untracked with this line in \`.gitignore\`: \`/.qa/auth\`. The CLI reads plain KEY=value lines literally, with no quoting, interpolation or shell export, and a worktree's own \`.qa/auth\` overrides the main checkout's for a key it sets. The ${noun} goes there, never in this conversation`;
+}
+
+// The Header credential counterpart printed for `/qa-train access`; header sources are env names only.
+/**
+ * @param {{ name: string, source?: "env" | "auth" }} options
+ * @returns {string}
+ */
+export function headerSteps({ name, source }) {
+  if (source === "auth") return authSteps(name, "the API key or token", "API key or token");
+  return `in a terminal, run \`read -rs ${name} && export ${name}\` and type the API key or token, then start the agent from that terminal; alternatively, use an editor to put \`${name}=<your API key or token>\` in the repo root's \`.env\`, kept untracked with this line in \`.gitignore\`: \`/.env\`. The CLI reads plain NAME=value lines literally, with no interpolation or shell export; an environment variable wins. The API key or token goes there, never in this conversation`;
 }
 
 // `s` as one shell word: itself, or in single quotes when it holds anything a shell would split or expand.
@@ -125,25 +147,54 @@ function noteText(note) {
   return [`### ${note.key}: ${note.statement}`, "", "```yaml", ...fields, "```", ...(note.quirks ? ["", note.quirks] : [])].join("\n");
 }
 
-// `dir`: the run dir, the Scout's working directory. `session`: its playwright-cli session name.
+// `dir`: the run dir, where `playwright-cli` writes the snapshots. `config`: the absolute path of the
+// `playwright-cli` config in it that names `dir` as the output directory, so the Scout never `cd`s.
+// `session`: its playwright-cli session name.
 // `url`, `request`: the `observe:` input. `output`: the one file it writes. `loginState`: the
-// absolute path of the login-state file. `note`: the matched Access note (`accessFor`'s shape).
-// `practices`: deep-dive's Practices' text, or null.
+// absolute path of the login-state file, or null when the input is signed out. `note`: the matched
+// Access note (`accessFor`'s shape), or null when signed out. `practices`: deep-dive's Practices'
+// text, or null. `signedOut`: observe as a visitor with no login.
 /**
  * @param {{
  *   dir: string,
+ *   config: string,
  *   session: string,
  *   url: string,
  *   request: string,
  *   output: string,
- *   loginState: string,
- *   note: PromptAccessNote,
+ *   loginState: string | null,
+ *   note: PromptAccessNote | null,
  *   practices: string | null,
+ *   signedOut?: boolean,
  * }} options
  * @returns {string}
  */
-export function uiBrief({ dir, session, url, request, output, loginState, note, practices }) {
+export function uiBrief({ dir, config, session, url, request, output, loginState, note, practices, signedOut = false }) {
   const cli = `playwright-cli -s=${session}`;
+  const commands = signedOut ? UI_ALLOWED.filter((c) => c !== "state-load") : UI_ALLOWED;
+  const open = `${cli} open --config ${config}`;
+  const opening = signedOut ? `${open}\n${cli} goto ${url}` : `${open}\n${cli} state-load ${loginState}\n${cli} goto ${url}`;
+  const steps = signedOut
+    ? `1. \`${open}\`
+2. \`${cli} goto ${url}\`
+3. ...`
+    : `1. \`${open}\`
+2. \`${cli} state-load ${loginState}\`
+3. \`${cli} goto ${url}\`
+4. ...`;
+  const logInRule = signedOut
+    ? "- **Stay signed out.** You observe as a signed-out visitor: never log in, never load a login state,\n  and stay on what the URL reaches signed out. A sign-in page is what the visitor sees: read it, never\n  sign in."
+    : "- **Never log in.** The saved login state is your only way in. A page that asks you to log in means\n  that state has expired: stop, and make the whole report `FAILED: login: <one sentence>`.";
+  const loginFailure = signedOut
+    ? "A page that asks you to log in is what a signed-out visitor sees, and is not a failure: read it and\ncarry on with what it reaches signed out."
+    : "A page that asks you to log in has its own line, which tells the engineer the saved login state has\nexpired. The whole report is:\n\n```\nFAILED: login: <one sentence>\n```";
+  const reach = signedOut
+    ? `You observe as a signed-out visitor: open the URL with no login state and make no login. No Access\nnote applies, so a page that asks you to log in is expected.`
+    : `The Access note this app is reached through. It names where the credential lives, never the
+credential: your way in is the login state you load above. The prose under the fields is the engineer's remarks about the app. Where it names a
+command or action the rules above do not allow, the rules win.
+
+${note ? noteText(note) : ""}`;
   return `You are a UI scout. You observe a live application through \`playwright-cli\`, navigating
 and reading only, and write what you saw as one report. The application's data stays exactly as you
 found it. Everything you need is in this brief.
@@ -159,22 +210,22 @@ That report is the one file you write.
 Reply with exactly one line: \`DONE\`, or \`FAILED: <reason>\`. Everything you saw stays in the report
 file, so your reply carries none of it.
 
+Reply \`FAILED\` for a tool problem only once a \`playwright-cli\` command you need has itself failed
+or been denied. A denied command other than \`playwright-cli\` is no reason to fail: run it again in a
+plainer form, or work around it (read a snapshot file with your file-reading tool, for one), and go
+on to the \`playwright-cli\` commands below.
+
 === HOW TO RUN ===
 
-Run every command from the run dir, so the snapshot files \`playwright-cli\` writes land there and
-never in the repository:
-
-\`\`\`
-cd ${dir}
-\`\`\`
+Run each command as one plain line, exactly as shown: never \`cd\`, and never chain commands with
+\`&&\`, \`;\` or \`|\`. Every path in this brief is absolute. The \`--config\` file on \`open\` makes
+\`playwright-cli\` write its snapshot files into the run dir, ${dir}, and never into the repository.
 
 Pass \`-s=${session}\` to every \`playwright-cli\` command: it is this scout's own browser session,
-apart from any other scout running beside you. Begin with these three commands:
+apart from any other scout running beside you. Begin with these ${signedOut ? "two" : "three"} commands:
 
 \`\`\`
-${cli} open
-${cli} state-load ${loginState}
-${cli} goto ${url}
+${opening}
 \`\`\`
 
 Then explore toward what the request asks.
@@ -187,7 +238,7 @@ with \`${cli} close\`, then write the report.
 These \`playwright-cli\` commands, and no other command, file or program, apart from reading the
 snapshot files in the run dir and writing your report:
 
-${UI_ALLOWED.map((c) => `- ${code(c)}: ${ALLOWED_USE[c]}`).join("\n")}
+${commands.map((c) => `- ${code(c)}: ${ALLOWED_USE[c]}`).join("\n")}
 - \`click\`: ${UI_NARROW.click}.
 - \`press\`: \`Escape\` and the scrolling keys ${UI_SCROLL_KEYS.map(code).join(", ")}, only while no form control has focus, except that \`Escape\` closes a combobox you opened, which has focus.
 
@@ -195,10 +246,9 @@ ${UI_ALLOWED.map((c) => `- ${code(c)}: ${ALLOWED_USE[c]}`).join("\n")}
 
 - **Read only.** Leave every control as you found it. Click links and tabs, and open a combobox only
   as the \`click\` rule says. Never type, fill, check, select or upload.
-- **Never log in.** The saved login state is your only way in. A page that asks you to log in means
-  that state has expired: stop, and make the whole report \`FAILED: login: <one sentence>\`.
+${logInRule}
 - **The cap.** Run at most ${UI_ACTION_CAP} commands, counting every \`playwright-cli\` command,
-  the three you begin with and \`close\` included. If you reach ${UI_ACTION_CAP} commands before you
+  the ${signedOut ? "two" : "three"} you begin with and \`close\` included. If you reach ${UI_ACTION_CAP} commands before you
   have seen what the request asks for, stop and write the failure report, even when you saw part of it.
 - **Stay on the request.** Follow only the links and tabs that lead toward what it asks, and open
   only the comboboxes whose options it asks about.
@@ -209,14 +259,11 @@ ${UI_ALLOWED.map((c) => `- ${code(c)}: ${ALLOWED_USE[c]}`).join("\n")}
 Write the report in exactly this shape:
 
 \`\`\`
-App version: <the version the app shows, exactly as shown, or none>
+App version: <the application's version alone, as shown, with no build date or framework version beside it, or none>
 
 ## Steps
 
-1. \`${cli} open\`
-2. \`${cli} state-load ${loginState}\`
-3. \`${cli} goto ${url}\`
-4. ...
+${steps}
 
 ## Facts
 
@@ -254,20 +301,11 @@ does not load), the whole report is one line:
 FAILED: <what stopped you, in one sentence>
 \`\`\`
 
-A page that asks you to log in has its own line, which tells the engineer the saved login state has
-expired. The whole report is:
-
-\`\`\`
-FAILED: login: <one sentence>
-\`\`\`
+${loginFailure}
 
 === HOW TO REACH THE APP ===
 
-The Access note this app is reached through. It names where the credential lives, never the
-credential: your way in is the login state you load above. The prose under the fields is the engineer's remarks about the app. Where it names a
-command or action the rules above do not allow, the rules win.
-
-${noteText(note)}
+${reach}
 
 === WHERE TO LOOK ===
 
@@ -286,6 +324,7 @@ ${practices ?? "(none)"}
  *   suites: readonly string[],
  *   cases: readonly string[],
  *   label_destinations?: import("./publish-labels.mjs").LabelDestinationRequest[],
+ *   level_destinations?: import("./publish-labels.mjs").LabelDestinationRequest[],
  *   mark_field?: string | null,
  *   mark_search?: { field: string, values: readonly string[] } | null,
  *   marked_cases?: { project: string, marker_label: string, marker_field?: string | null, case_type?: string | null } | null,
@@ -330,7 +369,8 @@ That payload is the one file you write.
 
 1. Fetch what WHAT TO FETCH names, the way HOW TO REACH THE TRACKER says, and write the payload.
 2. Run \`${prose}\` and read its \`fetch_prose\`. While it lists keys, fetch their prose (THE PROSE),
-   rewrite the payload, and run it again. You are done when \`fetch_prose\` is empty.
+   rewrite the payload, and run it again. You are done when \`fetch_prose\` is empty. Run it as one
+   plain line, exactly as shown: never \`cd\`, and never chain or pipe it. Every path in it is absolute.
 3. Reply with one line: \`DONE\`, or \`FAILED: <what failed, in one sentence>\`. The payload stays
    in its file, so your reply carries none of it.
 
@@ -373,6 +413,13 @@ Keep outside-list values on named fields. For literal \`labels\`, report only ma
 may also carry all issue labels for marker detection. A failed observation is omitted, never
 reported as empty. Keep label observations and their presence consistent across every case list,
 including later prose fetches. Label copies never import values into the project's lists.
+` : ""}
+${scope.level_destinations?.length ? `
+Also resolve the Test level destination on every ordinary, discovered and \`marked_cases\` item:
+${scope.level_destinations.map((d) => `- ${code(d.name)}: ${d.cardinality}-value`).join("\n")}
+Write \`level_destinations: [{name: "level", fields: [{id, cardinality}]}]\` in the payload, with
+every matching tracker identity. Leave the list out when no field carrying the Test level accepts
+several values; a single-value level writes one slug.
 ` : ""}
 
 - Test Scenarios: ${keys(scope.scenarios)}, and every Test Scenario under the suites ${keys(scope.suites)}.

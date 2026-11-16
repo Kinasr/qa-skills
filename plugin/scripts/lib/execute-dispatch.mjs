@@ -22,7 +22,8 @@
 //
 //       Before it schedules anything, the call rechecks the running host (lib/host-admission.mjs):
 //       one it cannot verify at the supported Claude Code floor refuses `host_unverified`, leaving
-//       the Run untouched. Cleanup and ingest never need the check.
+//       the Run untouched, unless the Run is the Unguarded Run the engineer acknowledged for that
+//       same failure (never below the floor). Cleanup and ingest never need the check.
 //       Prints `{action: "next", ok, start: [{id, brief, model}], paused, done, in_flight}`: `brief`
 //       is the file's path, `model` the Tester Tier's label (null for `inherit`: the skill omits it),
 //       `paused` the notes that cannot log in, `[{acc, roles?, reason}]` (`roles` the Roles of the
@@ -33,15 +34,18 @@
 //       The skill's order: drain what is in flight, then ask the engineer once about every paused
 //       note, `resume` each, then `next` again.
 //
-//   record --dir <run-dir> --execution <id> --status ok|failed|timeout|refused|quota
+//   record --dir <run-dir> --execution <id> --status ok|failed|timeout|refused|quota [--reason-file <path>]
 //       Settles the attempt `next` started for that Execution and closes its sessions. The status is
 //       what the harness said about the Tester's reply; the report is what counts: a valid
-//       `report.md` settles the attempt whatever the status was. Otherwise the attempt failed, and it
+//       `tester.report.md` settles the attempt whatever the status was. Otherwise the attempt failed, and it
 //       is retryable only while `guard.json` shows `used === 0` and no stop (no command reached the
 //       app, so a re-run repeats nothing): the Execution is reset (`executions/<id>/` removed) and
 //       requeued behind a cooldown. After any command ran the failure is final: it feeds the breaker
-//       (lib/dispatch.mjs, with its Fallback) but is never requeued. Prints `{action: "record", ok,
-//       execution, status, usable, settled, retry, problems?, announcements?, in_flight, done}`.
+//       (lib/dispatch.mjs, with its Fallback) but is never requeued. `--reason-file` is a file holding
+//       the Tester's reply text: the command reads and removes it, and an attempt that does not retry
+//       keeps the text as given so a missing report's Why shows it.
+//       Prints `{action: "record", ok, execution, status, usable, settled, retry, problems?,
+//       announcements?, in_flight, done}`.
 //
 //   resume --dir <run-dir> --note <acc> [--skip]
 //       The engineer's answer for a paused note. Without `--skip` ("done")
@@ -52,19 +56,20 @@
 //       with that session left out. Prints `{action: "resume", ok, note, skipped, blocked: [{id, reason}],
 //       omitted: [id], paused}`, `paused` what is still paused. Refuses `not_paused` for any other note.
 //
-// A kept CLI login (`<run>/auth/<acc>.json`, lib/execute-auth.mjs) is deleted once no queued Execution
-// needs its note, and before an Execution opens when the note's previous Execution ended at a sign-in
-// page or stopped `no-access`, so it logs in once more.
+// Every Execution on a CLI-login note logs in fresh (`execute open`), so a sign-out in an earlier
+// Execution cannot leave a later one a dead login. The kept state (`<run>/auth/<acc>.json`,
+// lib/execute-auth.mjs) is loaded only by the Execution that made it, and is deleted once no queued
+// Execution needs its note.
 //
 // All mutable state is `<run>/dispatch.json`: lib/dispatch.mjs's state, plus `locks`
-// (`{<acc>: {mode: "exclusive" | "shared", holders: [id]}}`), `paused`, `retried` (resumed notes),
-// `skipped` and `stale` (notes to log in again). Cooldowns are real time;
+// (`{<acc>: {mode: "exclusive" | "shared", holders: [id]}}`), `paused`, `retried` (resumed notes)
+// and `skipped`. Cooldowns are real time;
 // QA_SKILLS_DISPATCH_SCALE scales them, which only a test sets.
-import { existsSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { UsageError, noArguments, orThrow, requireOption } from "./cli.mjs";
 import { activeDelegate, finished, inFlight, launch, nextReadyAt, POLICY, ready, settle } from "./dispatch.mjs";
-import { applySkips, dropAuth, endedStale, isHelper, pauseNote, skipNote, sweepAuth } from "./execute-auth.mjs";
+import { applySkips, dropAuth, isHelper, pauseNote, skipNote, sweepAuth } from "./execute-auth.mjs";
 import { executionBrief } from "./execute-brief.mjs";
 import { readAutomation } from "./execute-automation.mjs";
 import { executionDecision } from "./execute-chain.mjs";
@@ -72,7 +77,7 @@ import { openActions, execution, plannedRun } from "./execute-open.mjs";
 import { checkedReport } from "./execution-report.mjs";
 import { executionDir, readGuard } from "./execution-guard.mjs";
 import { refusalsFor } from "./refusal.mjs";
-import { admitHost } from "./host-admission.mjs";
+import { admitRun } from "./host-admission.mjs";
 import { readRunFile } from "./run-dir.mjs";
 import { subagentModel } from "./tiers.mjs";
 
@@ -90,6 +95,8 @@ import { subagentModel } from "./tiers.mjs";
  * @typedef {{
  *   blocked?: ExecuteBlocked,
  *   spent?: boolean,
+ *   returned?: boolean,
+ *   reply?: string,
  * }} DispatchMark
  */
 
@@ -126,6 +133,7 @@ import { subagentModel } from "./tiers.mjs";
  *   ok: true,
  *   problems?: never,
  *   report: Record<string, unknown>,
+ *   dropped?: Array<{ line?: number, message: string }>,
  * }} CheckedReportResult
  */
 
@@ -147,7 +155,7 @@ function load(runDir) {
   const read = readRunFile(runDir, STATE, { by: "execute confirm", restart: "execute plan", missing: `no ${STATE} in ${runDir}: run \`execute confirm\` first` });
   if (read.error) throw new UsageError(read.error);
   const state = /** @type {ExecuteDispatchState} */ (read.value);
-  for (const field of ["paused", "retried", "skipped", "stale"]) (/** @type {Record<string, unknown>} */ (state))[field] ??= [];
+  for (const field of ["paused", "retried", "skipped"]) (/** @type {Record<string, unknown>} */ (state))[field] ??= [];
   return state;
 }
 
@@ -163,10 +171,13 @@ function save(runDir, state) {
   renameSync(tmp, join(runDir, STATE));
 }
 
-// What ingest needs of the Run's dispatch: `Map<execution id, {blocked?, spent?}>`. `blocked` is the
-// `{reason, why}` a unit was Blocked with here (`unreachable`); `spent` marks an Execution whose
+// What ingest needs of the Run's dispatch: `Map<execution id, {blocked?, spent?, returned?, reply?}>`. `blocked` is
+// the `{reason, why}` a unit was Blocked with here (`unreachable`); `spent` marks an Execution whose
 // retries ran out without it ever acting or reporting (not stopped by a tripped breaker), which is
-// Blocked "no report" rather than not run. Empty when the Run never reached `dispatch.json`.
+// Blocked "no report" rather than not run; `returned` marks one whose last Tester was dispatched and
+// came back, whatever its reply, so a missing report is Blocked rather than not run even with no
+// guarded call (a failed guard hook looks like that); `reply` is the Tester's recorded text for a
+// no-report Execution, alongside `spent` when its retries were spent. Empty when the Run never reached `dispatch.json`.
 /**
  * @param {string} runDir
  * @returns {Map<string, DispatchMark>}
@@ -181,9 +192,38 @@ export function dispatchMarks(runDir) {
   const { units, stopped } = /** @type {ExecuteDispatchState} */ (read.value);
   for (const u of units) {
     if (u.blocked) marks.set(u.id, { blocked: u.blocked });
-    else if (u.status === "failed" && !u.final && !stopped) marks.set(u.id, { spent: true });
+    else {
+      /** @type {DispatchMark} */
+      const mark = {};
+      if (u.status === "failed" && !u.final && !stopped) mark.spent = true;
+      if (u.status !== "queued" && u.status !== "in_flight" && u.attempts?.some((a) => a.settled !== undefined)) mark.returned = true;
+      if (u.reply) mark.reply = u.reply;
+      if (Object.keys(mark).length) marks.set(u.id, mark);
+    }
   }
   return marks;
+}
+
+// Removes every reply a record kept in `dispatch.json`, so the raw text does not outlive the Run.
+// Absent or unreadable state, or no unit holding a reply, writes nothing.
+/**
+ * @param {string} runDir
+ * @returns {void}
+ */
+export function clearReplies(runDir) {
+  if (!existsSync(join(runDir, STATE))) return;
+  /** @type {RunFileResult<ExecuteDispatchState>} */
+  const read = readRunFile(runDir, STATE, { by: "execute confirm", restart: "execute plan" });
+  if (read.error || !Array.isArray(read.value?.units)) return;
+  const state = /** @type {ExecuteDispatchState} */ (read.value);
+  let cleared = false;
+  for (const u of state.units) {
+    if (u.reply !== undefined) {
+      delete u.reply;
+      cleared = true;
+    }
+  }
+  if (cleared) save(runDir, state);
 }
 
 // The Access notes an Execution holds and how: `Map<acc, "exclusive" | "shared">`. A case Role's note is
@@ -293,8 +333,8 @@ async function next(args, { dir, root, env }) {
   noArguments("execute next", args, "--dir <run-dir> and --root <qa-dir>");
   const { pinned, runDir } = plannedRun(dir, "next");
   if (!pinned.confirmed) return stop("not_confirmed", { run: pinned.run });
-  const hostRefusal = admitHost({ env });
-  if (hostRefusal) return hostRefusal;
+  const host = admitRun(pinned, { env });
+  if (host.refusal) return host.refusal;
   const state = load(runDir);
   const byId = new Map(pinned.executions.map((e) => [e.id, e]));
   // The Automation decides the Execution: a Passed, Flaky or Blocked case, a case marked
@@ -341,10 +381,6 @@ async function next(args, { dir, root, env }) {
       }
     }
 
-    for (const acc of new Set(batch.flatMap((u) => (/** @type {ExecuteExecution} */ (byId.get(u.id))).sessions.map((s) => s.acc)))) {
-      if (state.stale.includes(/** @type {string} */ (acc))) dropAuth(runDir, acc);
-    }
-    state.stale = state.stale.filter((acc) => !batch.some((u) => (/** @type {ExecuteExecution} */ (byId.get(u.id))).sessions.some((s) => s.acc === acc)));
     const { opened, refusal } = openBatch(batch, { runDir, root, env });
     if (refusal) {
       closeAll(/** @type {Array<DispatchedUnit<ExecuteUnit>>} */ ([...opened, batch[opened.length]].filter(Boolean)), { runDir, env });
@@ -380,7 +416,7 @@ async function next(args, { dir, root, env }) {
     });
     save(runDir, state);
     sweepAuth(runDir, state, byId);
-    return { exit: 0, json: { action: "next", ok: true, start, paused: state.paused, done: finished(state), in_flight: inFlight(state).length, ...(blocked.length && { blocked }) } };
+    return { exit: 0, json: { action: "next", ok: true, start, paused: state.paused, done: finished(state), in_flight: inFlight(state).length, ...(blocked.length && { blocked }), ...(host.unguarded && { unguarded: true }) } };
   }
 }
 
@@ -389,8 +425,8 @@ async function next(args, { dir, root, env }) {
  * @param {CommandContext} context
  * @returns {CommandResult}
  */
-function recordAttempt(args, { dir, execution: id, status, env }) {
-  noArguments("execute record", args, "--dir <run-dir>, --execution <id> and --status <status>");
+function recordAttempt(args, { dir, execution: id, status, "reason-file": reasonFile, env }) {
+  noArguments("execute record", args, "--dir <run-dir>, --execution <id>, --status <status> and [--reason-file <path>]");
   requireOption("execute record", id, "--execution <id>", "an id `execute next` started");
   if (status === undefined || !STATUSES.includes(/** @type {string} */ (status))) throw new UsageError(`execute record needs --status, one of ${STATUSES.join(", ")}`);
   const found = execution(dir, /** @type {string} */ (id), "record");
@@ -401,15 +437,26 @@ function recordAttempt(args, { dir, execution: id, status, env }) {
   const unit = state.units.find((u) => u.id === id);
   if (unit?.status !== "in_flight") return stop("not_in_flight", { execution: id });
 
+  // The reply is the Tester's; a refused record above leaves its file in place to answer again.
+  /** @type {string | undefined} */
+  let reason;
+  if (typeof reasonFile === "string") {
+    try {
+      reason = readFileSync(reasonFile, "utf8");
+    } catch {
+      throw new UsageError(`cannot read the reason file ${reasonFile}`);
+    }
+    rmSync(reasonFile, { force: true });
+  }
+
   openActions.close.run([], { dir: runDir, execution: /** @type {string} */ (id), env });
   const execDir = executionDir(runDir, /** @type {string} */ (id));
   const guard = readGuard(execDir);
   const used = Number.isSafeInteger(guard?.used) && /** @type {ExecutionGuard} */ (guard).used > 0 ? /** @type {ExecutionGuard} */ (guard).used : 0;
   const stopped = guard?.stopped ?? null;
-  for (const acc of /** @type {string[]} */ (endedStale(guard))) if (!state.stale.includes(acc)) state.stale.push(acc);
   const checked = /** @type {CheckedReportResult} */ (checkedReport(execDir, ex, { stopped, used }));
   const usable = checked.ok === true;
-  const problems = checked.ok === false ? checked.problems : [];
+  const problems = checked.ok === false ? checked.problems : checked.ok ? checked.dropped ?? [] : [];
   /** @type {SettlementOutcome} */
   const outcome = {
     status: /** @type {string} */ (status), error_kind: status === "ok" ? null : status === "failed" ? "other" : /** @type {string} */ (status), usable,
@@ -419,6 +466,8 @@ function recordAttempt(args, { dir, execution: id, status, env }) {
   const announcements = settle(state, unit, outcome, Date.now(), POLICY.cooldown_ms * (Number.isFinite(scale) && scale > 0 ? scale : 1));
   release(state.locks, /** @type {string} */ (id));
   const retry = (/** @type {UnitStatus} */ (unit.status)) === "queued";
+  if (!retry && typeof reason === "string" && reason.trim()) unit.reply = reason;
+  else delete unit.reply;
   if (retry) reset(runDir, /** @type {string} */ (id));
   save(runDir, state);
   sweepAuth(runDir, state, new Map(pinned.executions.map((e) => [e.id, e])));
@@ -467,5 +516,5 @@ function resumeNote(args, { dir, note: acc, skip }) {
 export const runActions = {
   next: { options: { root: "qa-dir", dir: "value" }, usage: "--dir <run-dir> [--root <qa-dir>]", run: next },
   resume: { options: { dir: "value", note: "value", skip: "flag" }, usage: "--dir <run-dir> --note <acc> [--skip]", run: resumeNote },
-  record: { options: { dir: "value", execution: "value", status: "value" }, usage: "--dir <run-dir> --execution <id> --status ok|failed|timeout|refused|quota", run: recordAttempt },
+  record: { options: { dir: "value", execution: "value", status: "value", "reason-file": "value" }, usage: "--dir <run-dir> --execution <id> --status ok|failed|timeout|refused|quota [--reason-file <path>]", run: recordAttempt },
 };

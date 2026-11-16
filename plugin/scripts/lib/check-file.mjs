@@ -24,25 +24,43 @@
 //   bug_type_collides   `tracker.bug_type` names a Suite, Scenario or Case issue type
 //   secret     a train file holds a credential: text in a known token format on any line of any
 //              file in `train/`, or a credential-named key in an Access note's block
-// Warnings use `unknown_key` for preserved unknown keys (the schema-evolution stance), and
-// `automation_key_overlap` when a regex matches a minted-Key witness (ADR-0027).
+//   unindented  a non-blank line under `## Rules` or `## Boundaries` that is not a heading, an
+//              item's first line, or any entry's range: it would fall out of every entry
+//              (ADR-0061), whatever its indentation
+//   wrong_section  a list item's key prefix does not match its section: a non-`rule_` item under
+//              `## Rules`, or a non-`boundary_` item under `## Boundaries`
+//   mixed_forms  a Feature writes some Rules or Boundaries as headings and some as list items
+//   heading_form  at schema 6 or later, a Rule or Boundary is still written as a `###` heading:
+//              the numbered list item replaced it, and the fix is `migrate-keys` (ADR-0061)
+// Warnings use `unknown_key` for preserved unknown keys (the schema-evolution stance),
+// `automation_key_overlap` when a regex matches a minted-Key witness (ADR-0027),
+// `unusable_carrier` when `annotation_map.automation_key` names a carrier the project's stack
+// adapter never writes, and `missing_anti_example` when a Convention prohibits a form without
+// showing it, outside the codegen case that already fails.
 /**
  * @import { LabelDefinitions } from "./case-labels.mjs"
+ * @import { ParsedBoundary, ParsedListItem, ParsedRule } from "./knowledge-file.mjs"
  * @import { TrainEntryDescriptor } from "./schema.mjs"
  */
+import { codegenApproachErrors } from "./codegen-approaches.mjs";
 import { publishDestinationProblems } from "./publish-labels.mjs";
 import { caseLabelProblems, labelDefinitionProblems, labelDefinitions } from "./case-labels.mjs";
-import { cliLoginUser, isMatchPrefix, PASSWORD_VIA } from "./access-note.mjs";
+import { cliLoginUser, headerCredential, isHeaderCredentialSource, isHeaderCredentialScheme, isCredentialHeaderName, isMatchPrefix, isNoLogin, NO_LOGIN_VIA, PASSWORD_VIA, signInUrl } from "./access-note.mjs";
 import { parseCategoryDraft, validateCategories } from "./category-file.mjs";
-import { testRunnerMatchesStack } from "./stacks/descriptors.mjs";
-import { credentialIn, credentialMessage, redactPairs, secretsIn, tokenIn, WITHHELD } from "./credentials.mjs";
+import { carrierSupported, stackCarriers, testRunnerMatchesStack } from "./stacks/descriptors.mjs";
+import { credentialIn, credentialMessage, redactionExemptName, redactPairs, secretsIn, tokenIn, WITHHELD } from "./credentials.mjs";
 import { sensitiveLiteralName } from "./sensitive-literals.mjs";
 import { isMap } from "./dialect.mjs";
 import { EVIDENCE_SUMMARY, isExecutionEvidence } from "./evidence-record.mjs";
 import { compileKeyPattern, hasMintedPrefix, isCaseKey, isFixtureName, isFormerKey, isHostname, isLiveCaseKey, isModelLabel, isRetiredKey, isScenarioKey, isTrackerKey, KEY_OVERLAP_WITNESSES, parseMintRecipe, PATTERN, readTrackerReference, TIERS } from "./keys.mjs";
 import { keyedHeading } from "./markdown.mjs";
 import { isRuleRef } from "./rule-ref.mjs";
-import { ACCESS_TRAIN_KEY, AUTOMATION_ATTEMPT, AUTOMATION_BLOCKED_REASONS, AUTOMATION_DIAGNOSTIC_CAP, AUTOMATION_DIAGNOSTICS_MAX, AUTOMATION_RESULTS, BUG_ROUTES, BUG_STATUSES, CATEGORIES_TRAIN_KEY, CODEGEN_FACETS, CODEGEN_SIGNALS, CODEGEN_TRAIN_KEY, DESIGN_TRAIN_KEY, EXECUTE_TRAIN_KEY, CODEFIX_TRAIN_KEY, canonicalTrainKey, EXECUTION_SKIPPED, FINDING_KINDS, LEVEL_ON_CASE_SCHEMA_VERSION, MINTED_KEYS_SCHEMA_VERSION, SUITE_KEYS_SCHEMA_VERSION, isBugFile, isExecutionFile, isSchemaVersion, KNOWN, MIRROR_FIELDS, MIRROR_LISTS, MIRROR_OPTIONAL, MIRROR_PROSE, SUBJECT_KINDS, TRAIN_ENTRIES, TRAIN_KEYS, trainEntry, TYPES } from "./schema.mjs";
+import { ACCESS_TRAIN_KEY, AUTOMATION_ATTEMPT, AUTOMATION_BLOCKED_REASONS, AUTOMATION_DIAGNOSTIC_CAP, AUTOMATION_DIAGNOSTICS_MAX, AUTOMATION_RESULTS, BUG_ROUTES, BUG_STATUSES, CATEGORIES_TRAIN_KEY, CODEGEN_FACETS, CODEGEN_SIGNALS, CODEGEN_TRAIN_KEY, DESIGN_TRAIN_KEY, EXECUTE_TRAIN_KEY, CODEFIX_TRAIN_KEY, canonicalTrainKey, EXECUTION_SKIPPED, FINDING_KINDS, allowsLayerFree, LEVEL_ON_CASE_SCHEMA_VERSION, MIGRATED_SCHEMA_VERSIONS, MINTED_KEYS_SCHEMA_VERSION, RULE_LIST_SCHEMA_VERSION, SUITE_KEYS_SCHEMA_VERSION, isBugFile, isCommitMode, isExecutionFile, isSchemaVersion, KNOWN, MIRROR_FIELDS, MIRROR_LISTS, MIRROR_OPTIONAL, MIRROR_PROSE, SUBJECT_KINDS, TRAIN_ENTRIES, TRAIN_KEYS, trainEntry, TYPES } from "./schema.mjs";
+
+/** @param {unknown} value @returns {value is string[]} */
+function distinctSlugList(value) {
+  return Array.isArray(value) && value.every((level) => typeof level === "string" && PATTERN.slug.test(level)) && new Set(value).size === value.length;
+}
 
 /**
  * A problem reported on a .qa file.
@@ -115,7 +133,9 @@ import { ACCESS_TRAIN_KEY, AUTOMATION_ATTEMPT, AUTOMATION_BLOCKED_REASONS, AUTOM
  *   problems?: Array<{ code?: string, line?: number, message: string }>,
  *   cases?: ParsedEntry[],
  *   executions?: ParsedEntry[],
- *   rules?: Array<{ key: string, statement: string, line: number, end?: number }>,
+ *   rules?: ParsedRule[],
+ *   boundaries?: ParsedBoundary[],
+ *   items?: ParsedListItem[],
  *   conventions?: ParsedEntry[],
  *   practices?: ParsedEntry[],
  *   access_notes?: ParsedEntry[],
@@ -132,6 +152,7 @@ import { ACCESS_TRAIN_KEY, AUTOMATION_ATTEMPT, AUTOMATION_BLOCKED_REASONS, AUTOM
  *   pathInsideRepo?: (path: string) => boolean,
  *   labels?: LabelDefinitions,
  *   schemaVersion?: number,
+ *   levels?: ReadonlySet<string>,
  *   trackerPattern?: RegExp | null,
  *   autPattern?: RegExp | null,
  *   [key: string]: unknown,
@@ -157,6 +178,7 @@ import { ACCESS_TRAIN_KEY, AUTOMATION_ATTEMPT, AUTOMATION_BLOCKED_REASONS, AUTOM
  *   pathInsideRepo?: (path: string) => boolean,
  *   labels?: LabelDefinitions,
  *   schemaVersion?: number,
+ *   levels: ReadonlySet<string>,
  *   trackerPattern?: RegExp | null,
  *   autPattern?: RegExp | null,
  *   line?: (key: string) => number | undefined,
@@ -166,8 +188,13 @@ import { ACCESS_TRAIN_KEY, AUTOMATION_ATTEMPT, AUTOMATION_BLOCKED_REASONS, AUTOM
  */
 
 /**
+ * The Access note that claimed a `(role, prefix)` first, and whether it logs in as nobody.
+ * @typedef {{ key: string, noLogin: boolean }} AccessPrefixClaim
+ */
+
+/**
  * @typedef {{
- *   prefixes: Map<string, string>,
+ *   prefixes: Map<string, AccessPrefixClaim>,
  *   accounts: Map<string, string>,
  * }} AccessPrefixRegistry
  */
@@ -206,6 +233,7 @@ export function checkFile(file, config) {
     file,
     secretLines: new Set(),
     schemaVersion: config.schemaVersion,
+    levels: config.levels ?? new Set(),
     labels: config.labels,
     pathInsideRepo: config.pathInsideRepo,
     trackerPattern: config.trackerPattern,
@@ -272,9 +300,9 @@ function checkDoc(file, ctx) {
 
   if (type === "train") {
     const shared = data.key === CATEGORIES_TRAIN_KEY ? ["retired"] : [];
-    const own = canonicalTrainKey(data.key) === CODEFIX_TRAIN_KEY ? ["fix_attempts", "flaky_repeats", "pr"] : data.key === EXECUTE_TRAIN_KEY ? ["setup_role", "automation_retries"] : data.key === CODEGEN_TRAIN_KEY ? ["pr", "trained_stacks", "codegen_repeats", "codegen_attempts"] : [];
+    const own = canonicalTrainKey(data.key) === CODEFIX_TRAIN_KEY ? ["fix_attempts", "flaky_repeats", "pr"] : data.key === EXECUTE_TRAIN_KEY ? ["setup_role", "redaction_exempt", "automation_retries"] : data.key === CODEGEN_TRAIN_KEY ? ["pr", "trained_stacks", "codegen_repeats", "codegen_attempts", "approaches"] : [];
     for (const k of Object.keys(data)) {
-      if (!KNOWN.train.includes(k) && !shared.includes(k) && !own.includes(k)) report("invalid", k, "a train file's frontmatter holds `type` and `key` only (execute also allows `setup_role` and `automation_retries`; codegen also allows `pr`, `trained_stacks`, `codegen_repeats` and `codegen_attempts`; codefix also allows `fix_attempts`, `flaky_repeats` and `pr`; categories also allows `retired`)", (/** @type {(k: string) => number | undefined} */ (ctx.line))(k));
+      if (!KNOWN.train.includes(k) && !shared.includes(k) && !own.includes(k)) report("invalid", k, "a train file's frontmatter holds `type` and `key` only (execute also allows `setup_role`, `redaction_exempt` and `automation_retries`; codegen also allows `pr`, `trained_stacks`, `codegen_repeats`, `codegen_attempts` and `approaches`; codefix also allows `fix_attempts`, `flaky_repeats` and `pr`; categories also allows `retired`)", (/** @type {(k: string) => number | undefined} */ (ctx.line))(k));
     }
   } else if (!["observation", "execution", "bug"].includes(type)) {
     for (const k of Object.keys(data)) {
@@ -486,6 +514,10 @@ function checkMirror(ctx, v, kind, field, line) {
   }
   for (const k of optional) {
     if (v[k] === undefined || v[k] === null) continue;
+    if (k === "level") {
+      if (!(typeof v[k] === "string" || (Array.isArray(v[k]) && (/** @type {unknown[]} */ (v[k])).length > 0 && (/** @type {unknown[]} */ (v[k])).every((x) => typeof x === "string")))) ctx.report("shape", `${field}.${k}`, `\`${field}.${k}\` must be a level slug, a non-empty list of them, or null`, line);
+      continue;
+    }
     const prose = MIRROR_PROSE.includes(k) || k === "tags";
     if (prose ? !Array.isArray(v[k]) || (/** @type {unknown[]} */ (v[k])).some((x) => typeof x !== "string") : typeof v[k] !== "string") ctx.report("shape", `${field}.${k}`, `\`${field}.${k}\` must be ${prose ? "a list of strings" : "a string"} or null`, line);
   }
@@ -507,7 +539,7 @@ function checkStamp(ctx, v, field, line, extra = []) {
   checkRequired(ctx, v, ["by", "at", "commit"], field, line);
   if (v.at !== undefined) checkDate(ctx, v.at, `${field}.at`, line);
   if (v.digest !== undefined) checkDigest(ctx, v.digest, `${field}.digest`, line);
-  if (v.migrated !== undefined && (v.migrated !== LEVEL_ON_CASE_SCHEMA_VERSION || v.digest === undefined)) ctx.report("invalid", `${field}.migrated`, "a migrated pin requires schema 4 and its carried digest", line);
+  if (v.migrated !== undefined && (typeof v.migrated !== "number" || !MIGRATED_SCHEMA_VERSIONS.includes(v.migrated) || v.digest === undefined)) ctx.report("invalid", `${field}.migrated`, `a migrated pin requires schema ${MIGRATED_SCHEMA_VERSIONS.join(" or ")} and its carried digest`, line);
   for (const k of Object.keys(v)) {
     if (![...["by", "at", "commit", "digest", "migrated"], ...extra].includes(k)) ctx.warn("unknown_key", `${field}.${k}`, `unknown key \`${field}.${k}\`; preserved`, line);
   }
@@ -705,25 +737,63 @@ function checkExecutionFields(d, file, ctx) {
     ctx.report("pattern", "playwright_cli", "`playwright_cli` must be a version string", L("playwright_cli"));
   }
   /** @type {Set<string>} */
-  const keys = new Set();
+  const pairs = new Set();
+  /** @type {Set<string>} */
+  const skippedKeys = new Set();
+  /** @type {Set<string>} */
+  const excludedKeys = new Set();
+  /** @type {Set<string>} */
+  const notRunKeys = new Set();
   /**
    * @param {string} key
+   * @param {unknown} level
    * @param {number | undefined} line
    */
-  const declare = (key, line) => {
-    if (keys.has(key)) ctx.report("duplicate", "key", "a Key occurs more than once in the record", line);
-    keys.add(key);
+  const declare = (key, level, line) => {
+    const pair = JSON.stringify([key, level ?? null]);
+    if (pairs.has(pair)) ctx.report("duplicate", "key", "a case and Test level pair occurs more than once in the record", line);
+    pairs.add(pair);
   };
   if (d.skipped !== undefined) {
-    const order = ["level", "conflict", "no-steps", "no-expected"];
+    const order = ["manual", "level", "conflict", "no-steps", "no-expected"];
     if (!Array.isArray(d.skipped)) ctx.report("shape", "skipped", "`skipped` must be a list", L("skipped"));
     else for (const s of d.skipped) {
       if (!isMap(s) || Object.keys(s).some((k) => !["key", "reasons"].includes(k)) || !nonEmptyString(s.key) ||
           !Array.isArray(s.reasons) || s.reasons.length === 0 ||
           !(/** @type {string[]} */ (s.reasons)).every((r, i) => order.includes(r) && (i === 0 || order.indexOf(r) > order.indexOf((/** @type {string[]} */ (s.reasons))[i - 1])))) {
-        ctx.report("invalid", "skipped", "a skip holds `key` and non-empty reasons in level, conflict, no-steps, no-expected order", L("skipped"));
+        ctx.report("invalid", "skipped", "a skip holds `key` and non-empty reasons in manual, level, conflict, no-steps, no-expected order", L("skipped"));
       }
-      if (isMap(s)) declare(/** @type {string} */ (s.key), L("skipped"));
+      if (isMap(s)) {
+        const key = /** @type {string} */ (s.key);
+        if (skippedKeys.has(key)) ctx.report("duplicate", "key", "a skipped case occurs more than once in the record", L("skipped"));
+        skippedKeys.add(key);
+      }
+    }
+  }
+  if (d.excluded !== undefined) {
+    if (!Array.isArray(d.excluded)) ctx.report("shape", "excluded", "`excluded` must be a list", L("excluded"));
+    else for (const entry of d.excluded) {
+      const bound = isMap(entry) ? entry.bound_levels : undefined;
+      const valid = isMap(entry) && Object.keys(entry).every((k) => ["key", "bound_levels"].includes(k)) &&
+        nonEmptyString(entry.key) && distinctSlugList(bound);
+      if (!valid) {
+        ctx.report("invalid", "excluded", "an excluded case holds `key` and distinct Test level slug `bound_levels`", L("excluded"));
+        continue;
+      }
+      const key = /** @type {string} */ (entry.key);
+      if (excludedKeys.has(key)) ctx.report("duplicate", "key", "an excluded case occurs more than once in the record", L("excluded"));
+      excludedKeys.add(key);
+    }
+  }
+  if (d.not_run !== undefined) {
+    if (!Array.isArray(d.not_run)) ctx.report("shape", "not_run", "`not_run` must be a list", L("not_run"));
+    else for (const key of d.not_run) {
+      if (!nonEmptyString(key)) {
+        ctx.report("invalid", "not_run", "a not-run case holds one non-empty Test Case key", L("not_run"));
+        continue;
+      }
+      if (notRunKeys.has(key)) ctx.report("duplicate", "key", "a not-run case occurs more than once in the record", L("not_run"));
+      notRunKeys.add(key);
     }
   }
   if (!(/** @type {ParsedEntry[]} */ (file.executions)).length) ctx.report("required", "execution", "an Execution record needs at least one Execution block", ctx.fmLine);
@@ -733,7 +803,10 @@ function checkExecutionFields(d, file, ctx) {
   for (const h of entryHeadings(file, /** @type {ParsedEntry[]} */ (file.executions))) {
     if (!h.entry) ctx.report("heading", "execution", "an Execution heading is `### <Key>: <summary>`", h.line);
     else {
-      declare(h.entry.key, h.line);
+      declare(h.entry.key, h.entry.data.level, h.line);
+      if (skippedKeys.has(h.entry.key)) ctx.report("duplicate", "key", "a skipped case also has an Execution block", h.line);
+      if (excludedKeys.has(h.entry.key)) ctx.report("duplicate", "key", "an excluded case also has an Execution block", h.line);
+      if (notRunKeys.has(h.entry.key)) ctx.report("duplicate", "key", "a not-run case also has an Execution block", h.line);
       checkExecutionEntry(ctx, h.entry);
     }
   }
@@ -750,6 +823,12 @@ export const BLOCKED_REASONS = ["no-access", "unreachable", "precondition", "ste
  * @type {readonly string[]}
  */
 export const TESTER_REASONS = BLOCKED_REASONS.filter((reason) => reason !== "unreachable");
+/**
+ * The shape of one interpretation line: where it was, and the question → action it records. Length is
+ * not checked here; ingest clamps it.
+ * @type {RegExp}
+ */
+export const INTERPRETATION_LINE = /^(?:setup|(?:after )?step [1-9]\d*|expected): (?:.+ → .+|.+…)$/;
 /**
  * @param {unknown} v
  * @returns {v is number}
@@ -833,6 +912,17 @@ function checkExecutionEntry(ctx, e) {
   checkRequired(ctx, d, ["key", "feature", "digest", "review", ...(d.result !== undefined || d.automation === undefined ? ["result", "roles", "access", "reached", "actions"] : [])], e.key, e.blockLine);
   for (const k of Object.keys(d)) if (!KNOWN.execution_case.includes(k)) bad("invalid", k, "unknown Execution field");
   if (d.key !== undefined && d.key !== e.key) bad("heading", "key", "the Execution heading and block keys must agree");
+  if (d.level !== undefined && !(typeof d.level === "string" && PATTERN.slug.test(d.level))) bad("pattern", "level", "`level` must be a Test level slug");
+  if (d.bound_levels !== undefined && !distinctSlugList(d.bound_levels)) bad("invalid", "bound_levels", "`bound_levels` lists distinct Test level slugs");
+  for (const field of ["selected_levels", "omitted_levels"]) {
+    if (d[field] !== undefined && !distinctSlugList(d[field])) bad("invalid", field, `\`${field}\` lists distinct Test level slugs`);
+  }
+  const boundLevels = Array.isArray(d.bound_levels) ? /** @type {string[]} */ (d.bound_levels) : null;
+  if (boundLevels && (d.level === undefined || (boundLevels.length > 0 && !boundLevels.includes(/** @type {string} */ (d.level))))) bad("invalid", "level", "a per-level block keeps its selected Test level, within its binding when bound");
+  if (Array.isArray(d.selected_levels) && (d.level === undefined || !d.selected_levels.includes(/** @type {string} */ (d.level)))) bad("invalid", "level", "a per-level block keeps its selected Test level, within `selected_levels`");
+  if (boundLevels && Array.isArray(d.selected_levels) && boundLevels.length > 0 && d.selected_levels.some((level) => !boundLevels.includes(level))) bad("invalid", "selected_levels", "`selected_levels` stays within the case's binding");
+  if (boundLevels && Array.isArray(d.omitted_levels) && d.omitted_levels.some((level) => !boundLevels.includes(level))) bad("invalid", "omitted_levels", "`omitted_levels` lists bound Test levels");
+  if (Array.isArray(d.omitted_levels) && d.level !== undefined && d.omitted_levels.includes(d.level)) bad("invalid", "omitted_levels", "a block's executed Test level is never omitted");
   if (d.result === undefined) {
     for (const k of ["roles", "access", "reached", "actions"]) {
       if (d[k] !== undefined) bad("invalid", k, "an Execution field appears only when an Execution followed");
@@ -844,7 +934,7 @@ function checkExecutionEntry(ctx, e) {
     const valid = Array.isArray(list) && list.length > 0 &&
       list.every((r, i) => typeof r === "string" && EXECUTION_SKIPPED.includes(r) &&
         (i === 0 || EXECUTION_SKIPPED.indexOf(r) > EXECUTION_SKIPPED.indexOf(/** @type {string} */ (list[i - 1]))));
-    if (!valid) bad("invalid", "execution_skipped", "`execution_skipped` holds no-steps, no-expected or not-run, once each, in that order");
+    if (!valid) bad("invalid", "execution_skipped", "`execution_skipped` holds manual, no-steps, no-expected or not-run, once each, in that order");
     else if (d.result !== undefined) bad("invalid", "execution_skipped", "`execution_skipped` appears only when no Execution result is recorded");
   }
   if (d.feature !== undefined && !(typeof d.feature === "string" && PATTERN.slug.test(d.feature))) bad("pattern", "feature", "`feature` must be a slug");
@@ -855,7 +945,7 @@ function checkExecutionEntry(ctx, e) {
   if (d.digest !== undefined) checkDigest(ctx, d.digest, f("digest"), at("digest"));
   if (d.review !== undefined && !["fresh", "void", "none"].includes(/** @type {string} */ (d.review))) bad("invalid", "review", "`review` must be fresh, void or none");
   for (const k of ["dirty", "stale", "at_login", "redacted"]) if (d[k] !== undefined && d[k] !== true) bad("invalid", k, "a flag must be true when present");
-  for (const k of ["roles", "access", "created"]) {
+  for (const k of ["roles", "access", "created", "routes"]) {
     if (d[k] !== undefined && !stringList(d[k])) bad("shape", k, "a list of non-empty strings is required");
   }
   if (Array.isArray(d.access) && d.access.some((k) => typeof k !== "string" || !PATTERN.acc.test(k))) bad("pattern", "access", "`access` items must be Access note keys");
@@ -883,8 +973,11 @@ function checkExecutionEntry(ctx, e) {
     if (!valid) bad("invalid", "preconditions", "preconditions hold text, status and optional how; every item after unmet must be skipped");
   }
   if (d.interpretations !== undefined && (!Array.isArray(d.interpretations) || d.interpretations.length < 1 || d.interpretations.length > 5 ||
-      !(/** @type {unknown[]} */ (d.interpretations)).every((s) => typeof s === "string" && s.length <= 200 && /^(?:setup|step [1-9]\d*|expected): (?:.+ → .+|.+…)$/.test(s)))) {
-    bad("invalid", "interpretations", "interpretations hold 1–5 strings of at most 200 characters: setup, step N or expected: question → action");
+      !(/** @type {unknown[]} */ (d.interpretations)).every((s) => typeof s === "string" && s.length <= 200 && INTERPRETATION_LINE.test(s)))) {
+    bad("invalid", "interpretations", "interpretations hold 1–5 strings of at most 200 characters: setup, step N, after step N or expected: question → action");
+  }
+  if (d.interpretations_dropped !== undefined && (!Number.isSafeInteger(d.interpretations_dropped) || /** @type {number} */ (d.interpretations_dropped) < 1)) {
+    bad("invalid", "interpretations_dropped", "`interpretations_dropped` is a positive integer count of malformed interpretation lines");
   }
   checkExecutionProse(ctx, e);
 }
@@ -1120,6 +1213,9 @@ function checkProject(d, _file, ctx) {
   if (d.schema_version !== undefined && !isSchemaVersion(d.schema_version)) {
     ctx.report("invalid", "schema_version", "`schema_version` must be an integer ≥ 1", L("schema_version"));
   }
+  if (d.commit_mode !== undefined && !isCommitMode(d.commit_mode)) {
+    ctx.report("invalid", "commit_mode", "`commit_mode` must be print, ask or auto", L("commit_mode"));
+  }
 
   if (d.stack !== undefined && checkMap(ctx, d.stack, "stack", L("stack"))) {
     for (const k of ["language", "framework"]) {
@@ -1192,6 +1288,18 @@ function checkProject(d, _file, ctx) {
     }
   }
 
+  if (d.level_targets !== undefined && checkMap(ctx, d.level_targets, "level_targets", L("level_targets"))) {
+    if (!Object.keys(d.level_targets).length) ctx.report("invalid", "level_targets", "`level_targets` must be a non-empty map", L("level_targets"));
+    const levels = isMap(d.stack) && Array.isArray(d.stack.levels) ? d.stack.levels : [];
+    const targetSlugs = isMap(d.targets) ? Object.keys(d.targets) : [];
+    for (const [level, target] of Object.entries(d.level_targets)) {
+      const field = `level_targets.${level}`;
+      if (!PATTERN.slug.test(level)) ctx.report("pattern", field, `level \`${level}\` is not a slug`, L("level_targets"));
+      if (!(/** @type {unknown[]} */ (levels)).includes(level)) ctx.report("invalid", field, `\`${field}\` must name a level in \`stack.levels\``, L("level_targets"));
+      if (typeof target !== "string" || !targetSlugs.includes(target)) ctx.report("invalid", field, `\`${field}\` must name a target in \`targets\``, L("level_targets"));
+    }
+  }
+
   if (d.tracker !== undefined && checkMap(ctx, d.tracker, "tracker", L("tracker"))) {
     checkRequired(ctx, d.tracker, ["provider", "project", "key_pattern"], "tracker", L("tracker"));
     if (d.tracker.key_pattern !== undefined && !compileKeyPattern(/** @type {string} */ (d.tracker.key_pattern))) {
@@ -1241,6 +1349,20 @@ function checkProject(d, _file, ctx) {
           ctx.report("invalid", field, `\`${n}\` is not an annotation identifier`, L("annotation_map"));
         }
       }
+    }
+  }
+
+  // A Key carrier the stack's adapter cannot write holds no Automation key (ADR-0022). The
+  // adapter declares its carriers clear of its parser, so this holds while it cannot load.
+  const carriers = isMap(d.stack) ? stackCarriers(d.stack) : null;
+  if (carriers && isMap(d.annotation_map) && Array.isArray(d.annotation_map.automation_key)) {
+    /** @type {string[]} */
+    const forms = carriers.write === "any" ? [] : carriers.write.map((form) => `\`${form}\``);
+    const written = forms.length > 1 ? `${forms.slice(0, -1).join(", ")} or ${forms[forms.length - 1]}` : forms[0];
+    for (const name of d.annotation_map.automation_key) {
+      if (typeof name !== "string" || carrierSupported(carriers, name, "write")) continue;
+      const why = carrierSupported(carriers, name, "read") ? "reads but never writes" : "does not write";
+      ctx.warn("unusable_carrier", "annotation_map.automation_key", `\`${name}\` is a Key carrier this stack's adapter ${why}; write the key in ${written}`, L("annotation_map"));
     }
   }
 
@@ -1379,24 +1501,62 @@ function checkFeature(d, file, ctx) {
   if (d.generated !== undefined) checkGenerated(ctx, d.generated, "generated", L("generated"));
   if (d.sources !== undefined) checkList(ctx, d.sources, "sources", L("sources"));
 
+  // A malformed heading is still reported, as old commits are read.
   for (const e of /** @type {ParsedSection[]} */ (file.sections)) {
-    if (e.level !== 3 || !e.title.startsWith("rule_")) continue;
-    const h = keyedHeading(e.title);
-    if (!h) {
-      ctx.report("heading", "rule", `a Rule heading is \`### rule_<key>: <statement>\`: ${e.title}`, e.line);
-      continue;
-    }
-    if (!PATTERN.rule.test(h.key)) ctx.report("pattern", "rule", `Rule key \`${h.key}\` does not match ${PATTERN.rule}`, e.line);
-    declare(h.key, "rule", e.line);
+    if (e.level !== 3) continue;
+    if (e.title.startsWith("rule_") && !keyedHeading(e.title)) ctx.report("heading", "rule", `a Rule heading is \`### rule_<key>: <statement>\`: ${e.title}`, e.line);
+    else if (e.title.startsWith("boundary_") && !keyedHeading(e.title)) ctx.report("heading", "boundary", `a Boundary heading is \`### boundary_<key>: <statement>\`: ${e.title}`, e.line);
   }
-  for (const e of /** @type {ParsedSection[]} */ (file.sections)) {
-    if (e.level !== 3 || !e.title.startsWith("boundary_")) continue;
-    const h = keyedHeading(e.title);
-    if (!h) {
-      ctx.report("heading", "boundary", `a Boundary heading is \`### boundary_<key>: <statement>\`: ${e.title}`, e.line);
-      continue;
+
+  // A Rule or Boundary keeps the same identity checks in either form (ADR-0061): the existing
+  // `pattern` code applies to its key, and `declare` counts a duplicate once per entry.
+  for (const e of (/** @type {NonNullable<ParsedFile["rules"]>} */ (file.rules))) {
+    if (!PATTERN.rule.test(e.key)) ctx.report("pattern", "rule", `Rule key \`${e.key}\` does not match ${PATTERN.rule}`, e.line);
+    declare(e.key, "rule", e.line);
+  }
+  for (const e of (/** @type {NonNullable<ParsedFile["boundaries"]>} */ (file.boundaries))) {
+    if (!PATTERN.boundary.test(e.key)) ctx.report("pattern", "boundary", `Boundary key \`${e.key}\` does not match ${PATTERN.boundary}`, e.line);
+  }
+  const items = (/** @type {NonNullable<ParsedFile["items"]>} */ (file.items ?? []));
+  const entries = [...(/** @type {NonNullable<ParsedFile["rules"]>} */ (file.rules)), ...(/** @type {NonNullable<ParsedFile["boundaries"]>} */ (file.boundaries))];
+  const forms = new Set(entries.map((e) => e.form ?? "heading"));
+  if (forms.size > 1) {
+    const first = [...entries].sort((a, b) => a.line - b.line)[0];
+    ctx.report("mixed_forms", "rule", "a Feature writes its Rules and Boundaries as `### <key>: <statement>` headings or as numbered `1. **<key>**: <statement>` items, never both; run `migrate-keys`", first.line);
+  }
+  // The heading form is read for old commits, so `check` reports it only where the working tree's
+  // schema has left it behind (ADR-0061), the way `suite_key` and `scenario_level` are gated.
+  if (/** @type {number} */ (ctx.schemaVersion) >= RULE_LIST_SCHEMA_VERSION) {
+    for (const entry of [...entries].sort((a, b) => a.line - b.line)) {
+      if ((entry.form ?? "heading") !== "heading") continue;
+      const kind = entry.key.startsWith("boundary_") ? "boundary" : "rule";
+      ctx.report("heading_form", kind, `a ${kind === "boundary" ? "Boundary" : "Rule"} is a numbered \`1. **${kind}_<key>**: <statement>\` item at schema ${RULE_LIST_SCHEMA_VERSION}; this is still a \`###\` heading: run \`migrate-keys\``, entry.line);
     }
-    if (!PATTERN.boundary.test(h.key)) ctx.report("pattern", "boundary", `Boundary key \`${h.key}\` does not match ${PATTERN.boundary}`, e.line);
+  }
+  for (const item of items) {
+    if (item.section === "Rules" && !item.key.startsWith("rule_")) {
+      ctx.report("wrong_section", "rule", `a \`## Rules\` item's first line is \`<n>. **rule_<key>**: <statement>\`; \`${item.key}\` is not a Rule key`, item.line);
+    } else if (item.section === "Boundaries" && !item.key.startsWith("boundary_")) {
+      ctx.report("wrong_section", "boundary", `a \`## Boundaries\` item's first line is \`<n>. **boundary_<key>**: <statement>\`; \`${item.key}\` is not a Boundary key`, item.line);
+    }
+  }
+  // Only a section that holds a list item is read this way: the heading form's prose is part of
+  // its heading entry, and stays valid with no schema gate. Any non-blank line outside an entry's
+  // range is reported, whatever its indentation: a short-indented line falls out just as an
+  // unindented one does.
+  const itemLines = new Set(items.map((item) => item.line));
+  const headingLines = new Set((/** @type {ParsedSection[]} */ (file.sections)).map((section) => section.line));
+  /** @param {number} line */
+  const inEntry = (line) => entries.some((entry) => line >= entry.line && line <= (entry.end ?? entry.line));
+  const lines = String(file.text ?? "").replace(/\r\n/g, "\n").split("\n");
+  for (const section of (/** @type {ParsedSection[]} */ (file.sections)).filter((e) => e.level === 2 && (e.title === "Rules" || e.title === "Boundaries"))) {
+    if (!items.some((item) => item.section === section.title)) continue;
+    const field = section.title === "Rules" ? "rule" : "boundary";
+    for (let line = section.line + 1; line <= section.end; line++) {
+      const text = lines[line - 1] ?? "";
+      if (!text.trim() || itemLines.has(line) || headingLines.has(line) || inEntry(line)) continue;
+      ctx.report("unindented", field, `a line under \`## ${section.title}\` is not indented into an item, so it falls out of every ${field}; indent it into the item, or write \`1. **${field}_<key>**: <statement>\``, line);
+    }
   }
 }
 
@@ -1504,8 +1664,18 @@ function checkCase(ctx, heading, headingLine, entry, declare, caseKey, keyKind) 
   if (c.automatable !== undefined && typeof c.automatable !== "boolean") {
     ctx.report("shape", f("automatable"), "`automatable` must be true or false", at("automatable"));
   }
-  if (c.level === undefined && /** @type {number} */ (ctx.schemaVersion) >= LEVEL_ON_CASE_SCHEMA_VERSION) ctx.report("required", f("level"), "a Test Case requires one level", entry.blockLine);
-  if (c.level !== undefined && !nonEmptyString(c.level)) ctx.report("shape", f("level"), "`level` must be a level slug", at("level"));
+  if (c.manual !== undefined && typeof c.manual !== "boolean") {
+    ctx.report("shape", f("manual"), "`manual` must be true or false", at("manual"));
+  }
+  if (c.level === undefined && /** @type {number} */ (ctx.schemaVersion) >= LEVEL_ON_CASE_SCHEMA_VERSION && !allowsLayerFree(ctx.schemaVersion)) ctx.report("required", f("level"), "a Test Case requires one level", entry.blockLine);
+  if (c.level !== undefined) {
+    if (allowsLayerFree(ctx.schemaVersion)) {
+      const levels = Array.isArray(c.level) ? c.level : [c.level];
+      if (!distinctSlugList(levels) || !levels.length || levels.some((level) => !ctx.levels.has(level))) {
+        ctx.report("shape", f("level"), "`level` must be a project level slug or a non-empty list of distinct project level slugs", at("level"));
+      }
+    } else if (!nonEmptyString(c.level)) ctx.report("shape", f("level"), "`level` must be a level slug", at("level"));
+  }
   if (c.roles !== undefined) checkList(ctx, c.roles, f("roles"), at("roles"));
   if (c.sources !== undefined) checkList(ctx, c.sources, f("sources"), at("sources"));
   if (c.mirror !== undefined) checkMirror(ctx, c.mirror, "case", f("mirror"), at("mirror"));
@@ -1518,6 +1688,8 @@ function checkCase(ctx, heading, headingLine, entry, declare, caseKey, keyKind) 
 // An Observation (ADR-0016): what a UI scout saw in the live application, dated and never
 // edited. Its front matter is closed: a field outside it is refused, not preserved, since nothing
 // else may ride into committed evidence.
+const OBSERVATION_REQUIRED = KNOWN.observation.slice(1).filter((k) => k !== "signed_out");
+
 /**
  * @param {Record<string, unknown>} d
  * @param {ParsedFile} file
@@ -1528,9 +1700,13 @@ function checkObservation(d, file, ctx) {
   for (const k of Object.keys(d)) {
     if (!KNOWN.observation.includes(k)) ctx.report("invalid", k, `\`${k}\` is not an Observation field: its front matter holds ${KNOWN.observation.map((f) => `\`${f}\``).join(", ")} only`, (/** @type {(k: string) => number | undefined} */ (ctx.line))(k));
   }
-  checkRequired(ctx, d, KNOWN.observation.slice(1), "", ctx.fmLine);
+  checkRequired(ctx, d, OBSERVATION_REQUIRED, "", ctx.fmLine);
   if (d.observed_at !== undefined) checkDate(ctx, d.observed_at, "observed_at", (/** @type {(k: string) => number | undefined} */ (ctx.line))("observed_at"));
   if (d.url !== undefined) checkObservedUrl(ctx, d.url, (/** @type {(k: string) => number | undefined} */ (ctx.line))("url"));
+  // A signed-out Observation says how it was taken (ADR-0065): a mark, never a login mode.
+  if (d.signed_out !== undefined && d.signed_out !== true) {
+    ctx.report("shape", "signed_out", "`signed_out` marks an Observation taken with no login, so it is `true` when present", (/** @type {(k: string) => number | undefined} */ (ctx.line))("signed_out"));
+  }
   // The version the app showed, as written (`2.14.1` is text, `2.14` reads as a number), or null.
   const v = d.app_version;
   if (v !== undefined && v !== null && !nonEmptyString(v) && typeof v !== "number") {
@@ -1615,6 +1791,7 @@ function checkObservedUrl(ctx, v, line) {
  */
 function checkCodegenFrontmatter(d, file, ctx) {
   const line = /** @type {(k: string) => number | undefined} */ (ctx.line);
+  for (const error of codegenApproachErrors(d.approaches, ctx.levels)) ctx.report("invalid", error.field, error.message, line("approaches"));
   if (d.pr !== undefined && !["on-request", "always"].includes(/** @type {string} */ (d.pr))) {
     ctx.report("invalid", "pr", "`pr` must be on-request or always", line("pr"));
   }
@@ -1651,7 +1828,7 @@ function checkCodegenFrontmatter(d, file, ctx) {
 function checkTrain(d, file, ctx) {
   const declare = keyRegistry(ctx);
   if (d.key === CODEGEN_TRAIN_KEY) checkCodegenFrontmatter(d, file, ctx);
-  const accessPrefixes = { prefixes: /** @type {Map<string, string>} */ (new Map()), accounts: /** @type {Map<string, string>} */ (new Map()) }; // `(role, prefix)`, and a test account's `login_state` or `(origin, user)` → the Access note that claimed it first
+  const accessPrefixes = { prefixes: /** @type {Map<string, AccessPrefixClaim>} */ (new Map()), accounts: /** @type {Map<string, string>} */ (new Map()) }; // `(role, prefix)`, and a test account's `login_state` or `(origin, user)` → the Access note that claimed it first
   if (d.key === EXECUTE_TRAIN_KEY) for (const secret of secretsIn(d)) {
     const line = (/** @type {(k: string) => number | undefined} */ (ctx.line))(secret.key) ?? ctx.fmLine;
     ctx.secretLines.add(/** @type {number} */ (line));
@@ -1659,6 +1836,14 @@ function checkTrain(d, file, ctx) {
   }
   if (d.key === EXECUTE_TRAIN_KEY && d.setup_role !== undefined && !nonEmptyString(d.setup_role)) {
     ctx.report("shape", "setup_role", "`setup_role` must be a non-empty Role name", (/** @type {(k: string) => number | undefined} */ (ctx.line))("setup_role"));
+  }
+  if (d.key === EXECUTE_TRAIN_KEY && d.redaction_exempt !== undefined) {
+    const line = (/** @type {(k: string) => number | undefined} */ (ctx.line))("redaction_exempt");
+    if (!Array.isArray(d.redaction_exempt) || !d.redaction_exempt.every((name) => typeof name === "string")) {
+      ctx.report("shape", "redaction_exempt", "`redaction_exempt` must be a list of key names, each a string", line);
+    } else if (!d.redaction_exempt.every(redactionExemptName)) {
+      ctx.report("invalid", "redaction_exempt", "`redaction_exempt` names must be credential-named with only session(s), cookie(s) or token(s) credential words", line);
+    }
   }
   if (d.key === EXECUTE_TRAIN_KEY && d.automation_retries !== undefined &&
       (!Number.isInteger(d.automation_retries) || /** @type {number} */ (d.automation_retries) < 0 || /** @type {number} */ (d.automation_retries) > 5)) {
@@ -1759,11 +1944,24 @@ function checkTrainEntry(ctx, d, file, e, declare, accessPrefixes) {
   if (kind === "convention" && fences < 2) {
     ctx.report("required", (/** @type {{ key: string, text: string }} */ (h)).key, `Convention \`${(/** @type {{ key: string, text: string }} */ (h)).key}\` has no fenced example`, e.line);
   }
-  // A codegen prohibition shows what not to write as well as what to write.
-  if (d.key === CODEGEN_TRAIN_KEY && kind === "convention" && /^(?:never|do not|don['’]t|avoid)\b/i.test(/** @type {string} */ (entry.statement ?? "")) && fences < 3) {
-    ctx.report("required", (/** @type {{ key: string, text: string }} */ (h)).key, `Convention \`${(/** @type {{ key: string, text: string }} */ (h)).key}\` is a prohibition, so it carries an anti-example beside its example`, e.line);
+  // A prohibition shows what not to write as well as what to write. The word may sit anywhere in
+  // the statement, and any Training file may hold the Convention. A codegen statement that opens
+  // with one fails as before; every other case is a warning, so existing Training still passes.
+  const statement = /** @type {string} */ (entry.statement ?? "");
+  if (kind === "convention" && PROHIBITION.test(statement) && fences < 3) {
+    const key = (/** @type {{ key: string, text: string }} */ (h)).key;
+    const message = `Convention \`${key}\` is a prohibition, so it carries an anti-example beside its example`;
+    if (d.key === CODEGEN_TRAIN_KEY && OPENS_WITH_PROHIBITION.test(statement)) ctx.report("required", key, message, e.line);
+    else ctx.warn("missing_anti_example", key, message, e.line);
   }
 }
+
+// A prohibition's words, anywhere in a statement: "state X, never Y" forbids Y as plainly as
+// "Never Y" does.
+const PROHIBITION = /\b(?:never|do not|don['’]t|avoid)\b/i;
+// The anchored form: a statement whose first word is a prohibition. Codegen already refuses one
+// without an anti-example.
+const OPENS_WITH_PROHIBITION = /^(?:never|do not|don['’]t|avoid)\b/i;
 
 // A repo-relative path: no absolute path or drive, no backslash or NUL, and no `..` segment.
 const REPO_RELATIVE = (/** @type {string} */ p) => p.trim() !== "" && !/^(?:\/|[A-Za-z]:)/.test(p) && !/[\\\0]/.test(p) && !p.split("/").includes("..");
@@ -1833,6 +2031,12 @@ function checkExecuteEntry(ctx, kind, entry) {
     if (d[key] !== undefined && (!Array.isArray(d[key]) || (nonEmpty && d[key].length === 0) || !(/** @type {unknown[]} */ (d[key])).every(predicate))) bad(key, `\`${key}\` must be ${nonEmpty ? "a non-empty list" : "a list"} of names`);
   };
   list("features", (v) => typeof v === "string" && PATTERN.slug.test(v));
+  if (kind === "practice" && d.level !== undefined && !(nonEmptyString(d.level) && PATTERN.slug.test(d.level))) {
+    bad("level", "a Practice's `level` is a Test level slug");
+  }
+  if (kind !== "practice" && d.level !== undefined) {
+    bad("level", "`level` names the default Test level, and only a Practice may set it");
+  }
   if (kind === "recipe") {
     if (d.create === undefined && d.fixtures === undefined) bad("create", "a recipe needs `create` and/or `fixtures`", "required");
     string("create");
@@ -1903,12 +2107,12 @@ function refuseSensitiveLiterals(ctx, file) {
   });
 }
 
-// What an Access note's `via` may be: a connector (`mcp:name`, `cli:name`) or a password's home
-// (`PASSWORD_VIA`: `env:NAME`, `file:<path>`).
-const VIA = new RegExp(`^(mcp:[a-z0-9_-]+|cli:[a-z0-9_-]+)$|${PASSWORD_VIA.source}`);
+// What an Access note's `via` may be: a connector (`mcp:name`, `cli:name`), a password's home
+// (`PASSWORD_VIA`: `auth:KEY`, `env:NAME`, `file:<path>`), or `none` for a Role's signed-out visitor (ADR-0063).
+const VIA = new RegExp(`^(mcp:[a-z0-9_-]+|cli:[a-z0-9_-]+|${NO_LOGIN_VIA})$|${PASSWORD_VIA.source}`);
 
 // An app test account: the note logs in to an app, every `match` a `url:` prefix, as a CLI
-// login or a saved login state.
+// login, a saved login state, a Header credential or no login at all.
 /**
  * @param {Record<string, unknown>} a
  * @returns {boolean}
@@ -1916,7 +2120,7 @@ const VIA = new RegExp(`^(mcp:[a-z0-9_-]+|cli:[a-z0-9_-]+)$|${PASSWORD_VIA.sourc
 function appTestAccount(a) {
   const urlsOnly = Array.isArray(a.match) && a.match.length > 0 && a.match.every((m) => typeof m === "string" && m.startsWith("url:"));
   const saved = a.via === "cli:playwright-cli" && isMap(a.identifiers) && nonEmptyString(a.identifiers.login_state);
-  return urlsOnly && (cliLoginUser(a) !== null || saved);
+  return urlsOnly && (cliLoginUser(a) !== null || saved || headerCredential(a) !== null || isNoLogin(a));
 }
 
 /**
@@ -1931,9 +2135,17 @@ function checkAccessRole(ctx, a, field, line) {
     return ctx.report("shape", field, `\`${field}\` must be a non-empty Role name with no surrounding whitespace`, line);
   }
   if (!appTestAccount(a)) {
-    ctx.report("invalid", field, `\`${field}\` belongs on an app test account only: every \`match\` a \`url:\` prefix, and a CLI login or \`via: cli:playwright-cli\` with \`identifiers.login_state\``, line);
+    ctx.report("invalid", field, `\`${field}\` belongs on an app test account only: every \`match\` a \`url:\` prefix, and a CLI login, \`via: cli:playwright-cli\` with \`identifiers.login_state\`, a Header credential, or \`via: none\` for a signed-out visitor`, line);
   }
 }
+
+// What an `auth:` source with a malformed key is told, without repeating the key (it may be a credential
+// pasted in the wrong place); null for any other source.
+/**
+ * @param {unknown} source
+ * @returns {string | null}
+ */
+const authShape = (source) => (typeof source === "string" && source.startsWith("auth:") && !/^auth:[A-Z_][A-Z0-9_]*$/.test(source) ? "An `auth:` source names a key of an environment variable's shape: capital letters, digits and `_`, not starting with a digit (`auth:KEY`)" : null);
 
 // One note is one test account: `identifiers.login_state`, and `identifiers.user` on an origin,
 // belong to the first note that names them, whatever the Roles. The message names neither value.
@@ -2004,9 +2216,33 @@ function checkAccessNote(ctx, h, headingLine, entry, { prefixes, accounts }) {
   const a = entry.data;
   const at = (/** @type {string} */ k) => entry.keyLines[k] ?? entry.blockLine;
   const f = (/** @type {string} */ k) => `${h.key}.${k}`;
-  checkRequired(ctx, a, ["match", "via", "sources", "added"], h.key, entry.blockLine);
+  const noLogin = isNoLogin(a);
+  checkRequired(ctx, a, ["match", ...(a.header_via === undefined ? ["via"] : []), ...(noLogin ? ["role"] : []), "sources", "added"], h.key, entry.blockLine);
+  if (noLogin && (a.header_via !== undefined || a.expired_via !== undefined)) {
+    ctx.report("invalid", f("via"), "`via: none` logs in as nobody, so it cannot also carry a Header credential", at("via"));
+  }
+  if (noLogin && isMap(a.identifiers) && (nonEmptyString(a.identifiers.login_state) || nonEmptyString(a.identifiers.user))) {
+    ctx.report("invalid", f("identifiers"), "A note that logs in as nobody names no user or login state", at("identifiers"));
+  }
+  if (a.expired_via !== undefined) {
+    if (!isHeaderCredentialSource(a.expired_via)) ctx.report("pattern", f("expired_via"), authShape(a.expired_via) ?? "Expired credentials use `auth:KEY` or `env:NAME`", at("expired_via"));
+    if (a.header_via === undefined) ctx.report("invalid", f("expired_via"), "An expired source needs a Header credential", at("expired_via"));
+  }
+  if (isMap(a.identifiers) && a.identifiers.sign_in_urls !== undefined) {
+    const urls = a.identifiers.sign_in_urls;
+    if (!Array.isArray(urls) || urls.length === 0 || urls.some((u) => signInUrl(u) === null)) {
+      ctx.report("pattern", f("identifiers.sign_in_urls"), "`sign_in_urls` is a non-empty list of full http or https URLs, without credentials, that sign in to the app", at("identifiers"));
+    }
+  }
+  if (a.header_via !== undefined) {
+    if (!isHeaderCredentialSource(a.header_via)) ctx.report("pattern", f("header_via"), authShape(a.header_via) ?? "Header credentials use `auth:KEY` or `env:NAME`", at("header_via"));
+    const ids = isMap(a.identifiers) ? a.identifiers : {};
+    if (!isCredentialHeaderName(ids.header)) ctx.report("pattern", f("identifiers.header"), "A Header credential needs an HTTP header name other than cookie, host or proxy-authorization", at("identifiers"));
+    if (!isHeaderCredentialScheme(ids.scheme)) ctx.report("pattern", f("identifiers.scheme"), "The optional scheme is one HTTP token", at("identifiers"));
+    if (!Array.isArray(a.match) || a.match.some((m) => typeof m !== "string" || !m.startsWith("url:"))) ctx.report("invalid", f("match"), "A Header credential belongs to URL origins only", at("match"));
+  }
   if (a.via !== undefined && !(typeof a.via === "string" && VIA.test(a.via))) {
-    ctx.report("pattern", f("via"), `\`${f("via")}\` is \`env:NAME\`, \`mcp:name\`, \`cli:name\` or \`file:<path>\`, naming where the credential lives outside anything git tracks`, at("via"));
+    ctx.report("pattern", f("via"), (typeof a.via === "string" ? authShape(a.via) : null) ?? `\`${f("via")}\` is \`auth:KEY\`, \`env:NAME\`, \`mcp:name\`, \`cli:name\`, \`file:<path>\` or \`none\`, naming where the credential lives outside anything git tracks, or that a Role logs in as nobody`, at("via"));
   } else if (typeof a.via === "string" && a.via.startsWith("file:")) {
     const urlsOnly = Array.isArray(a.match) && a.match.every((m) => typeof m === "string" && m.startsWith("url:"));
     if (!cliLoginUser(a) || !urlsOnly) {
@@ -2025,10 +2261,15 @@ function checkAccessNote(ctx, h, headingLine, entry, { prefixes, accounts }) {
         if (!isMatchPrefix(m)) {
           ctx.report("pattern", f("match"), `${entry} is not a \`tracker:\` prefix or a \`url:\` prefix naming a host`, at("match"));
         } else if (prefixes.has(`${roleKey}\n${m}`)) {
-          // The longest prefix wins, so an identical one leaves no winner.
-          ctx.report("duplicate", f("match"), `${entry} is a prefix \`${prefixes.get(`${roleKey}\n${m}`)}\` already matches${a.role === undefined ? "" : " for that Role"}: two notes with one prefix leave no way to choose between them`, at("match"));
+          // The longest prefix wins, so an identical one leaves no winner; a `via: none` note
+          // reusing a signing-in Role's prefix needs its own separate Role (ADR-0063).
+          const prior = /** @type {AccessPrefixClaim} */ (prefixes.get(`${roleKey}\n${m}`));
+          const msg = noLogin !== prior.noLogin && nonEmptyString(a.role)
+            ? `${entry} is a prefix \`${prior.key}\` already matches for that Role: a signed-out visitor needs a separate Role of its own (add it with \`/qa-init --add-role <name>\`), not a Role that signs in`
+            : `${entry} is a prefix \`${prior.key}\` already matches${a.role === undefined ? "" : " for that Role"}: two notes with one prefix leave no way to choose between them`;
+          ctx.report("duplicate", f("match"), msg, at("match"));
         } else {
-          prefixes.set(`${roleKey}\n${m}`, h.key);
+          prefixes.set(`${roleKey}\n${m}`, { key: h.key, noLogin });
         }
       });
     }

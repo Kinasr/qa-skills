@@ -1,15 +1,21 @@
 // @ts-check
 // The Gradle adapter: select one Kotlin/JUnit test by `<pkg>.<Class>.<method>` in its module's task
-// path, move prior XML aside, and re-invoke only while the Automation has not passed, with
-// `--rerun`, within 1 + `automation_retries` invocations. It is one registry entry
-// (`runners/index.mjs`), using the same options and result shape as Playwright.
+// path, move prior XML aside, and re-invoke only while the Automation has not passed, within
+// 1 + `automation_retries` invocations. Every invocation passes `--rerun`: with the build cache on,
+// a task whose report was moved aside is restored `FROM-CACHE` without running, and that file
+// would read as fresh. It is one registry entry (`runners/index.mjs`), using the same options and
+// result shape as Playwright.
+//
+// The wrapper is spawned through `spawnBatchWrapper`, so on win32 `gradlew.bat` runs behind
+// `cmd.exe`'s argument allow-list and a refused token is this Automation's runner refusal.
 import { spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
 import { join } from "node:path";
+import { defaultBatchLauncher, spawnBatchWrapper } from "../platform.mjs";
 import {
   copyFreshReport, gradleSelector, jvmModule, jvmTarget, lastAttemptPassed, mergeRunnerResult,
   movePriorReport, readFreshReport, reportDirectory, runnerEnvironment, runnerOutput,
 } from "./junit.mjs";
+/** @import { PlatformContext } from "../platform.mjs" */
 /** @import { AutomationSelection, RunnerResult } from "../test-runner.mjs" */
 /** @import { TestRunner } from "../knowledge-file.mjs" */
 
@@ -23,7 +29,7 @@ import {
  *   origin: string,
  *   env: Record<string, string | undefined>,
  *   retries: number,
- *   fresh?: boolean,
+ *   context?: PlatformContext,
  * }} RunOptions
  */
 
@@ -35,10 +41,10 @@ export const GRADLE_DEFAULT_TASK = "test";
  * @param {RunOptions} options
  * @returns {{ parsed: RunnerResult, selector: string }}
  */
-export function runGradle({ selection, runner, repo, dir, origin, env, retries, fresh }) {
+export function runGradle({ selection, runner, repo, dir, origin, env, retries, context }) {
   const runnerDir = runner.dir ?? ".";
   const cwd = join(repo, runnerDir);
-  const launcher = runner.launcher ?? [existsSync(join(cwd, "gradlew")) ? "./gradlew" : "gradle"];
+  const launcher = runner.launcher ?? [defaultBatchLauncher("gradle", cwd, context)];
   const task = runner.task ?? GRADLE_DEFAULT_TASK;
   const module = jvmModule(repo, runnerDir, selection.file, ["build.gradle", "build.gradle.kts"]);
   const taskPath = module === "." ? task : `:${module.split("/").join(":")}:${task}`;
@@ -49,12 +55,35 @@ export function runGradle({ selection, runner, repo, dir, origin, env, retries, 
   const inherited = runnerEnvironment(env, origin, runner.target_env);
   /** @type {RunnerResult} */
   const parsed = { instances: {}, diagnostics: [] };
+  const taskToken = module === "."
+    ? { value: taskPath, source: "test_runner.task" }
+    : { value: taskPath, parts: [{ value: `:${module.split("/").join(":")}:` }, { value: task, source: "test_runner.task" }] };
+  // `--rerun` and the selector travel as their own tokens; only the ones `project.md` configures
+  // name a key, and a module directory or the selector itself names the Automation instead.
+  const spawn = spawnBatchWrapper({
+    file: launcher[0],
+    args: [...launcher.slice(1), taskPath, "--rerun", "--tests", selected, ...(runner.args ?? [])],
+    options: { cwd, env: inherited, encoding: /** @type {const} */ ("utf8"), shell: false },
+    cwd,
+    ...(runner.launcher ? { source: "test_runner.launcher" } : {}),
+    tokens: [
+      ...launcher.slice(1).map((value) => ({ value, source: "test_runner.launcher" })),
+      taskToken,
+      { value: "--rerun" },
+      { value: "--tests" },
+      { value: selected },
+      ...(runner.args ?? []).map((value) => ({ value, source: "test_runner.args" })),
+    ],
+    automation: selection.id,
+  }, context);
+  if (spawn.refusal) {
+    parsed.reason = "runner-error";
+    parsed.diagnostics.push(spawn.refusal.message);
+    return { parsed, selector: `${taskPath} --rerun --tests ${selected}` };
+  }
   for (let attempt = 0; attempt <= retries; attempt++) {
     movePriorReport(report, priorDir);
-    const args = [
-      ...launcher.slice(1), taskPath, ...(fresh || attempt > 0 ? ["--rerun"] : []), "--tests", selected, ...(runner.args ?? []),
-    ];
-    const child = spawnSync(launcher[0], args, { cwd, env: inherited, encoding: "utf8", shell: false });
+    const child = spawnSync(spawn.file, spawn.args, spawn.options);
     parsed.diagnostics.push(...runnerOutput(child.stdout, child.stderr));
     if (child.signal || child.error) {
       parsed.reason = "runner-error";
@@ -70,5 +99,5 @@ export function runGradle({ selection, runner, repo, dir, origin, env, retries, 
     if (parsed.reason || lastAttemptPassed(parsed)) break;
   }
   if (!Object.keys(parsed.instances).length && !parsed.reason) parsed.reason = "no-result";
-  return { parsed, selector: `${taskPath} --tests ${selected}` };
+  return { parsed, selector: `${taskPath} --rerun --tests ${selected}` };
 }

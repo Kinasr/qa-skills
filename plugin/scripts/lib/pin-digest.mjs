@@ -29,7 +29,7 @@
  * @import { KeyIndex } from "./qa-index.mjs"
  * @import { StrippableFile, Stripped } from "./stripped.mjs"
  */
-import { LEVEL_ON_CASE_SCHEMA_VERSION } from "./schema.mjs";
+import { MIGRATED_SCHEMA_VERSIONS } from "./schema.mjs";
 import { createHash } from "node:crypto";
 import { join, relative, sep } from "node:path";
 import { isMap } from "./dialect.mjs";
@@ -41,7 +41,7 @@ import { buildIndex } from "./qa-index.mjs";
 import { dependencyIndex, formatRuleRef } from "./rule-ref.mjs";
 import { relianceOf } from "./reliance.mjs";
 import { causeRefs, restsOn } from "./stored-findings.mjs";
-import { impactProjection, claimProjection } from "./stripped.mjs";
+import { impactProjection, claimProjection, legacyStrip, strip } from "./stripped.mjs";
 
 /**
  * One .qa/ state's content digests.
@@ -87,7 +87,7 @@ export const writtenDigest = (v) => (typeof v === "string" && v !== "" ? v : nul
  * @param {unknown} stamp
  * @returns {boolean}
  */
-export const isMigratedPin = (stamp) => isMap(stamp) && stamp.migrated === LEVEL_ON_CASE_SCHEMA_VERSION && writtenDigest(stamp.digest) !== null;
+export const isMigratedPin = (stamp) => isMap(stamp) && typeof stamp.migrated === "number" && MIGRATED_SCHEMA_VERSIONS.includes(stamp.migrated) && writtenDigest(stamp.digest) !== null;
 
 // What a Feature-level Dismissal rests on: nothing, so every one has this digest.
 /** @type {string} */
@@ -101,13 +101,16 @@ export const FEATURE_DISMISSAL = digestOf(["dismissal"]);
 export const featureDismissalHolds = (dismissed, resolves) => resolves || writtenDigest(dismissed?.digest) === FEATURE_DISMISSAL;
 
 // One `.qa/` state's digests. Each is null when the state holds nothing to digest (the case or
-// Feature is absent).
+// Feature is absent). `legacy` reads the pre-neutral Rule form, for the schema 6 migration's
+// before/after check; every ordinary caller leaves it off.
 /**
  * @param {readonly (ParsedFile | UnreadableFile)[]} files
+ * @param {{ legacy?: boolean }} [options]
  * @returns {PinDigests}
  */
-export function digests(files) {
+export function digests(files, { legacy = false } = {}) {
   const index = buildIndex(files);
+  const stripFn = legacy ? legacyStrip : strip;
   /** @type {Map<ParsedFile, Stripped>} */
   const stripped = new Map();
   /**
@@ -115,20 +118,20 @@ export function digests(files) {
    * @returns {Stripped}
    */
   const s = (f) => {
-    if (!stripped.has(f)) stripped.set(f, claimProjection(/** @type {StrippableFile} */ (f)));
+    if (!stripped.has(f)) stripped.set(f, claimProjection(/** @type {StrippableFile} */ (f), {}, stripFn));
     return /** @type {Stripped} */ (stripped.get(f));
   };
   // The Feature's impact projection is what a Watermark or Stale pin digests (ADR-0033 as
   // amended): a Coverage-only change moves neither.
   /** @type {Map<ParsedFile, Stripped>} */
-  const projections = new Map();
+  const impact = new Map();
   /**
    * @param {ParsedFile} f
    * @returns {Stripped}
    */
   const projected = (f) => {
-    if (!projections.has(f)) projections.set(f, impactProjection(/** @type {StrippableFile} */ (f)));
-    return /** @type {Stripped} */ (projections.get(f));
+    if (!impact.has(f)) impact.set(f, impactProjection(/** @type {StrippableFile} */ (f), {}, stripFn));
+    return /** @type {Stripped} */ (impact.get(f));
   };
   /**
    * @param {string} key

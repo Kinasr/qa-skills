@@ -48,6 +48,8 @@ Skip dependent writes when their Suite, its remark or their Scenario failed; con
 An \`update_case\` writes only its specified knowledge-layer-owned fields to the existing case
 named by \`tracker_key\`. Never write status, automation status, issue type or marker on update. Record each
 successful update immediately as {n, key}; on failure record {n, key, error}.
+A case write's \`fields.level\` is one slug, or several values when it is a list, written to the
+Test level field; \`null\` clears it. A write with no \`level\` sets none.
 
 A case write's optional \`labels\` are operations alongside its claim fields, in one atomic field update.
 Check that the tracker can apply all those fields atomically before mutating; if unsupported, fail

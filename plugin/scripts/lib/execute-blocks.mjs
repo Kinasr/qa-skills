@@ -9,23 +9,32 @@
 //                                            `skipped`, and per Execution its Key, digest, Roles, cap
 //                                            and (when Blocked before dispatch) its reason
 //   <run>/executions/<id>/guard.json         actions used, `at_login`, the sticky `stopped`, the trace
-//   <run>/executions/<id>/report.md          the Tester's result and prose (lib/execution-report.mjs)
+//   <run>/executions/<id>/tester.report.md   the Tester's result and prose (lib/execution-report.mjs)
 //   <run>/dispatch.json                      (lib/execute-dispatch.mjs `dispatchMarks`) an Execution Blocked
-//                                            `unreachable` by `next`, or whose retries were spent with no report
+//                                            `unreachable` by `next`, or whose retries were spent with no report,
+//                                            or whose Tester was dispatched and returned with no report
 // `guard.stopped` overrides the report: the result is Blocked with that reason, `**Expected.**` goes,
-// `**Seen.**` moves to `**Evidence.**` when that is empty, and `**Why.**` is written from the stop. No
-// report from an Execution that acted, or a report that does not match the contract, is Blocked
-// `guard.stopped ?? "step"` with `reached: 0` and the trace kept. An Execution that never acted (no
-// calls, no stop, no report) was not run: it is left out of the record, so its previous result stays
-// the latest. Nothing here refuses a whole Run for one Execution's report.
+// `**Seen.**` moves to `**Evidence.**` when that is empty, and `**Why.**` is written from the stop. A
+// report holding an `unmet` precondition is Blocked `precondition` whatever result it claims, keeping
+// its trace and Evidence. No report from an Execution that acted, or a report that does not match the contract, is Blocked
+// `guard.stopped ?? "step"` with `reached: 0` and the trace kept; a missing report's Why carries the
+// Tester's recorded reply, or says the reason is unknown. A Tester dispatched that returned with no
+// report and no guarded call is Blocked `step` too, its Why naming a possible guard-hook failure. A report whose only fault is malformed
+// `interpretations` lines is still usable: those lines are left out, the block shows
+// `interpretations_dropped`, and the drop is named in the problems `execute ingest` reports. An
+// Execution whose Tester never started (no calls, no stop, no report, no returned dispatch) was not run: it gets no block, so its
+// previous result stays the latest, and `execute ingest` names a case that never ran at any level
+// in the record's `not_run`. Nothing here refuses a whole Run for one Execution's report.
 //
 // A secret never reaches a block. Every text field of an Execution is cut of URL queries and
-// fragments and redacted (`redactCredentials`), setting `redacted: true` when that changed anything,
-// and clamped to its cap.
+// fragments and redacted (`redactCredentials`), setting `redacted: true` when that changed anything;
+// its Run dir path becomes `<run>`, as Automation diagnostics already write it; and it is clamped to
+// its cap at a word boundary.
 //
 // A traced call whose guard-log entry carries element evidence has it written, scrubbed again, in one
 // folded `json` block right after that Execution's **Trace.** (lib/evidence-record.mjs
 // `evidenceBlockLines`), keyed by the call's Trace number. No such call, no block.
+import { realpathSync } from "node:fs";
 import { readAutomation } from "./execute-automation.mjs";
 import { executionDecision, notRunAutomation } from "./execute-chain.mjs";
 import { scrubRecordText, stripUrlQueries } from "./credentials.mjs";
@@ -35,6 +44,8 @@ import { dispatchMarks } from "./execute-dispatch.mjs";
 import { GUARD_STOPS, executionDir, readGuard } from "./execution-guard.mjs";
 import { evidenceBlockLines, isExecutionEvidence } from "./evidence-record.mjs";
 import { AUTOMATION_DIAGNOSTIC_CAP, AUTOMATION_DIAGNOSTICS_MAX, oneLine } from "./schema.mjs";
+import { CREDENTIAL_VARIANTS } from "./tester-request.mjs";
+import { maskCredentialText } from "./header-credential.mjs";
 
 /**
  * @import { ExecuteBlocked, ExecuteExecution, ExecutePlan } from "./execute.mjs"
@@ -70,6 +81,8 @@ import { AUTOMATION_DIAGNOSTIC_CAP, AUTOMATION_DIAGNOSTICS_MAX, oneLine } from "
  *   created?: string[],
  *   preconditions?: Array<{ text: string, status: string, how?: string }>,
  *   interpretations?: string[],
+ *   interpretations_dropped?: number,
+ *   unreported?: boolean,
  * }} RawExecution
  */
 
@@ -101,17 +114,21 @@ import { AUTOMATION_DIAGNOSTIC_CAP, AUTOMATION_DIAGNOSTICS_MAX, oneLine } from "
  */
 
 /**
- * What one settled Run contributes: one block per started case, the wholly unstarted cases, and any
- * reports that did not match the contract.
+ * What one settled Run contributes: one block per started case, the wholly unstarted cases, any
+ * reports that did not match the contract or had interpretation lines dropped, and one entry per
+ * Execution that acted without a valid report (used > 0 and its report missing or off-contract).
  * @typedef {{
  *   blocks: ExecutionBlock[],
  *   notRun: Array<{ key: string, summary: string }>,
  *   problems: Array<{ execution: string, problems: string[] }>,
+ *   unreported: Array<{ key: string }>,
  * }} SettledRun
  */
 
-const CAPS = { seen: 600, why: 300, evidence: 1000, interpretation: 200, created: 200, precondition: 300 };
+const CAPS = { route: 200, seen: 600, why: 300, evidence: 1000, interpretation: 200, created: 200, precondition: 300 };
 const MAX_INTERPRETATIONS = 5;
+// A report that saw a precondition fail is Blocked `precondition` whatever result it claims.
+const UNMET_WHY = "A precondition was not met, so the case never started.";
 /** @type {Record<ExecutionGuardStop, (cap: number) => string>} */
 const STOP_WHY = {
   "action-cap": (cap) => `The action cap of ${cap} was spent before the Execution finished.`,
@@ -144,29 +161,59 @@ export function localIso(iso) {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}${offset < 0 ? "-" : "+"}${hhmm}`;
 }
 
-// One Execution's text, cut of URL queries and redacted. `hit` says whether a credential was found.
+// The spellings a Run dir may be written in: as the Run names it, as `realpath` resolves it, and the
+// other side of the `/var` and `/tmp` symlinks macOS puts under `/private`, so either spelling is
+// caught. Longest first, so the fuller path is replaced before its own tail.
 /**
+ * @param {string} runDir
+ * @returns {string[]}
+ */
+function runDirMarkers(runDir) {
+  const markers = new Set([runDir.replace(/\/+$/, "")]);
+  try { markers.add(realpathSync(runDir)); } catch { /* a Run dir not on disk keeps the spelling it was given */ }
+  for (const path of [...markers]) {
+    if (path.startsWith("/private/")) markers.add(path.slice("/private".length));
+    else if (path.startsWith("/var/") || path.startsWith("/tmp/")) markers.add(`/private${path}`);
+  }
+  return [...markers].filter(Boolean).sort((a, b) => b.length - a.length);
+}
+
+// One Execution's text, cut of URL queries and redacted, with its Run dir path marked `<run>`.
+// `hit` says whether a credential was found.
+/**
+ * @param {readonly string[]} [values]
+ * @param {string} [runDir]
  * @returns {Scrubber}
  */
-export function scrubber() {
+export function scrubber(values = [], runDir = undefined) {
+  const markers = runDir === undefined ? [] : runDirMarkers(runDir);
   const scrub = /** @type {Scrubber} */ ({ hit: false });
   scrub.text = (text) => {
-    const stripped = stripUrlQueries(String(text));
+    const masked = maskCredentialText(String(text), values);
+    if (masked !== String(text)) scrub.hit = true;
+    const stripped = stripUrlQueries(masked);
     const swept = scrubRecordText(stripped);
     if (swept !== stripped) scrub.hit = true;
-    return swept;
+    return markers.reduce((out, marker) => out.replaceAll(marker, "<run>"), swept);
   };
   // A YAML string: one line, each backslash shown as `/`, clamped.
   scrub.line = (text, cap = Infinity) => clamp(oneLine(scrub.text(text)).replaceAll("\\", "/"), cap);
   return scrub;
 }
 
+// Cut to `cap` at the last word boundary that fits, marking the cut `…`; a single word longer than
+// the cap has no boundary, so it is cut to fit.
 /**
  * @param {string} text
  * @param {number} cap
  * @returns {string}
  */
-const clamp = (text, cap) => (text.length > cap ? `${text.slice(0, cap - 1).trimEnd()}…` : text);
+const clamp = (text, cap) => {
+  if (text.length <= cap) return text;
+  const head = text.slice(0, Math.max(0, cap - 1));
+  const boundary = head.search(/\s+\S*$/);
+  return `${(boundary > 0 ? head.slice(0, boundary) : head).trimEnd()}…`;
+};
 
 // Prose that stays inside its Execution: a line that would read as a heading, a fence, a conflict
 // marker or a bold label is escaped. Clamped after escaping, since that is what `check-file` counts.
@@ -194,18 +241,39 @@ function proseLines(text, cap) {
  */
 function traceOf(guard, used, scrub) {
   if (!(used > 0)) return [];
-  const span = (/** @type {string} */ text) => scrub.line(text).replaceAll("`", "'").replace(/--(?=(?:query|header|json)\b)/g, "- -");
+  const span = (/** @type {string} */ text) => scrub.line(text).replaceAll("`", "'").replace(/--(?=(?:query|header|json|auth)\b)/g, "- -");
   const items = (guard?.log ?? []).slice(0, used).map((e) => {
-    const args = Array.isArray(e.args) ? e.args.map((a) => (/^\/|^[a-z][a-z0-9+.-]*:\/\//i.test(String(a)) ? String(a).replace(/[?#].*$/, "") : String(a))) : [];
+    const args = Array.isArray(e.args) ? e.args.map((a) => scrub.text(a)).map((a) => (/^\/|^[a-z][a-z0-9+.-]*:\/\//i.test(a) ? a.replace(/[?#].*$/, "") : a)) : [];
     const status = ["ok", "error", "refused"].includes(e.status) ? e.status : "error";
     const role = span(typeof e.role === "string" && e.role ? e.role : "-");
     let call;
     if (typeof e.cmd !== "string" || !/^[a-z-]+$/.test(e.cmd)) call = "do unknown";
     else if (e.cmd === "request" && /^[A-Z]+$/.test(args[0] ?? "") && /^\S+$/.test((args[1] ?? "").split(/[?#]/)[0])) call = `request ${args[0]} ${/** @type {string} */ (args[1]).split(/[?#]/)[0]}`;
     else call = `do ${[e.cmd, ...args].join(" ")}`;
-    return span(`${role} ${call}`) + ` → ${status}`;
+    const auth = e.cmd === "request" && e.auth && CREDENTIAL_VARIANTS.includes(e.auth) ? ` auth: ${e.auth}` : "";
+    const rejected = e.cmd === "request" && e.auth_rejected === true ? " auth_rejected" : "";
+    const expect = e.expect && typeof e.expect === "object" && typeof e.expect.text === "string" && typeof e.expect.seen === "boolean" ? e.expect : null;
+    const expectArg = expect ? ` --expect="${span(expect.text).replaceAll('"', "'")}"` : "";
+    const expectSeen = expect ? `, ${expect.seen ? "seen" : "not seen"}` : "";
+    return span(`${role} ${call}`) + expectArg + ` → ${status}${auth}${rejected}${expectSeen}`;
   });
   return items.length ? items : [`${span(guard?.sessions?.[0]?.role ?? "-")} do unknown → unlogged`];
+}
+
+// Admitted route operations are recorded in guard sequence, with the same scrubbing and cap as
+// other short record strings.
+/**
+ * @param {ExecutionGuard | null} guard
+ * @param {Scrubber} scrub
+ * @returns {string[]}
+ */
+function routesOf(guard, scrub) {
+  return (guard?.log ?? []).filter((entry) => entry.status === "ok" && entry.route)
+    .slice().sort((a, b) => a.n - b.n).map((entry) => {
+      const route = /** @type {NonNullable<typeof entry.route>} */ (entry.route);
+      const pattern = route.pattern === undefined ? "all" : scrub.line(route.pattern).split(/[?#]/)[0];
+      return scrub.line(route.unroute ? `unroute ${pattern}` : `${pattern} → ${route.status ?? 200}`, CAPS.route);
+    });
 }
 
 // The element evidence of the traced calls, keyed by the Trace number each shows. Every string goes
@@ -255,21 +323,48 @@ function settle(ex, runDir, mark) {
   const stopped = GUARD_STOPS.includes(/** @type {ExecutionGuardStop} */ (guard?.stopped)) ? /** @type {ExecutionGuardStop} */ (/** @type {ExecutionGuard} */ (guard).stopped) : null;
   const access = guard ? [...new Set((guard.sessions ?? []).map((s) => s.acc).filter(Boolean))] : ex.access;
   const base = { used, guard, access: /** @type {string[]} */ (access) };
+
+  const checked = /** @type {CheckedReportResult & { report?: Record<string, unknown> }} */ (checkedReport(execDir, ex, { stopped, used }));
+  // The one place that answers "did this Execution act without a valid report?": it acted (`used >
+  // 0`) and its report is missing or off-contract. One that never acted, or only stopped or spent
+  // its retries, is not one, so no unlisted data is claimed for it.
+  const unreported = used > 0 && (checked.missing === true || checked.ok === false);
   /**
    * @param {string} why
    * @param {string[]} [problems]
    * @returns {SettleResult}
    */
-  const blocked = (why, problems) => ({ raw: { ...base, result: "blocked", reason: stopped ?? "step", reached: 0, why }, ...(problems && { problems }) });
-
-  const checked = /** @type {CheckedReportResult & { report?: Record<string, unknown> }} */ (checkedReport(execDir, ex, { stopped, used }));
-  // A Tester that acted, stopped, or spent its retries without a report left a Run that ran; one that never acted was not run.
-  if (checked.missing) return used > 0 || stopped || mark?.spent ? blocked("The Tester wrote no report.") : { notRun: true };
-  if (!checked.ok) return blocked("The Tester's report did not match the contract.", checked.problems.map((p) => `${ex.id} report${p.line === undefined ? "" : ` line ${p.line}`}: ${p.message}`));
-  const report = /** @type {Record<string, unknown> & { why?: string, expected?: string, seen?: string, evidence?: string }} */ (checked.report);
-  if (!stopped) return /** @type {SettleResult} */ ({ raw: { ...base, ...report, why: report.why } });
+  const blocked = (why, problems) => ({ raw: { ...base, result: "blocked", reason: stopped ?? "step", reached: 0, why, ...(unreported && { unreported: true }) }, ...(problems && { problems }) });
+  /** @param {Array<{ line?: number, message: string }>} list */
+  const reportProblems = (list) => list.map((p) => `${ex.id} report${p.line === undefined ? "" : ` line ${p.line}`}: ${p.message}`);
+  // A Tester that acted, stopped, spent its retries or returned without a report left a Run that ran;
+  // one that never started was not run. One that returned having made no guarded call, with no stop
+  // and no spent retries, may have met a guard hook that failed before it logged anything.
+  if (checked.missing) {
+    const reply = mark?.reply;
+    const said = typeof reply === "string" && reply.trim() ? ` Its reply: ${reply}` : "";
+    const silent = used === 0 && !stopped && !mark?.spent && mark?.returned;
+    const why = silent ? `The Tester returned without a report and made no guarded call, which can mean the guard hook failed.${said}`
+      : said ? `The Tester wrote no report.${said}` : "The Tester wrote no report. The reason is unknown.";
+    return used > 0 || stopped || mark?.spent || mark?.returned ? blocked(why) : { notRun: true };
+  }
+  if (!checked.ok) return blocked("The Tester's report did not match the contract.", reportProblems(checked.problems));
+  const report = /** @type {Record<string, unknown> & { why?: string, expected?: string, seen?: string, evidence?: string, preconditions?: Array<{ status?: string }> }} */ (checked.report);
+  // Dropped interpretation lines never change the result; they are counted on the block and named as
+  // problems so `execute ingest` reports them too.
+  const dropped = checked.dropped ?? [];
+  const problems = dropped.length ? reportProblems(dropped) : undefined;
+  const droppedRaw = dropped.length ? { interpretations_dropped: dropped.length } : {};
+  // `checked` means the precondition was seen to hold, so an `unmet` one settles the Execution
+  // Blocked `precondition` whatever result the report claims. A guard stop still wins; Expected goes,
+  // and Seen becomes Evidence when the report has none.
+  if (!stopped && (report.preconditions ?? []).some((p) => p.status === "unmet")) {
+    const { expected, seen, ...unmetKept } = report;
+    return /** @type {SettleResult} */ ({ raw: { ...base, ...unmetKept, result: "blocked", reason: "precondition", reached: 0, why: report.why ?? UNMET_WHY, evidence: report.evidence ?? seen, ...droppedRaw }, ...(problems && { problems }) });
+  }
+  if (!stopped) return /** @type {SettleResult} */ ({ raw: { ...base, ...report, why: report.why, ...droppedRaw }, ...(problems && { problems }) });
   const { expected, seen, ...kept } = report;
-  return /** @type {SettleResult} */ ({ raw: { ...base, ...kept, result: "blocked", reason: stopped, why: STOP_WHY[stopped](ex.cap), evidence: report.evidence ?? seen } });
+  return /** @type {SettleResult} */ ({ raw: { ...base, ...kept, result: "blocked", reason: stopped, why: STOP_WHY[stopped](ex.cap), evidence: report.evidence ?? seen, ...droppedRaw }, ...(problems && { problems }) });
 }
 
 // The case block's `automation:` entries: what the Run's Automations reported for this case,
@@ -277,14 +372,13 @@ function settle(ex, runDir, mark) {
 // a diagnostic becomes `<run>`.
 /**
  * @param {AutomationResult[]} entries
- * @param {string} runDir
  * @param {Scrubber} scrub
  * @returns {Array<Record<string, unknown>>}
  */
-function automationOf(entries, runDir, scrub) {
+function automationOf(entries, scrub) {
   return entries.map((entry) => {
     const diagnostics = entry.diagnostics
-      .map((text) => scrub.line(scrub.text(text).replaceAll(runDir, "<run>"), AUTOMATION_DIAGNOSTIC_CAP))
+      .map((text) => scrub.line(text, AUTOMATION_DIAGNOSTIC_CAP))
       .filter(Boolean).slice(0, AUTOMATION_DIAGNOSTICS_MAX);
     return {
       id: entry.id, stack: entry.stack, selector: scrub.line(entry.selector),
@@ -303,16 +397,19 @@ function automationOf(entries, runDir, scrub) {
  * @param {AutomationResult[]} evidence
  * @param {string} runDir
  * @param {string[]} [skipped]
+ * @param {readonly string[]} [values]
  * @returns {ExecutionBlock}
  */
-function automationBlock(ex, evidence, runDir, skipped = []) {
-  const scrub = scrubber();
+function automationBlock(ex, evidence, runDir, skipped = [], values = []) {
+  const scrub = scrubber(values, runDir);
+  const summary = oneLine(scrub.text(ex.summary));
   const data = {
-    ...(ex.tracker && { tracker: scrub.line(ex.tracker) }), feature: ex.feature, digest: ex.digest,
+    ...(ex.tracker && { tracker: scrub.line(ex.tracker) }), feature: ex.feature, level: ex.level, ...(ex.bound_levels && { bound_levels: ex.bound_levels }),
+    ...(ex.selected_levels && { selected_levels: ex.selected_levels }), ...(ex.omitted_levels && { omitted_levels: ex.omitted_levels }), digest: ex.digest,
     ...(ex.dirty && { dirty: true }), review: ex.review, ...(ex.stale && { stale: true }),
-    automation: automationOf(evidence, runDir, scrub), ...(skipped.length && { execution_skipped: skipped }), ...(scrub.hit && { redacted: true }),
+    automation: automationOf(evidence, scrub), ...(skipped.length && { execution_skipped: skipped }), ...(scrub.hit && { redacted: true }),
   };
-  return { key: ex.key, summary: oneLine(scrub.text(ex.summary)), data, prose: [], feature: ex.feature, atLogin: false, created: 0, redacted: scrub.hit };
+  return { key: ex.key, summary, data, prose: [], feature: ex.feature, atLogin: false, created: 0, redacted: scrub.hit };
 }
 
 // The record's block for one Execution: `{data, prose}` (the YAML fields beyond `key`, and the prose
@@ -323,10 +420,11 @@ function automationBlock(ex, evidence, runDir, skipped = []) {
  * @param {RawExecution} raw
  * @param {AutomationResult[]} evidence
  * @param {string} runDir
+ * @param {readonly string[]} values
  * @returns {ExecutionBlock}
  */
-function blockOf(ex, raw, evidence, runDir) {
-  const scrub = scrubber();
+function blockOf(ex, raw, evidence, runDir, values) {
+  const scrub = scrubber(values, runDir);
   const summary = oneLine(scrub.text(ex.summary));
   const used = raw.reason === "action-cap" ? ex.cap : raw.used;
   const trace = traceOf(raw.guard, used, scrub);
@@ -342,16 +440,21 @@ function blockOf(ex, raw, evidence, runDir) {
   if (raw.result === "blocked") add("Why", raw.why, CAPS.why);
   add("Evidence", raw.evidence, CAPS.evidence);
   if (trace.length) prose.push("**Trace.**", ...trace.map((t, i) => `${i + 1}. \`${t}\``), "", ...evidenceBlockLines(evidenceOf(raw.guard, used, scrub)));
+  const routes = routesOf(raw.guard, scrub);
   const created = (raw.created ?? []).map((c) => scrub.line(c, CAPS.created));
   const preconditions = (raw.preconditions ?? []).map((p) => ({ text: scrub.line(p.text, CAPS.precondition), status: p.status, ...(p.how && { how: scrub.line(p.how, CAPS.precondition) }) }));
   const interpretations = (raw.interpretations ?? []).slice(0, MAX_INTERPRETATIONS).map((i) => scrub.line(i, CAPS.interpretation));
   const data = {
-    ...(ex.tracker && { tracker: scrub.line(ex.tracker) }), feature: ex.feature, result: raw.result, ...(raw.reason && { reason: raw.reason }),
+    ...(ex.tracker && { tracker: scrub.line(ex.tracker) }), feature: ex.feature, level: ex.level, ...(ex.bound_levels && { bound_levels: ex.bound_levels }),
+    ...(ex.selected_levels && { selected_levels: ex.selected_levels }), ...(ex.omitted_levels && { omitted_levels: ex.omitted_levels }),
+    result: raw.result, ...(raw.reason && { reason: raw.reason }),
     digest: ex.digest, ...(ex.dirty && { dirty: true }), review: ex.review, ...(ex.stale && { stale: true }),
     roles: ex.roles.map((r) => scrub.line(r)), access: raw.access, reached: raw.reached, actions: { used, cap: ex.cap },
-    ...(evidence.length && { automation: automationOf(evidence, runDir, scrub) }),
+    ...(evidence.length && { automation: automationOf(evidence, scrub) }),
     ...(raw.guard?.at_login?.length && { at_login: true }), ...(scrub.hit && { redacted: true }),
-    ...(created.length && { created }), ...(preconditions.length && { preconditions }), ...(interpretations.length && { interpretations }),
+    ...(routes.length && { routes }), ...(created.length && { created }), ...(preconditions.length && { preconditions }),
+    ...(interpretations.length && { interpretations }),
+    ...((raw.interpretations_dropped ?? 0) > 0 && { interpretations_dropped: raw.interpretations_dropped }),
   };
   return { key: ex.key, summary, data, prose, feature: ex.feature, atLogin: data.at_login === true, created: created.length, redacted: scrub.hit };
 }
@@ -362,15 +465,18 @@ function blockOf(ex, raw, evidence, runDir) {
 /**
  * @param {ExecutePlan} plan
  * @param {string} runDir
+ * @param {readonly string[]} [values]
  * @returns {SettledRun}
  */
-export function buildBlocks(plan, runDir) {
+export function buildBlocks(plan, runDir, values = []) {
   /** @type {ExecutionBlock[]} */
   const blocks = [];
   /** @type {Array<{ key: string, summary: string }>} */
   const notRun = [];
   /** @type {Array<{ execution: string, problems: string[] }>} */
   const problems = [];
+  /** @type {Array<{ key: string }>} */
+  const unreported = [];
   const marks = dispatchMarks(runDir);
   const automation = readAutomation(runDir);
   const automationById = new Map(automation.map((entry) => [entry.id, entry]));
@@ -383,8 +489,10 @@ export function buildBlocks(plan, runDir) {
     const settled = settle(ex, runDir, marks.get(ex.id));
     const decision = executionDecision(ex, automationById);
     if (settled.problems) problems.push({ execution: ex.id, problems: settled.problems });
-    // A case where nothing started is left out of the record, so its earlier results stand; one
-    // that has Automation evidence or an Execution is kept, because something ran.
+    if (settled.raw?.unreported) unreported.push({ key: ex.key });
+    // A case where nothing started gets no block, so its earlier results stand; the record names
+    // it in `not_run`. One that has Automation evidence or an Execution is kept, because something
+    // ran.
     const started = ran.length > 0 || !settled.notRun;
     if (!started) {
       notRun.push({ key: ex.key, summary: oneLine(ex.summary) });
@@ -397,7 +505,21 @@ export function buildBlocks(plan, runDir) {
     const evidence = [...ran, ...missing];
     const planSkipped = ex.execution_skipped ?? [];
     const executionSkipped = settled.notRun ? [...planSkipped, ...(!planSkipped.length && decision.follow ? ["not-run"] : [])] : [];
-    blocks.push(settled.notRun ? automationBlock(ex, evidence, runDir, executionSkipped) : blockOf(ex, settled.raw, evidence, runDir));
+    blocks.push(settled.notRun ? automationBlock(ex, evidence, runDir, executionSkipped, values) : blockOf(ex, settled.raw, evidence, runDir, values));
   }
-  return { blocks, notRun, problems };
+  // The record shows what this Run actually executed: a bound level with no block stays omitted,
+  // whether the filter narrowed it or the Run never reached it.
+  /** @type {Map<string, Set<string>>} */
+  const executed = new Map();
+  for (const block of blocks) {
+    if (typeof block.data.level !== "string") continue;
+    if (!executed.has(block.key)) executed.set(block.key, new Set());
+    (/** @type {Set<string>} */ (executed.get(block.key))).add(block.data.level);
+  }
+  for (const block of blocks) {
+    if (!Array.isArray(block.data.bound_levels) || typeof block.data.level !== "string") continue;
+    const levels = executed.get(block.key) ?? new Set();
+    block.data.omitted_levels = (/** @type {string[]} */ (block.data.bound_levels)).filter((level) => !levels.has(level));
+  }
+  return { blocks, notRun, problems, unreported };
 }

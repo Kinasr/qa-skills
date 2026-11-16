@@ -15,11 +15,12 @@
 // Wording is not a dimension: a summary, the `automatable` flag and Reliance are left out, and the
 // texts compared ignore case, spacing, list markers, Markdown emphasis and closing punctuation.
 // Setup and Roles are sets (their order is no pass); steps are a sequence.
-import { casePreconditions, caseFields, caseSteps, stepActor, stripListMarker } from "./case-fields.mjs";
+import { casePreconditions, caseFields, comparisonLevel, caseSteps, stepActor, stripListMarker } from "./case-fields.mjs";
 import { listOf } from "./dialect.mjs";
 
 /** @import { CaseEntry, ParsedFile as QaFile } from "./knowledge-file.mjs" */
 /** @import { KeyIndex } from "./qa-index.mjs" */
+/** @import { CaseLevel } from "./case-fields.mjs" */
 /** @import { DesignCase } from "./design-contract.mjs" */
 
 /**
@@ -29,7 +30,7 @@ import { listOf } from "./dialect.mjs";
  * @property {string[]} setup - the preconditions, sorted
  * @property {string[]} steps - the exercised steps, in order
  * @property {string[]} roles - the Roles that act, sorted
- * @property {string | null} level
+ * @property {Exclude<CaseLevel, undefined> | null} level
  * @property {string} expected
  */
 
@@ -96,7 +97,7 @@ export function proposedPass(c) {
     setup: sorted((c.preconditions ?? []).map(norm).filter(Boolean)),
     steps: stepsOf(c.steps ?? [], c.roles),
     roles: sorted(c.roles),
-    level: c.level,
+    level: comparisonLevel(c.level),
     expected: norm(c.expected),
   };
 }
@@ -113,7 +114,7 @@ export function storedPass(entry) {
     setup: sorted(casePreconditions(entry).map(norm).filter(Boolean)),
     steps: stepsOf(caseSteps(entry), roles),
     roles: sorted(roles),
-    level: typeof entry.data.level === "string" ? entry.data.level : null,
+    level: comparisonLevel(entry.data.level),
     expected: norm(caseFields(entry).expected ?? ""),
   };
 }

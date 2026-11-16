@@ -35,8 +35,21 @@
  */
 
 /**
- * A parsed Markdown element: a fence or heading.
- * @typedef {MarkdownFenceElement | MarkdownHeadingElement} MarkdownElement
+ * An ordered-list item's first line: `<n>. <text>` at `indent` spaces. `contentIndent` is the
+ * column its content starts at, so a continuation line indented to it belongs to the item.
+ * @typedef {{
+ *   kind: "item",
+ *   number: string,
+ *   text: string,
+ *   indent: number,
+ *   contentIndent: number,
+ *   line: number,
+ * }} MarkdownItemElement
+ */
+
+/**
+ * A parsed Markdown element: a fence, heading or ordered-list item.
+ * @typedef {MarkdownFenceElement | MarkdownHeadingElement | MarkdownItemElement} MarkdownElement
  */
 
 /**
@@ -111,7 +124,23 @@ export function splitFile(raw) {
       continue;
     }
     const h = lines[i].match(/^(#{1,6})\s+(.*?)\s*$/);
-    if (h) elements.push({ kind: "heading", level: h[1].length, text: h[2], line: i + 1 });
+    if (h) {
+      elements.push({ kind: "heading", level: h[1].length, text: h[2], line: i + 1 });
+      continue;
+    }
+    // An ordered-list item, at any indent: `1. text`. Its content starts after the marker and one
+    // space, the one indent a continuation line must reach to belong to it.
+    const item = lines[i].match(/^( *)(\d+)\. (.*)$/);
+    if (item) {
+      elements.push({
+        kind: "item",
+        number: item[2],
+        text: item[3].replace(/\s+$/, ""),
+        indent: item[1].length,
+        contentIndent: item[1].length + item[2].length + 2,
+        line: i + 1,
+      });
+    }
   }
   return { frontmatter, elements, errors };
 }

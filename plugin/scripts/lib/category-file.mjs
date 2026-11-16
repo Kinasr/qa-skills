@@ -182,7 +182,7 @@ function parseEntries(text) {
       current = { key: heading.key, name: heading.text, line: element.line, blockLine: null, block: null, firstLine: 1 };
       continue;
     }
-    if (current !== null && current.block === null && element.lang === "yaml") {
+    if (current !== null && current.block === null && element.kind === "fence" && element.lang === "yaml") {
       current.blockLine = element.line;
       current.block = element.text;
       current.firstLine = element.firstLine;

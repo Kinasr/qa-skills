@@ -72,12 +72,13 @@ const MODIFIERS = new Set([
  *   t: "id" | "str" | "p" | "num",
  *   v: string,
  *   line: number,
+ *   endLine: number,
  *   adj: boolean,
  * }} KotlinToken
  */
 
-// Tokens: `{t: "id" | "str" | "p", v, line, adj}`. `adj` is true when nothing separates the token
-// from the one before it (so `this@Outer`'s `@` is a label, not an annotation).
+// Tokens: `{t: "id" | "str" | "p", v, line, endLine, adj}`. `adj` is true when nothing separates
+// the token from the one before it (so `this@Outer`'s `@` is a label, not an annotation).
 /**
  * @param {string} src
  * @returns {KotlinToken[]}
@@ -95,7 +96,7 @@ function tokenize(src) {
    * @param {number} at
    */
   const push = (t, v, at) => {
-    out.push({ t, v, line: at, adj: !gap });
+    out.push({ t, v, line: at, endLine: line, adj: !gap });
     gap = false;
   };
   /**
@@ -528,4 +529,144 @@ export function kotlinAssertionContracts(text) {
     checks.push({ matcher, expected, literals, constant: actual.length ? constant(actual) : root.args.length === 1 && constant(root.args[0]), same: operands.some(operand => same(actual, operand)) });
   }
   return checks;
+}
+
+const CLOSERS = new Map([["(", ")"], ["[", "]"], ["{", "}"]]);
+const INFIX_OPS = new Set(["+", "-", "*", "/", "%", "to"]);
+
+/**
+ * Consume one balanced `(…)`, `[…]`, or `{…}` token group starting at `start`.
+ * @param {KotlinToken[]} tokens
+ * @param {number} start
+ * @returns {{ nextIdx: number, endLine: number }}
+ */
+function consumeBalancedGroup(tokens, start) {
+  const open = tokens[start].v;
+  const close = CLOSERS.get(open);
+  let depth = 0;
+  let endLine = tokens[start].endLine;
+  let k = start;
+  while (k < tokens.length) {
+    const t = tokens[k];
+    endLine = Math.max(endLine, t.endLine);
+    if (t.t === "p" && t.v === open) depth++;
+    else if (t.t === "p" && t.v === close && --depth === 0) return { nextIdx: k + 1, endLine };
+    k++;
+  }
+  return { nextIdx: k, endLine };
+}
+
+/**
+ * Advance across postfix call arguments, trailing lambdas, and `.member` chains.
+ * @param {KotlinToken[]} tokens
+ * @param {number} start
+ * @param {number} endLine
+ * @returns {{ nextIdx: number, endLine: number }}
+ */
+function consumePostfixChain(tokens, start, endLine) {
+  let idx = start;
+  let end = endLine;
+  while (idx < tokens.length) {
+    const cur = tokens[idx];
+    if (cur.t === "p" && CLOSERS.has(cur.v)) {
+      const group = consumeBalancedGroup(tokens, idx);
+      end = Math.max(end, group.endLine);
+      idx = group.nextIdx;
+      continue;
+    }
+    if (cur.t === "p" && cur.v === ".") {
+      idx++;
+      if (tokens[idx]?.t === "id") {
+        end = Math.max(end, tokens[idx].endLine);
+        idx++;
+      }
+      continue;
+    }
+    if (cur.t === "p" && cur.v === "?" && tokens[idx + 1]?.t === "p" && tokens[idx + 1].v === ".") {
+      idx += 2;
+      if (tokens[idx]?.t === "id") {
+        end = Math.max(end, tokens[idx].endLine);
+        idx++;
+      }
+      continue;
+    }
+    if (cur.t === "p" && cur.v === "!" && tokens[idx + 1]?.t === "p" && tokens[idx + 1].v === "!") {
+      end = Math.max(end, tokens[idx + 1].endLine);
+      idx += 2;
+      continue;
+    }
+    break;
+  }
+  return { nextIdx: idx, endLine: end };
+}
+
+/**
+ * Consume the right-hand expression of an infix assertion (`actual shouldBe expected`).
+ * @param {KotlinToken[]} tokens
+ * @param {number} start
+ * @param {number} endLine
+ * @returns {number}
+ */
+function consumeInfixRhs(tokens, start, endLine) {
+  let idx = start;
+  let end = endLine;
+  while (idx < tokens.length) {
+    const cur = tokens[idx];
+    if (cur.t === "p" && (cur.v === "-" || cur.v === "+" || cur.v === "!")) {
+      end = Math.max(end, cur.endLine);
+      idx++;
+      continue;
+    }
+    if (cur.t === "p" && CLOSERS.has(cur.v)) {
+      const chain = consumePostfixChain(tokens, idx, end);
+      end = chain.endLine;
+      idx = chain.nextIdx;
+    } else if (cur.t === "id" || cur.t === "str" || cur.t === "num") {
+      end = Math.max(end, cur.endLine);
+      const chain = consumePostfixChain(tokens, idx + 1, end);
+      end = chain.endLine;
+      idx = chain.nextIdx;
+    } else {
+      break;
+    }
+    const op = tokens[idx];
+    if (op && ((op.t === "p" && INFIX_OPS.has(op.v)) || (op.t === "id" && INFIX_OPS.has(op.v)))) {
+      idx++;
+      continue;
+    }
+    break;
+  }
+  return end;
+}
+
+/**
+ * Line spans (`[start, end]`, 1-based inclusive) of every assertion statement in Kotlin source
+ * whose callee or infix matcher matches any regex in `patterns`.
+ * @param {string} src
+ * @param {readonly RegExp[]} patterns
+ * @returns {{ start: number, end: number }[]}
+ */
+export function kotlinAssertionSpans(src, patterns) {
+  const tokens = tokenize(src);
+  /** @type {{ start: number, end: number }[]} */
+  const spans = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const tok = tokens[i];
+    if (tok.t !== "id") continue;
+    if (i > 0 && tokens[i - 1].t === "p" && tokens[i - 1].v === "@") continue;
+    // A declaration named like an assertion (`fun assertCart(...)`) is not a call to one.
+    if (i > 0 && tokens[i - 1].t === "id" && tokens[i - 1].v === "fun") continue;
+    const next = tokens[i + 1];
+    const hasCall = next?.t === "p" && next.v === "(";
+    const probe = hasCall ? `${tok.v}(` : tok.v;
+    if (!patterns.some((p) => p.test(probe))) continue;
+    if (hasCall) {
+      const chain = consumePostfixChain(tokens, i + 1, tok.endLine);
+      spans.push({ start: tok.line, end: chain.endLine });
+    } else {
+      const end = consumeInfixRhs(tokens, i + 1, tok.endLine);
+      spans.push({ start: tok.line, end });
+    }
+  }
+  return spans;
 }

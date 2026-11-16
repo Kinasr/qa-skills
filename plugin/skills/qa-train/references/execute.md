@@ -2,7 +2,7 @@
 
 `/qa-train execute` writes `.qa/train/execute.md`: how to operate the application for a Tester.
 It holds Practices (`prc_`), data recipes (`rcp_`), API actions (`act_`), upload fixtures (`upl_`)
-and an optional frontmatter `setup_role`. Keys use kebab-case slugs, as the parent skill's keys do.
+and optional frontmatter `setup_role`, `redaction_exempt` and `automation_retries`. Keys use kebab-case slugs, as the parent skill's keys do.
 
 ## Gather evidence
 
@@ -31,6 +31,10 @@ existing fixtures and setup paths, and mark a named fixture disposable. A Practi
 the Tester's rules is void; the rules win. The orchestrating skill reads every Practice. The Tester
 receives unscoped Practices plus entries of any of the four kinds whose `features` includes its
 Feature. Give recipes, actions and upload fixtures Feature scopes so the right Tester receives them.
+
+One Practice may set `level: <slug>` to name the default Test level a Layer-free case runs at.
+The level must be a key of `execute_levels`, and only one Practice may name one; it replaces the
+single `browser`-mode default.
 
 A data recipe records a creation path, named existing fixtures, or both:
 
@@ -81,6 +85,21 @@ gate. A missing covering Access note for that Role on the selected target causes
 and omits the helper session; a case that needs it then Blocks `precondition`. Teach login access
 through a separate `/qa-train access` run.
 
+Frontmatter may add `redaction_exempt: [sessions, sessionCount]` when the engineer declares those
+body fields or `tester do` page-text pair names safe to show, including snapshot controls' accessible
+names and non-JSON response bodies. JSON keys match exact names case-insensitively. Page-text pair
+keys and snapshot accessible names match a trailing word run case-insensitively only after
+allowlisted leading count words such as `Total`, never state words such as `Current` or `Active`.
+Declaring `sessions` keeps `Total sessions: 3`,
+but `password sessions: x` and `activeSessions: 9` still lose their values. Declared names must be
+credential-named with only `session(s)`, `cookie(s)` or `token(s)` credential words. Password, secret, API key,
+private key, bearer, authorization and session-cookie identifier names cannot be exempted.
+Only leaf values survive; objects and arrays still lose their whole value. Strings still pass the
+token-format and page-text scrubs. `execute open` pins the list from the Run's root into the guard,
+including for anonymous sessions. Headers, `{name, value}` entries, URL queries, playwright errors, outward text and
+training's credential refusals keep their usual scrubs. Explain the exact field names at the gate;
+this declaration belongs here rather than in an Access note.
+
 Frontmatter may also add `automation_retries`, an integer from 0 to 5 that defaults to 2. It is the
 number of extra attempts a failing Automation gets in `/qa-execute`; a stack's own retry config can
 add attempts that still count. It is a fact about this project's tolerance, not a Practice.
@@ -109,6 +128,6 @@ Access note accounts and named shared fixtures are protected from destructive ac
 contradictory operating paths, dead Feature scopes, missing fixture files and an unknown setup Role
 as coherence findings, then use the parent's three-way gate.
 
-Draft the whole agreed file and run `train check execute --stdin`. Fix every structural or relational
+Draft the whole agreed file and run `train check execute --input <file>`. Fix every structural or relational
 error, settle every outcome warning, and write only when the parent's gate and check both pass.
 The close hands refused outcome claims to `/qa-deep-dive` as the parent skill specifies.

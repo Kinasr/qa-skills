@@ -25,10 +25,10 @@ export function fixSelections(repo, config) {
 /**
  * Recheck after each reverse-order rollback. Each rollback removes only that item's delta and
  * rebuilds the surviving commits before another test process or branch preparation can see them.
- * @param {{ state: FollowUps, pinned: ExecutePlan, repo: string, dir: string, selections: AutomationSelection[], refresh: () => AutomationSelection[], env: Record<string, string | undefined>, save: () => void }} input
+ * @param {{ state: FollowUps, pinned: ExecutePlan, root: string, repo: string, dir: string, selections: AutomationSelection[], refresh: () => AutomationSelection[], env: Record<string, string | undefined>, save: () => void }} input
  * @returns {{ ok: boolean, checked: number, rolled_back: string[], text: string }}
  */
-export function regressFix({ state, pinned, repo, dir, selections, refresh, env, save }) {
+export function regressFix({ state, pinned, root, repo, dir, selections, refresh, env, save }) {
   const rolled = [...(state.regress?.rolled_back ?? [])];
   mkdirSync(join(dir, 'regress'), { recursive: true });
   const batch = mkdtempSync(join(dir, 'regress', 'check-'));
@@ -47,7 +47,7 @@ export function regressFix({ state, pinned, repo, dir, selections, refresh, env,
     if (!pinned.automation?.runner) return false;
     const output = join(batch, String(cycle), selection.id.replace(/[^\w-]/g, '_'));
     mkdirSync(output, { recursive: true });
-    return proveSelection({ selection, runner: pinned.automation.runner, repo, dir: output, origin: state.target.origin, env, retries: 0 }, 1).passed;
+    return proveSelection({ selection, runner: pinned.automation.runner, root, repo, dir: output, origin: state.target.origin, env, retries: 0 }, 1).passed;
   };
   /** @param {string} id */
   const rollback = id => {

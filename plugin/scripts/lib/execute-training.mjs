@@ -28,6 +28,7 @@ import { EXECUTE_TRAIN_KEY, TRAIN_ENTRIES } from "./schema.mjs";
  *   data: {
  *     key?: unknown,
  *     setup_role?: string,
+ *     redaction_exempt?: string[],
  *     automation_retries?: number,
  *     [key: string]: unknown,
  *   },
@@ -58,6 +59,7 @@ import { EXECUTE_TRAIN_KEY, TRAIN_ENTRIES } from "./schema.mjs";
  *   required?: Record<string, unknown>,
  *   tag_field?: string,
  *   disposable?: boolean,
+ *   level?: string,
  *   [key: string]: unknown,
  * }} ExecuteTrainingEntry
  */
@@ -73,8 +75,11 @@ import { EXECUTE_TRAIN_KEY, TRAIN_ENTRIES } from "./schema.mjs";
  */
 
 /**
+ * The optional `default_levels` are the distinct Test levels Practices name with `level`; a
+ * Layer-free case runs at one when a single Practice names one. Membership in `execute_levels`
+ * is checked by `executeIntegrity`, not read here.
  * @param {ParsedTrainFile | null | undefined} file
- * @returns {{ setup_role?: string, automation_retries: number, entries: ExecuteTrainingEntry[] }}
+ * @returns {{ setup_role?: string, redaction_exempt?: string[], automation_retries: number, default_levels?: string[], entries: ExecuteTrainingEntry[] }}
  */
 export function executeTraining(file) {
   const raw = file?.type === "train" && file.data.key === EXECUTE_TRAIN_KEY ? file.data.automation_retries : undefined;
@@ -85,7 +90,14 @@ export function executeTraining(file) {
       ...e.data, kind: prefix.slice(0, -1), key: e.key, heading: e.statement, line: e.line,
       prose: e.prose.map((p) => p.text).join("\n").trim(),
     })))).sort((a, b) => a.line - b.line);
-  return { automation_retries: retries, ...(file.data.setup_role !== undefined && { setup_role: file.data.setup_role }), entries };
+  const defaultLevels = [...new Set(entries.filter((e) => e.kind === "prc" && typeof e.level === "string" && e.level.trim()).map((e) => /** @type {string} */ (e.level)))];
+  return {
+    automation_retries: retries,
+    ...(file.data.setup_role !== undefined && { setup_role: file.data.setup_role }),
+    ...(file.data.redaction_exempt !== undefined && { redaction_exempt: file.data.redaction_exempt }),
+    ...(defaultLevels.length && { default_levels: defaultLevels }),
+    entries,
+  };
 }
 
 // A committed upload must resolve to a real file inside .qa/fixtures/, including through links.
@@ -107,10 +119,15 @@ export function fixtureExists(root, name) {
 
 /**
  * @param {ParsedTrainFile | null | undefined} file
- * @param {{ root: string, roles: ReadonlySet<string> | Set<string>, features: ReadonlySet<string> | Set<string> }} options
+ * @param {{
+ *   root: string,
+ *   roles: ReadonlySet<string> | Set<string>,
+ *   features: ReadonlySet<string> | Set<string>,
+ *   execute_levels?: Record<string, unknown>,
+ * }} options
  * @returns {IntegrityError[]}
  */
-export function executeIntegrity(file, { root, roles, features }) {
+export function executeIntegrity(file, { root, roles, features, execute_levels = {} }) {
   if (file?.type !== "train" || file.data.key !== EXECUTE_TRAIN_KEY) return [];
   /** @type {IntegrityError[]} */
   const errors = [];
@@ -119,6 +136,8 @@ export function executeIntegrity(file, { root, roles, features }) {
   if (typeof role === "string" && role.trim() && !roles.has(role)) {
     report("unknown_role", "setup_role", file.keyLines.setup_role, "`setup_role` is not in `project.roles`");
   }
+  /** @type {Set<string>} */
+  const namedLevels = new Set();
   for (const { list } of TRAIN_ENTRIES) for (const e of /** @type {ParsedTrainEntry[]} */ (file[list])) {
     const at = (/** @type {string} */ key) => e.keyLines[key] ?? e.blockLine;
     if (Array.isArray(e.data.features)) for (const feature of e.data.features) {
@@ -126,6 +145,15 @@ export function executeIntegrity(file, { root, roles, features }) {
     }
     if (list === "uploads" && isFixtureName(/** @type {string} */ (e.data.file)) && !fixtureExists(root, /** @type {string} */ (e.data.file))) {
       report("missing_fixture", `${shownKey(e.key)}.file`, at("file"), "upload `file` is not an existing file under `.qa/fixtures/`");
+    }
+    if (list === "practices" && typeof e.data.level === "string") {
+      if (!Object.hasOwn(execute_levels, e.data.level)) {
+        report("unknown_execute_level", `${shownKey(e.key)}.level`, at("level"), "a Practice's `level` must name an entry in `execute_levels`");
+      }
+      if (namedLevels.size && !namedLevels.has(e.data.level)) {
+        report("default_level_conflict", `${shownKey(e.key)}.level`, at("level"), "only one Practice may name the default Test level");
+      }
+      namedLevels.add(e.data.level);
     }
   }
   return errors;

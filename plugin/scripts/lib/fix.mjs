@@ -20,6 +20,7 @@ import { scrubPageText } from './credentials.mjs';
 /** @import { CommandDefinition, CommandContext, CommandResult } from './cli.mjs' */
 /** @import { FollowUps, FixItem } from './follow-ups.mjs' */
 /** @import { PrTree } from './pr-git.mjs' */
+/** @import { RefusalResult } from './refusal.mjs' */
 import { planPr, commitPrItem, prActions, prResult } from './pr.mjs';
 import { fixConventions } from './fix-conventions.mjs';
 import { regressionDependents } from './stacks/regress-refs.mjs';
@@ -27,7 +28,7 @@ import { baselineFix } from './fix-baseline.mjs';
 import { fixSelections, regressFix } from './fix-regress.mjs';
 import { fixTraining } from './fix-training.mjs';
 import { CODEFIX_TRAIN_KEY } from './schema.mjs';
-/** @typedef {{ before: PrTree, last: PrTree, verified?: PrTree, attempts: number, passed: boolean, brief: string, sources: string[], handoffSources: string[], index: string, error?: string, evidence?: string }} FixWork */
+/** @typedef {{ before: PrTree, last: PrTree, verified?: PrTree, attempts: number, passed: boolean, brief: string, sources: string[], handoffSources: string[], index: string, error?: string, evidence?: string, fixedBy?: string }} FixWork */
 /** @typedef {{ items: Record<string, FixWork>, done?: string[], standalone?: boolean, regression?: import('./test-runner.mjs').AutomationSelection[], regressPassed?: boolean }} FixSession */
 
 
@@ -110,6 +111,17 @@ function brief(run, item) {
   ].join('\n\n'));
   return { text, sources: sources.map(scrub), handoffSources: handoffSources.map(scrub), error: scrub(error), evidence: scrub(evidence.join('\n\n')) };
 }
+/**
+ * The done item whose edit last touched the tree, other than `id`; null when no done item has a diff.
+ * @param {FollowUps} state @param {string} id @returns {string | null}
+ */
+function earlierFix(state, id) {
+  for (const done of [...(state.fix?.done ?? [])].reverse()) {
+    const work = state.fix?.items[done];
+    if (done !== id && work?.verified && Object.keys(diffTrees(work.before, work.verified)).length) return done;
+  }
+  return null;
+}
 /** @param {ReturnType<typeof open>} run @param {FixItem} item @param {FixWork | undefined} work @returns {void} */
 function restore(run, item, work) {
   if (work) {
@@ -176,7 +188,7 @@ function act(action, args, ctx) {
     state.fix.regression ??= selections;
     state.fix.regressPassed = false;
     save(dir, state);
-    const result = regressFix({ state, pinned, repo, dir, selections: state.fix.regression, refresh: () => fixSelections(repo, config), env: ctx.env, save: () => save(dir, state) });
+    const result = regressFix({ state, pinned, root: run.root, repo, dir, selections: state.fix.regression, refresh: () => fixSelections(repo, config), env: ctx.env, save: () => save(dir, state) });
     state.fix.regressPassed = result.ok;
     save(dir, state);
     return { exit: result.ok ? 0 : 1, json: result };
@@ -219,16 +231,20 @@ function act(action, args, ctx) {
     if (!String(ctx.hypothesis).trim()) return refuse('empty_hypothesis');
     const training = fixTraining(trainingFile);
     if (work.attempts >= training.fix_attempts) return fail(run, item, work, 'cap-reached');
-    if (equal(work.last, now)) return refuse('code_unchanged');
+    // An item's first verify runs on an unchanged tree when an earlier done item's edit may have
+    // repaired it; any later unchanged verify is refused.
+    const fixedBy = equal(work.last, now) && work.attempts === 0 ? earlierFix(state, item.id) : null;
+    if (equal(work.last, now) && !fixedBy) return refuse('code_unchanged');
     const selection = pinned.automation?.selections.find(selection => selection.id === item.automation);
     if (!selection || !pinned.automation?.runner) return fail(run, item, work, 'blocked');
     work.attempts += 1; work.last = now; work.passed = false; delete work.verified;
+    if (fixedBy) work.fixedBy = fixedBy; else delete work.fixedBy;
     item.hypothesis = scrub(ctx.hypothesis);
     // Persist the charged attempt before invoking a process; interruption cannot reset the cap.
     save(dir, state);
     const output = join(dir, 'fix', item.id, String(work.attempts));
     mkdirSync(output, { recursive: true });
-    const proof = proveSelection({ selection, runner: pinned.automation.runner, repo, dir: output, origin: state.target.origin, env: ctx.env, retries: 0 }, item.route === 'flaky' ? training.flaky_repeats : 1);
+    const proof = proveSelection({ selection, runner: pinned.automation.runner, root: run.root, repo, dir: output, origin: state.target.origin, env: ctx.env, retries: 0 }, item.route === 'flaky' ? training.flaky_repeats : 1);
     work.passed = proof.passed;
     item.diagnostics = proof.diagnostics;
     if (work.passed) work.verified = now;
@@ -250,7 +266,8 @@ function act(action, args, ctx) {
   if (semantic.length) return { exit: 1, json: { ok: false, refusals: semantic } };
 
   if (edits.some(edit => state.dirty.includes(edit.path))) return refuse('dirty');
-  if (state.pr && state.pr.mode.kind !== 'working-tree') {
+  // An item passing with no diff of its own closes as fixed by the earlier item, with no commit.
+  if (state.pr && state.pr.mode.kind !== 'working-tree' && edits.length) {
     const committed = commitPrItem(state.pr, {
       id: item.id, automation: item.automation, file: item.file, route: item.route, summary: scrub(ctx.summary),
       cases: pinned.executions.filter(ex => item.cases.includes(ex.key)).map(ex => ({ key: ex.key, summary: ex.summary })),
@@ -264,6 +281,7 @@ function act(action, args, ctx) {
   delete state.fix.regression;
   state.fix.done = [...(state.fix.done ?? []), item.id];
   item.state = 'done'; item.summary = scrub(ctx.summary);
+  if (!edits.length) item.outcome = work.fixedBy ? `fixed-by ${work.fixedBy}` : 'already-passing';
   if (ctx['assertions-reduced']) item.assertions_reduced = scrub(ctx['assertions-reduced']);
   save(dir, state);
   return { exit: 0, json: { ok: true, item, text: `${item.id}: done — ${item.summary}` } };
@@ -279,7 +297,12 @@ const FORMS = {
   regress: { options: {}, usage: '' },
 };
 /** @type {CommandDefinition} */
-export const command = { actions: { ...Object.fromEntries(Object.entries(FORMS).map(([action, form]) => [action, {
+export const command = {
+  refuse: (err) => {
+    const refusal = /** @type {{ detail?: { refusal?: RefusalResult } }} */ (err).detail?.refusal;
+    return refusal ?? { exit: 2, json: { ok: false, error: err.message } };
+  },
+  actions: { ...Object.fromEntries(Object.entries(FORMS).map(([action, form]) => [action, {
   options: { dir: 'value', root: 'qa-dir', ...form.options },
   // `codefix plan` also starts a standalone Run from keys, so it states the whole form itself.
   usage: action === 'plan' ? form.usage : `--dir <run-dir>${form.usage ? ` ${form.usage}` : ''} [--root <qa-dir>]`,

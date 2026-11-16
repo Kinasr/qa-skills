@@ -53,8 +53,7 @@ node scan.mjs delegate next --dir <dir>
   2. Record it:
 
      ```
-     node scan.mjs delegate record --dir <dir> --unit <unit> --attempt <attempt> \
-       [--status failed|timeout|refused] [--wall-ms <ms>]
+     node scan.mjs delegate record --dir <dir> --unit <unit> --attempt <attempt> [--status failed|timeout|refused] [--wall-ms <ms>]
      ```
 
      Choose `--status` by what happened to the item:

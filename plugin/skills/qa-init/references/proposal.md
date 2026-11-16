@@ -1,6 +1,6 @@
 # Building the /qa-init proposal
 
-The proposal is the JSON you pipe to `init card --stdin`: every value with the evidence it came
+The proposal is the JSON you pass to `init card --input <file>`: every value with the evidence it came
 from. Read the repository with shell counts (`find`, `grep`) and its guidance files (`AGENTS.md`,
 `CLAUDE.md`, `README*`, `CONTRIBUTING*`, `docs/`).
 
@@ -8,8 +8,9 @@ from. Read the repository with shell counts (`find`, `grep`) and its guidance fi
 
 Every value carries evidence: `{file, count, sample}` (where it came from, how many hits, one
 verbatim hit), `{tracker, count, sample}` for a value read from the tracker ("Jira field Role"), or
-`{"asked": true}` for the engineer's answer. `stack.levels` may add its `histogram`
-(`{"ui": 524, "api": 308}`) and `docs: {file, quote}`.
+`{"asked": true}` for the engineer's answer, with `hint` for one line the repository shows that
+suggests the answer without giving it. The question belongs on the Card, never in the evidence.
+`stack.levels` may add its `histogram` (`{"ui": 524, "api": 308}`) and `docs: {file, quote}`.
 
 | Field | Evidence |
 |---|---|
@@ -19,24 +20,36 @@ verbatim hit), `{tracker, count, sample}` for a value read from the tracker ("Ji
 | `stack.levels` | the first token of test function names, as a histogram, beside what the guidance files say; asked when there is no signal |
 | `targets` | name → exact http/https origin from application configuration or guidance, with file, count and sample; ask when unknown |
 | `execute_levels` | level → `browser` or `api`, using only keys in `stack.levels`, from the chosen stack's tests or guidance; ask when unclear |
+| `level_targets` | level → target name in `targets` (using only keys in `execute_levels`), only from repository evidence when split across origins; otherwise leave it out, because the Card itself asks for it when `targets` and `execute_levels` each hold more than one entry |
 | `tracker.provider` | asked, or confirmed from a tracker connection you have |
 | `tracker.project`, `tracker.key_pattern` | the value shape of the tracker-key annotation's values |
 | `annotation_map.tracker_key_fn`, `.tracker_key_class` | annotations whose values match `key_pattern`, on functions and on classes |
-| `annotation_map.automation_key` | an existing annotation with `aut_` values, else asked, proposing `Automation` |
-| `roles` | the **tracker's Role field** (its allowed values), else asked; may be empty |
+| `annotation_map.automation_key` | an existing Key carrier holding `aut_` values, else asked: propose a Key carrier the chosen stack writes (`tag` on Playwright, `Automation` on Kotlin) |
+| `roles` | the **tracker's Role field** (its allowed values), else asked with any repository hint in `hint`; may be empty |
 | `role_meaning`, `tags`, `custom_fields` | see [the labels reference](labels.md) |
 
 - **Roles come from the tracker, never from test code** (`@Test.User` is who a test runs as).
+- **A carrier the stack writes.** A name the stack only reads, or one it does not use, holds no
+  Automation key: `init` refuses it and names the forms it accepts.
 - **No tracker.** Leave out the `tracker.*` fields.
 - **Story-only tracker.** Propose `tracker.provider`, `tracker.project` and `tracker.key_pattern`
   together; `issue_types` is optional and belongs to publishing below.
 - `concurrency_cap` has a default and is not asked.
+- `commit_mode` is offered as `ask`: `print` gives the engineer the commit, `ask` asks first, and
+  `auto` commits (ADR-0062). Propose another only when the engineer chooses it.
 
 Always propose both execution maps. Target names are slugs; origins have no path, trailing slash,
 query, fragment or user info. Never invent an origin. For an unknown origin, include
 `"targets": {"value": null, "evidence": {"asked": true}}` so the Card asks for the map.
 Use the same unanswered shape for `execute_levels` when its modes are unclear. A map with
 `{"asked": true}` needs a `value` answer on the Card, or an explicit drop; a dropped map is omitted.
+Leave `level_targets` out unless repository evidence binds levels to distinct targets: the Card asks
+for `level_targets` only when `targets` and `execute_levels` each hold more than one entry, and
+shows a Suggested answer only when each executable level pairs cleanly with one target slug.
+When the evidence binds them (the runner config's per-project base URLs, for one), propose that
+pairing, on maintenance as on a first run; the maintenance Card asks for an unset map too.
+When `level_targets` is set or asked on the Card, narrow `target_env` to the origin the Run reaches
+as directed under `test_runner.target_env` below.
 Both maps are checked by `check-file` and written only on acceptance. On maintenance, propose only
 what was re-read; an unchosen detection leaves the existing map intact.
 
@@ -59,9 +72,22 @@ Propose a parameter map, never a shell command:
   or `./mvnw` else `mvn`. Optional `task`: Gradle only, default `test`.
 - Optional `args`: literal extra argv words; selection, output, reporter and retry flags belong
   to the CLI and are refused here.
-- Required `target_env`: names read by the tests for their base URL, from configuration or guidance.
-  Set `target_env: []` only when evidence or the engineer says the tests choose their own base URL.
-  Ask when those names are unknown; never store credentials or reserved process-control names.
+- Required `target_env`: ask how a Run points the tests at one Application target — the test
+  configuration fixes the origin, or a variable supplies it. Variable names found in configuration,
+  guidance or existing tests take precedence, such as `process.env.BASE_URL`. With the tool known
+  but no tests and no runner configuration, propose `target_env: [BASE_URL]` and mark the map
+  `{"asked": true}`, so the Card shows a suggested answer. Set `target_env: []` only when evidence
+  or the engineer says the configuration fixes the origin. A Reply naming an Application target,
+  or its origin, is no answer and never means `target_env: []`: ask again. Never store credentials
+  or reserved process-control names. On a project with more than one Target and `level_targets` set
+  or asked on the Card, every variable in `target_env` is overwritten with the Run's own origin on
+  every Run: propose only the variables for that Run's origin and leave variables for other origins
+  out so they keep the test configuration's default; name those omitted variables in Evidence. When
+  the evidence does not make plain which variable serves which origin, propose `test_runner` with
+  `value: null` and `{"asked": true}` plus a `hint` listing the candidate variables instead of
+  proposing both. On maintenance for a project with `level_targets` whose stored `target_env` names
+  more than one origin variable, re-read the runner configuration and propose the narrowed `target_env`
+  list; never rewrite `test_runner` without the engineer adopting or editing it.
 
 Read `origin` with `git remote get-url origin`. Infer `code_host: {tool: gh | glab}` from its host:
 GitHub uses `gh`; GitLab uses `glab`. Ask for unknown hosts, including an unidentified self-hosted
@@ -101,8 +127,10 @@ no type mapping: use the created names directly.
 The labels the engineer picked in section 2, one field per Tier: `tiers.deep`, `tiers.standard` and
 `tiers.light`. Each is
 `{"value": "<label>", "evidence": {"picked": true}}`: a pick is an answer, so the card asks nothing
-more. Leave a skipped Tier out: it then runs on `inherit`. A label other than
-`inherit` goes on only once its smoke test passed, in the run dir passed to `init card`.
+more. Each pick is a `picked_tiers` line on the Card with its label and, when one ran, its smoke-test result:
+it has no item number and needs no answer. Leave a skipped Tier out: it then runs on `inherit`. A
+label other than `inherit` goes on only once its smoke test passed, in the run dir passed to
+`init card`.
 
 ## Reaching the tracker
 

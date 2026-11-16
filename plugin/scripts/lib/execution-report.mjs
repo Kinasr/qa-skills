@@ -12,7 +12,7 @@
 //       status: established | checked | unmet | skipped
 //       how: …                            optional
 //   interpretations:                      optional
-//     - "<setup | step N | expected>: <what the text left open> → <what I did>"
+//     - "<setup | step N | after step N | expected>: <what the text left open> → <what I did>"
 //   ```
 //   then labelled prose: **Expected.** and **Seen.** (failed), **Why.** (blocked), optional **Evidence.**
 //
@@ -20,12 +20,14 @@
 // plan's entry; its pinned `text` bounds `reached` by the case's steps and the preconditions by its own.
 // A problem is `{line, message}`, the line a 1-based line of the report and the message fixed words: what
 // the Tester wrote is never echoed back (it may hold a secret). Lengths are not checked: ingest clamps
-// them. `report` holds the YAML fields as written (an empty `interpretations` stays `[]`, for ingest to
-// drop) and the prose as `expected`, `seen`, `why`, `evidence`.
+// them. A malformed `interpretations` line is dropped from the record rather than failing the report:
+// the success then carries `dropped`, one fixed-word problem per dropped line at its own line. `report`
+// holds the YAML fields as written (an empty `interpretations` stays `[]`, for ingest to drop) and the
+// prose as `expected`, `seen`, `why`, `evidence`.
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { TESTER_REASONS } from "./check-file.mjs";
-import { GUARD_ONLY_STOPS } from "./execution-guard.mjs";
+import { INTERPRETATION_LINE, TESTER_REASONS } from "./check-file.mjs";
+import { GUARD_ONLY_STOPS, REPORT_FILE } from "./execution-guard.mjs";
 import { caseSteps, casePreconditions } from "./case-fields.mjs";
 import { isMap, parseYaml } from "./dialect.mjs";
 import { parse } from "./knowledge-file.mjs";
@@ -73,11 +75,13 @@ import { parse } from "./knowledge-file.mjs";
  * @typedef {{
  *   ok: true,
  *   report: ExecutionReport,
+ *   dropped?: ReportProblem[],
  *   problems?: never,
  * } | {
  *   ok: false,
  *   problems: ReportProblem[],
  *   report?: never,
+ *   dropped?: never,
  * }} ValidateReportResult
  */
 
@@ -98,13 +102,15 @@ import { parse } from "./knowledge-file.mjs";
  *   ok: true,
  *   problems?: never,
  *   report: ExecutionReport,
+ *   dropped?: ReportProblem[],
  * }} CheckedReportResult
  */
 
 const FIELDS = ["result", "reason", "reached", "created", "preconditions", "interpretations"];
 const RESULTS = ["passed", "failed", "blocked"];
 const STATUSES = ["established", "checked", "unmet", "skipped"];
-const INTERPRETATION = /^(?:setup|step [1-9]\d*|expected): .+ → .+$/;
+const INTERPRETATION_MESSAGE = "an interpretation is `<setup | step N | after step N | expected>: <what the text left open> → <what I did>`";
+const DROPPED_INTERPRETATION = `${INTERPRETATION_MESSAGE}; this line was dropped`;
 const LABELS = ["Expected", "Seen", "Why", "Evidence"];
 const REQUIRED = { passed: [], failed: ["Expected", "Seen"], blocked: ["Why"] };
 const nonEmpty = (/** @type {unknown} */ v) => typeof v === "string" && v.trim() !== "";
@@ -135,7 +141,21 @@ export function validateReport(text, execution) {
   const close = lines.findIndex((l, i) => i > open && l.trim() === "```");
   if (close < 0) return { ok: false, problems: [{ line: open + 1, message: "the `yaml` block is never closed" }] };
 
-  const yaml = parseYaml(lines.slice(open + 1, close).join("\n"), open + 2);
+  const block = lines.slice(open + 1, close);
+  // `interpretations` is read apart from the rest: one malformed item is dropped, not a parser failure
+  // for every field after it. The span is the key line and the lines that can belong to it; parsing the
+  // block with those lines blank keeps every other line number and field exactly as it was.
+  const keyAt = block.findIndex((l) => /^interpretations:(\s|$)/.test(l));
+  const span = new Set();
+  if (keyAt >= 0) {
+    span.add(keyAt);
+    for (let i = keyAt + 1; i < block.length; i++) {
+      const l = block[i];
+      if (l.trim() === "" || /^\s/.test(l) || /^-(?: |$)/.test(l)) span.add(i);
+      else break;
+    }
+  }
+  const yaml = parseYaml(block.map((l, i) => (span.has(i) ? "" : l)).join("\n"), open + 2);
   for (const e of yaml.errors) bad(e.line, "the `yaml` block is outside the report grammar");
   const d = yaml.data;
   const at = (/** @type {string} */ key) => yaml.keyLines[key] ?? open + 2;
@@ -151,9 +171,8 @@ export function validateReport(text, execution) {
   else if (counts && /** @type {number} */ (d.reached) > counts.steps) bad(at("reached"), "`reached` is past the case's last step");
 
   if (d.created !== undefined && !(Array.isArray(d.created) && d.created.every(nonEmpty))) bad(at("created"), "`created` is a list of labels");
-  if (d.interpretations !== undefined && !(Array.isArray(d.interpretations) && d.interpretations.every((s) => typeof s === "string" && INTERPRETATION.test(s)))) {
-    bad(at("interpretations"), "an interpretation is `<setup | step N | expected>: <what the text left open> → <what I did>`");
-  }
+  // The first key's span is blank above, so any `interpretations` left in the parse is a second key.
+  if (d.interpretations !== undefined) bad(at("interpretations"), INTERPRETATION_MESSAGE);
   if (d.preconditions !== undefined) checkPreconditions(d.preconditions, counts, at("preconditions"), bad);
 
   const prose = readProse(lines, close + 1, bad);
@@ -169,11 +188,56 @@ export function validateReport(text, execution) {
   }
   if (problems.length) return { ok: false, problems };
 
+  // Each piece of the span is parsed on its own, so one bad line cannot affect another. A piece that
+  // is not an interpretation is dropped with fixed words and its line; the Tester's text is never kept.
+  /** @type {ReportProblem[]} */
+  const dropped = [];
+  /** @type {string[]} */
+  const kept = [];
+  if (keyAt >= 0) {
+    const drop = (/** @type {number} */ i) => dropped.push({ line: open + 2 + i, message: DROPPED_INTERPRETATION });
+    const keyText = /** @type {string} */ (block[keyAt]).slice("interpretations:".length).trim();
+    const itemLines = [...span].filter((i) => i !== keyAt && /** @type {string} */ (block[i]).trim() !== "");
+    if (keyText === "") {
+      if (itemLines.length === 0) drop(keyAt);
+    } else {
+      const piece = parseYaml(`v: ${keyText}`);
+      const value = piece.data.v;
+      if (Array.isArray(value)) {
+        let itemDropped = false;
+        for (const item of value) {
+          if (typeof item === "string" && INTERPRETATION_LINE.test(item)) kept.push(item);
+          else {
+            drop(keyAt);
+            itemDropped = true;
+          }
+        }
+        if (piece.errors.length && !itemDropped) drop(keyAt);
+      } else drop(keyAt);
+    }
+    for (const i of span) {
+      if (i === keyAt) continue;
+      const line = /** @type {string} */ (block[i]);
+      if (line.trim() === "") continue;
+      const item = /^\s*-(?:\s(.*))?$/.exec(line);
+      const text = (item?.[1] ?? "").trim();
+      if (!item || !text) {
+        drop(i);
+        continue;
+      }
+      const piece = parseYaml(`v: ${text}`);
+      const value = piece.data.v;
+      if (piece.errors.length || typeof value !== "string" || !INTERPRETATION_LINE.test(value)) drop(i);
+      else kept.push(value);
+    }
+  }
+
   /** @type {Record<string, unknown>} */
   const report = {};
   for (const key of FIELDS) if (d[key] !== undefined) report[key] = d[key];
+  if (keyAt >= 0 && (kept.length || dropped.length === 0)) report.interpretations = kept;
   for (const name of LABELS) if (prose.sections.has(name)) report[name.toLowerCase()] = (/** @type {string} */ (prose.sections.get(name))).trim();
-  return { ok: true, report: /** @type {ExecutionReport} */ (report) };
+  return { ok: true, report: /** @type {ExecutionReport} */ (report), ...(dropped.length && { dropped }) };
 }
 
 const MAX_REPORT_BYTES = 262144;
@@ -191,7 +255,7 @@ const MAX_REPORT_BYTES = 262144;
  * @returns {CheckedReportResult}
  */
 export function checkedReport(execDir, execution, { stopped, used }) {
-  const file = join(execDir, "report.md");
+  const file = join(execDir, REPORT_FILE);
   if (!existsSync(file)) return { missing: true };
   if (statSync(file).size > MAX_REPORT_BYTES) return { ok: false, problems: [{ message: `larger than ${MAX_REPORT_BYTES} bytes` }] };
   const checked = validateReport(readFileSync(file, "utf8"), execution);

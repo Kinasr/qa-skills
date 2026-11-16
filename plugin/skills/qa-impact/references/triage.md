@@ -13,7 +13,7 @@ even with a fresh Review: accepting clears a passed `review_by` with the Review 
    stamps and Watermarks stay the CLI's to write. Run `check-file` on the file you edited. A `fix`
    answered with `accept` needs the fix committed first: the Review pins that commit.
 4. Translate only clear answers; ask on ambiguity. Retain clear decisions across clarification
-   turns. Send `design triage --dir <dir> --stdin` when every finding and review is answered:
+   turns. Run `design triage --dir <dir> --input <file>` when every finding and review is answered:
 
 Shape only:
 

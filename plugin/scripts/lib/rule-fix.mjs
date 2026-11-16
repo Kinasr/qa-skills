@@ -20,7 +20,7 @@ import { causeRefs, isOpenFinding, isStaleObligation } from "./stored-findings.m
 
 /** @type {Record<string, string>} */
 export const RULE_FIX_REFUSALS = {
-  rule_fix_arguments: "`rule-fix` takes the one Feature whose Rules the engineer fixed, as `rule-fix <feature> --dir <run-dir> --stdin`.",
+  rule_fix_arguments: "`rule-fix` takes the one Feature whose Rules the engineer fixed, as `rule-fix <feature> --dir <run-dir> --input <file>`.",
   no_feature: "No such Feature: a Rule fix follows the Rule edits of an existing Feature.",
   no_rule_edit: "The Feature's Rules in the working tree do not differ from HEAD: edit the Rule first and run `rule-fix` before committing it (the Scan owes a Stale for a Rule edit already committed once `impact plan --persist` runs again).",
   rules_edited_since_persist: "Rules reaching a Feature of this run were edited and committed after `persist`, without the Rule fix: checkpoint 2 would certify them unchecked. Run `impact plan --persist` again so the Scan stores the Stale they owe, or revert the edit.",

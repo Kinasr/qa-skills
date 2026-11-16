@@ -2,23 +2,27 @@
 // A Run's logins (ADR-0036): what `execute open` and the scheduler (`execute next`/`record`/`resume`)
 // agree on about a login kept for the Run, a note that cannot log in and the Executions that need it.
 //
-// A CLI login's state lives at `<run>/auth/<acc>.json`, mode 0600 in a 0700 dir: made lazily by the
-// first `execute open` that needs the note, loaded by later ones, deleted by the scheduler once no
-// unstarted Execution needs the note (`sweepAuth`), swept whole by `ingest`. The engineer's saved
-// `login_state` is never copied or deleted. Nothing here is a model's to read (the Tester's Read
-// guard denies `auth/`) and no function returns a state file's content.
+// A CLI login's state lives at `<run>/auth/<acc>.json`, mode 0600 in a 0700 dir: made by every
+// `execute open` that needs the note and loaded by that Execution alone, never by a later one (a case
+// that signed out may have revoked it); deleted by the scheduler once no unstarted Execution needs
+// the note (`sweepAuth`), swept whole by `ingest`. The engineer's saved `login_state` is never copied
+// or deleted. Nothing here is a model's to read (the Tester's Read guard denies `auth/`) and no
+// function returns a state file's content.
 //
-// Pausing and skipping are facts of `dispatch.json` (`paused`, `retried`, `skipped`, `stale`), kept as
+// Pausing and skipping are facts of `dispatch.json` (`paused`, `retried`, `skipped`), kept as
 // plain arrays so a Run survives between calls; the functions here change a state object in place and
 // leave the saving to the caller.
-import { chmodSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync } from "node:fs";
+import { existsSync, readdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { casePreconditions, stepActor } from "./case-fields.mjs";
 import { parse } from "./knowledge-file.mjs";
+import { createPrivacyRefusalError, ensurePrivateDir, isPrivacyRefusalError, moveSecretFileWin32 } from "./platform-privacy.mjs";
+
+export { isPrivacyRefusalError };
 
 /** @import { ExecuteDispatchState, ExecuteExecution, ExecuteSession } from "./execute.mjs" */
-/** @import { ExecutionGuard, ExecutionGuardStop, ExecutionLogEntry } from "./execution-guard.mjs" */
 /** @import { CaseFieldEntry } from "./case-fields.mjs" */
+/** @import { PrivacyContext } from "./platform-privacy.mjs" */
 
 /**
  * Result of skipping an Access note across queued units.
@@ -43,14 +47,15 @@ export const authFile = (runDir, acc) => join(runDir, AUTH_DIR, `${acc}.json`);
  * @param {string} runDir
  * @param {string} acc
  * @param {string} from
+ * @param {PrivacyContext} [context]
  * @returns {string}
  */
-export function keepAuth(runDir, acc, from) {
-  mkdirSync(join(runDir, AUTH_DIR), { recursive: true, mode: 0o700 });
-  chmodSync(join(runDir, AUTH_DIR), 0o700);
-  chmodSync(from, 0o600);
+export function keepAuth(runDir, acc, from, context = {}) {
+  const dirCheck = ensurePrivateDir(join(runDir, AUTH_DIR), context);
+  if (!dirCheck.ok) throw createPrivacyRefusalError(dirCheck.refusal);
   const kept = authFile(runDir, acc);
-  renameSync(from, kept);
+  const moved = moveSecretFileWin32(from, kept, context);
+  if (!moved.ok) throw createPrivacyRefusalError(moved.refusal);
   return kept;
 }
 
@@ -87,21 +92,6 @@ export function sweepAuth(runDir, state, byId) {
   for (const file of readdirSync(dir)) {
     if (file.endsWith(".json") && !needed.has(file.slice(0, -".json".length))) rmSync(join(dir, file), { force: true });
   }
-}
-
-// The notes whose login the Execution just recorded may have ended: a Role's last call landed on the
-// sign-in page (`at_login`), or the guard stopped it `no-access`, which the last logged call caused.
-/**
- * @param {ExecutionGuard | null | undefined} guard
- * @returns {string[]}
- */
-export function endedStale(guard) {
-  if (!Array.isArray(guard?.sessions) || !Array.isArray(guard.log)) return [];
-  const accOf = new Map(guard.sessions.map((s) => [s.role, s.acc]));
-  const last = new Map(guard.log.map((e) => [e.role, e]));
-  const stale = new Set([...last].filter(([, e]) => e.at_login).map(([role]) => accOf.get(role)));
-  if (guard.stopped === "no-access" && guard.log.length) stale.add(accOf.get((/** @type {ExecutionLogEntry} */ (guard.log.at(-1))).role));
-  return /** @type {string[]} */ ([...stale].filter(Boolean));
 }
 
 // Whether session `s` of Execution `ex` is only the `setup_role` helper: a setup session that no

@@ -6,6 +6,7 @@ import { glossaryOf, labelOf, keyLabel } from "./labels.mjs";
 import { table } from "./markdown.mjs";
 
 /** @import { Override, Repeat } from "./design-duplicates.mjs" */
+/** @import { PlanSkip, PlanSkipReason } from "./design.mjs" */
 
 // What each step takes, for `bad_arguments`.
 /** @type {Record<string, string>} */
@@ -15,12 +16,14 @@ const ARGUMENTS = {
   plan: "one Feature key and at most one scenario key",
   split: "exactly one Feature key",
   report: "no argument, only the run directory",
+  keep: "no argument, only the run directory and the kept items on standard input",
+  unbind: "exactly one Test Case key and the run directory",
 };
 
 // One factual line for each refusal code.
 /** @type {Record<string, string>} */
 export const REFUSALS = {
-  unknown_action: "The /qa-design step is missing or does not exist; the steps are state, agree, split, override, plan and report.",
+  unknown_action: "The /qa-design step is missing or does not exist; the steps are state, agree, split, override, plan, report, keep and unbind.",
   dir_and_out: "--dir and --out both name the run directory; --out is only --dir's old name.",
   bad_arguments: "The step was given the wrong arguments.",
   expand_and_regenerate: "A run takes --expand or --regenerate, not both.",
@@ -31,7 +34,17 @@ export const REFUSALS = {
   split_not_json: "The canonical agreement is not JSON; nothing was written.",
   no_override: "The engineer's reasons are read from standard input, and none was given.",
   bad_override: "The engineer's reasons are a JSON object of a stored case's Key to a non-blank reason; nothing was written.",
+  unbind_not_written: "This Run did not write the case; nothing was changed.",
+  unbind_kept: "The case is already committed or reviewed; nothing was changed.",
+  unbind_missing: "The case this Run wrote no longer resolves uniquely; nothing was changed.",
+  unbind_check: "The unbound case would fail its file check; nothing was changed.",
+  unbind_history: "The repository history could not be read; nothing was changed.",
   mint_failed: "No free key could be minted for the new scenario files; nothing was written.",
+  no_keep: "The kept Proposed Rules are read from standard input, and none was given.",
+  bad_keep: "The kept Proposed Rules are a JSON object `{\"keep\": [{\"item\": <report item number>, \"statement\"?: \"<the engineer's rewording>\"}]}`; nothing was written.",
+  unknown_proposal: "A kept item number is not in this Run's report of Proposed Rules; nothing was written.",
+  keep_no_feature: "The Feature file could not be read; nothing was written.",
+  keep_check: "The Feature's `## Proposed Rules` does not pass its check, so nothing was written; fix the section by hand first.",
 };
 
 /**
@@ -45,8 +58,9 @@ export const REFUSALS = {
  */
 
 // Why a scenario file is no unit of the run, as the end of a sentence about it. `brief design`
-// refuses a file the same way, in the same words.
-/** @type {Record<string, SkippedFact>} */
+// refuses a file the same way, in the same words. Keyed by the plan's reason union (lib/design.mjs
+// `PLAN_SKIP_REASONS`), so a reason with no line here fails the type check.
+/** @type {Record<PlanSkipReason, SkippedFact>} */
 export const SKIPPED = {
   populated: () => "already holds Test Cases: a bare run fills empty scenario files only; `--expand` adds to one, `--regenerate` redoes one",
   not_populated: ({ mode }) => `has no Test Cases to ${mode}: a bare run fills an empty scenario file`,
@@ -54,6 +68,7 @@ export const SKIPPED = {
   waived_only: () => "has no uncovered Rule without a Waiver: `--expand` has nothing left to cover",
   fails_check: () => "cannot be designed: its file does not pass its check",
   unaddressable: () => "cannot be designed: its key is declared by more than one scenario file",
+  not_agreed: () => "keeps its Test Cases: the agreement did not name it",
 };
 
 // Why a unit's cases were not written.
@@ -85,15 +100,19 @@ export const PROBLEMS = {
   duplicate_role: "A Test Case lists a step Role more than once.",
   unused_role: "A Test Case lists a Role that acts in no step.",
   unknown_actor: "A Test Case's actor prefix is missing or names an unexpected Role.",
-  no_level: "A Test Case must name its own level.",
+  bad_level: "A Test Case has an invalid level binding.",
+  binding_reason_required: "A bound Test Case has no binding reason.",
   unagreed_level: "A Test Case is at a level outside the scenario's agreement.",
   unknown_level: "A Test Case is at a level the project does not list.",
   bad_steps: "A Test Case's steps could not be read.",
   empty_steps: "A Test Case has no steps.",
   bad_preconditions: "A Test Case's preconditions could not be read.",
   bad_automatable: "A Test Case does not say whether it can be automated.",
+  bad_manual: "A Test Case does not say whether a Tester can perform it.",
   empty_expected: "A Test Case has no Expected-result paragraph.",
   bad_proposed_rule: "A proposed Rule could not be read.",
+  bad_check_gap: "A check gap could not be read: it names no one-line Test Case summary or states no need.",
+  unknown_check_case: "A check gap names a Test Case the reply did not propose.",
 };
 
 // Why a label a reply assigned was dropped: a label is checked apart from the case's claim, so the
@@ -142,33 +161,6 @@ export const { fact, refuse } = refusalsFor(REFUSALS, (code, data) => ({ ...(cod
  */
 
 /**
- * The question `design state` asks when empty scenario files need agreed levels: each file by label, and
- * the one level worth suggesting, which is only one the data may give.
- * @typedef {object} LevelQuestion
- * @property {{ scenario: string, label: string }[]} files
- * @property {string | null} suggested
- * @property {GlossaryEntry[]} glossary
- */
-
-// A scenario file and `/qa-design`'s own piece of the glossary.
-const LEVEL = { term: "Level", explanation: "the layer a Test Case exercises; agree the wanted levels for each scenario, then name one on every case" };
-
-/**
- * The question `design state` asks when empty scenario files need agreed levels.
- * @param {string[]} files
- * @param {string[]} levels
- * @param {(key: string) => string | undefined} summaryOf
- * @returns {LevelQuestion}
- */
-export function levelQuestion(files, levels, summaryOf) {
-  return {
-    files: files.map((scenario) => ({ scenario, label: keyLabel(scenario, summaryOf(scenario)) })),
-    suggested: levels.length === 1 ? levels[0] : null,
-    glossary: [LEVEL],
-  };
-}
-
-/**
  * A reason as data: its code with its one factual line.
  * @param {string} code
  * @param {string} line
@@ -185,6 +177,7 @@ const withLine = (code, line) => ({ code, line });
  * @property {number} cases_written
  * @property {string[]} cases
  * @property {string[]} not_automatable
+ * @property {string[]} not_manual
  * @property {{ key: string, summary: string }[]} replaced
  * @property {Array<Omit<Override, "summary"> & { key: string }>} [overridden] - the written cases that
  *   repeat a stored case and the engineer stated why they are a distinct pass
@@ -233,6 +226,12 @@ const withLine = (code, line) => ({ code, line });
  */
 
 /**
+ * One check gap as design hands it to `/qa-train design`: the case's Key when the Run wrote it, and
+ * what checking its Expected result needs.
+ * @typedef {{ scenario: string, key: string | null, case: string, needs: string }} ReportCheckGap
+ */
+
+/**
  * One agreed obligation's outcome after the Run: `covered` when a stored case names its Rule, and
  * otherwise why the run delivered no evidence. `omitted` is a unit that wrote other cases but not
  * this Rule (a regenerate's replaced-only coverage included); `awaiting` is a proposal-only unit;
@@ -259,6 +258,18 @@ const withLine = (code, line) => ({ code, line });
  * @property {"declared coverage"} label
  * @property {DeclaredScenario[]} scenarios
  * @property {string | null} markdown
+ */
+/**
+ * One numbered entry of the report's single list of Proposed Rules the engineer may keep
+ * (ADR-0067): every Delegate's and every hand-off's, each statement once. `scenario` is null for a
+ * proposal the agreement made; `kept` says the Feature already holds the statement.
+ * @typedef {object} ReportProposal
+ * @property {number} item
+ * @property {string} statement
+ * @property {string} [why]
+ * @property {string | null} scenario
+ * @property {string} [label] - the scenario's label, in the report's JSON only
+ * @property {boolean} kept
  */
 /**
  * One proposed Rule in the report's hand-offs: a pre-dispatch proposal from the agreement, or one
@@ -294,12 +305,20 @@ const withLine = (code, line) => ({ code, line });
  * @property {boolean} dispatched
  * @property {string[] | undefined} delegate
  * @property {ReportScenario[]} scenarios
+ * @property {ReportBinding[]} bindings
+ * @property {{ code: string, scenario: string, key: string, file: string, missing_levels: string[] }[]} case_warnings
  * @property {{ code: string, scenario: string, level: string, file: string }[]} missing_levels
- * @property {{ scenario: string, file: string, status: string, reason: string, problems?: string[] }[]} skipped
+ * @property {PlanSkip[]} skipped
  * @property {number} cases_written
+ * @property {import("./design-questions.mjs").RunQuestion[]} questions
+ * @property {string | null} question_handoff
+ * @property {ReportCheckGap[]} check_gaps
+ * @property {string | null} check_handoff
  * @property {ReportProposed[]} proposed_rules
+ * @property {ReportProposal[]} proposals
+ * @property {string | null} keep - the `design keep` command when any proposal is not yet kept
  * @property {string} handoff
- * @property {{ scenario: string, file: string, needs_level: boolean }[]} still_empty
+ * @property {{ scenario: string, file: string }[]} still_empty
  * @property {string | null} rerun
  * @property {{ scenario: string, command: string }[]} reruns
  * @property {RunHealth | null} run_health
@@ -346,20 +365,34 @@ const withLine = (code, line) => ({ code, line });
  * @property {string[] | null} delegates
  * @property {number} cases_written
  * @property {ReportScenarioLine[]} scenarios
+ * @property {ReportBinding[]} bindings
+ * @property {{ code: string, scenario: string, key: string, file: string, missing_levels: string[] }[]} case_warnings
  * @property {{ code: string, scenario: string, level: string, file: string }[]} missing_levels
  * @property {string | null} written_markdown
  * @property {{ scenario: string, key: string, label: string }[]} not_automatable
+ * @property {{ scenario: string, key: string, label: string, automatable: boolean }[]} not_manual
  * @property {{ scenario: string, label: string, file: string, status: string, reason: { code: string, line: string } }[]} skipped
- * @property {{ scenario: string, label: string, file: string, needs_level: boolean }[]} still_empty
+ * @property {{ scenario: string, label: string, file: string }[]} still_empty
  * @property {string | null} rerun
  * @property {{ scenario: string, label: string, command: string }[]} reruns
+ * @property {import("./design-questions.mjs").RunQuestion[]} questions
+ * @property {string | null} question_handoff
+ * @property {ReportCheckGap[]} check_gaps
+ * @property {string | null} check_handoff
  * @property {ReportProposed[]} proposed_rules
+ * @property {ReportProposal[]} proposals
+ * @property {string | null} keep - the `design keep` command when any proposal is not yet kept
  * @property {string} handoff
  * @property {{ run: string, calls: number, announcements: string[], retried: { scenario: string | null, label: string, attempts: number }[], notes: { code: string, line: string, allowed?: number }[] } | null} run_health
  * @property {DesignChangeset} changeset
  * @property {DeclaredCoverage} [declared_coverage] - the agreed obligations, when an agreement was recorded
  * @property {ReportHandoffs} [handoffs] - the agreement's hand-offs and awaiting units' proposals, when one was recorded
  * @property {GlossaryEntry[]} glossary
+ */
+
+/**
+ * A binding this Run wrote, retaining its original levels and reason after an unbinding.
+ * @typedef {{ key: string, scenario: string, file: string, level: import("./case-fields.mjs").CaseLevel, reason: string, unbound?: boolean }} ReportBinding
  */
 
 // The closing report as data. `m` is what `report` in lib/design.mjs gathers; `summaryOf` gives
@@ -419,15 +452,26 @@ export function reportData(m, summaryOf) {
     cases_written: m.cases_written,
     scenarios,
     missing_levels: m.missing_levels,
+    bindings: m.bindings,
+    case_warnings: m.case_warnings,
     written_markdown: table(["Scenario", "File", "Test Case written"], rows),
     // The cases the Delegate proposed `automatable: false` for, for the engineer to confirm in Review.
     not_automatable: m.scenarios.flatMap((s) => (s.status === "written" ? s.not_automatable.map((key) => ({ scenario: s.scenario, key, label: labelOf(summaryOf, key) })) : [])),
+    // The cases the Delegate proposed `manual: false` for: no Tester can perform them, so only their
+    // Automations check them. `automatable` says whether even those exist.
+    not_manual: m.scenarios.flatMap((s) => (s.status === "written" ? s.not_manual.map((key) => ({ scenario: s.scenario, key, label: labelOf(summaryOf, key), automatable: !s.not_automatable.includes(key) })) : [])),
     skipped: (m.dispatched ? [] : m.skipped).map((s) => ({ ...where(s), status: s.status, reason: withLine(s.reason, SKIPPED[s.reason]({ ...s, feature: m.feature, mode: m.mode })) })),
-    still_empty: m.still_empty.map((s) => ({ ...where(s), needs_level: s.needs_level })),
+    still_empty: m.still_empty.map((s) => where(s)),
     rerun: m.rerun,
     reruns: m.reruns.map((c) => ({ scenario: c.scenario, label: scenario(c.scenario), command: c.command })),
+    questions: m.questions,
+    question_handoff: m.question_handoff,
+    check_gaps: m.check_gaps.map((g) => ({ scenario: g.scenario, label: scenario(g.scenario), key: g.key, case: g.key === null ? g.case : keyLabel(g.key, g.case), needs: g.needs })),
+    check_handoff: m.check_handoff,
     proposed_rules: m.proposed_rules.map((p) => ({ scenario: p.scenario, label: scenario(p.scenario), statement: p.statement, ...(p.why && { why: p.why }) })),
     handoff: m.handoff,
+    proposals: m.proposals.map((p) => ({ ...p, ...(p.scenario !== null && { label: scenario(p.scenario) }) })),
+    keep: m.keep,
     run_health: h && { run: h.run, calls: h.calls, announcements: h.announcements, retried: h.retried.map((x) => ({ scenario: x.scenario, label: scenario(/** @type {string} */ (x.scenario)), attempts: x.attempts })), notes: h.notes.map((n) => ({ code: n.code, ...NOTES[n.code] })) },
     changeset: m.changeset,
     ...(m.declared_coverage === undefined ? {} : { declared_coverage: m.declared_coverage }),

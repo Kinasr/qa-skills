@@ -6,9 +6,10 @@ Use the `feature` output's `boundaries` and Rule `waiver` fields as the current 
 
 When the engineer says behaviour does not belong to this Feature, settle what owns it: name an
 existing Feature key, or use `none` when it belongs to no Feature. Write a Boundary under
-`## Boundaries` with `### boundary_<key>: <statement>` and `Owner: <feature_key | none>` as its first
-non-blank line. Mint the key with `mint boundary --feature <slug>`. Keep existing keys unchanged;
-put a withdrawn key in `retired:` and never reuse it.
+`## Boundaries` as a numbered item, `1. **boundary_<key>**: <statement>`, with
+`Owner: <feature_key | none>` in the field block directly under the statement. Mint the key with
+`mint boundary --feature <slug>`. Keep existing keys unchanged; retire one by deleting its item and
+appending the key to `retired:`, and never reuse it.
 
 ## Waiver
 

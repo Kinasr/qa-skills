@@ -7,7 +7,10 @@
 //   id, run, origin   the Execution, the Run and the target origin
 //   cap, used         the action budget and the calls counted so far (refusals count)
 //   stopped           null, or the sticky stop: "action-cap" | "off-target" | "no-access" | "connection-lost"
-//   sessions          [{role, slug, name, acc, setup, login_url}] one per Role; `role` is the Role or
+//   sessions          [{role, slug, name, acc, setup, login_url, kind?, header?, user?}] one per Role;
+//                     `header: true` records a Header credential at open; `user` is the note's
+//                     `identifiers.user` when it has a password source, the name the brief tells
+//                     the Tester to `fill` (not a secret, ADR-0015). `role` is the Role or
 //                     `-`, `name` the playwright-cli session, `login_url` its note's sign-in page
 //                     (origin + path) when the note names one that is not `/`, else null (then a
 //                     same-origin page with a password field is the sign-in page, `passwordShown`)
@@ -20,10 +23,12 @@
 //                     off the target, `status` "ok" | "error" | "refused", `evidence` the element
 //                     evidence of an admitted element action (or `target: "none"` for a ref-less one)
 //   modal             true while a dialog blocks the page (the origin check is deferred)
+//   typed_secret      true once `fill-password` typed a Role's password: from then every output of the Execution is scrubbed of it (ADR-0066)
 //   closed            true once `execute close` closed the sessions
+/** @import { PlatformContext, PlatformRefusal, PlatformRunnerOptions } from "./platform.mjs" */
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { spawnSync } from "node:child_process";
+import { defaultPlatformRunner, mapSpawnRefusal, spawnNodeCli } from "./platform.mjs";
 import { covers } from "./access.mjs";
 import { redactPageText } from "./credentials.mjs";
 
@@ -54,6 +59,9 @@ export const GUARD_ONLY_STOPS = ["action-cap", "off-target", "connection-lost"];
  *   acc: string | null,
  *   setup: boolean,
  *   login_url: string | null,
+ *   kind?: "browser" | "header-only",
+ *   header?: boolean,
+ *   user?: string,
  * }} ExecutionSession
  */
 
@@ -100,6 +108,11 @@ export const GUARD_ONLY_STOPS = ["action-cap", "off-target", "connection-lost"];
  */
 
 /**
+ * A validated mock response or clear operation in the Role's browser context. Raw bodies stay out.
+ * @typedef {{ pattern: string, status?: number, content_type?: string, body_bytes?: number, unroute?: never } | { unroute: true, pattern?: string }} ExecutionRoute
+ */
+
+/**
  * Command log entry in an Execution guard.
  * @typedef {{
  *   n: number,
@@ -112,9 +125,13 @@ export const GUARD_ONLY_STOPS = ["action-cap", "off-target", "connection-lost"];
  *   at_login?: boolean,
  *   modal?: boolean,
  *   http_status?: number,
+ *   auth_rejected?: boolean,
+ *   auth?: import("./tester-request.mjs").CredentialVariant,
  *   screenshot?: string,
  *   session?: string,
  *   evidence?: ExecutionEvidence,
+ *   route?: ExecutionRoute,
+ *   expect?: { text: string, seen: boolean },
  * }} ExecutionLogEntry
  */
 
@@ -130,10 +147,14 @@ export const GUARD_ONLY_STOPS = ["action-cap", "off-target", "connection-lost"];
  *   sessions: ExecutionSession[],
  *   login_sessions?: string[],
  *   match: Record<string, string[]>,
+ *   route_origins?: string[],
+ *   route_sign_in_urls?: string[],
  *   uploads?: Record<string, string>,
+ *   redaction_exempt?: string[],
  *   at_login: number[],
  *   log: ExecutionLogEntry[],
  *   modal?: boolean,
+ *   typed_secret?: boolean,
  *   closed?: boolean,
  * }} ExecutionGuard
  */
@@ -149,7 +170,11 @@ export const GUARD_ONLY_STOPS = ["action-cap", "off-target", "connection-lost"];
 /**
  * Result of running a command via playwright-cli: `stderr` is kept for infrastructure classification,
  * already scrubbed by the existing credential redaction.
- * @typedef {{ missing: true, text?: undefined, error?: undefined, stderr?: undefined } | { missing?: false, text: string, error?: string, stderr?: string }} PlaywrightResult
+ * @typedef {(
+ *   { missing: true, refused?: undefined, refusal?: undefined, text?: undefined, error?: undefined, stderr?: undefined } |
+ *   { refused: true, refusal: PlatformRefusal, missing?: undefined, text?: undefined, error?: undefined, stderr?: undefined } |
+ *   { missing?: false, refused?: undefined, refusal?: undefined, text: string, error?: string, stderr?: string }
+ * )} PlaywrightResult
  */
 
 /**
@@ -159,6 +184,7 @@ export const GUARD_ONLY_STOPS = ["action-cap", "off-target", "connection-lost"];
  *   url: string | undefined,
  *   modal: boolean,
  *   error?: string,
+ *   refused?: boolean,
  * }} SessionObservation
  */
 
@@ -176,6 +202,7 @@ export const GUARD_ONLY_STOPS = ["action-cap", "off-target", "connection-lost"];
  * @typedef {{
  *   tabs: SessionTab[],
  *   error?: string,
+ *   refused?: boolean,
  * }} TabsObservation
  */
 
@@ -194,6 +221,10 @@ export const GUARD_ONLY_STOPS = ["action-cap", "off-target", "connection-lost"];
 
 /** @type {"guard.json"} */
 export const GUARD_FILE = "guard.json";
+// The Tester's report name. It must stay outside Claude Code's refused report names
+// (`/^(REPORT|SUMMARY|FINDINGS|ANALYSIS).*\.md$/i`), which its Write tool rejects.
+/** @type {string} */
+export const REPORT_FILE = "tester.report.md";
 const CALL_TIMEOUT_MS = 60000;
 
 /**
@@ -296,8 +327,27 @@ export function loginUrlOf(note, origin) {
  * @param {number} [timeoutMillis]
  * @returns {PlaywrightResult}
  */
-export function playwright(cwd, session, args, env, timeoutMillis = CALL_TIMEOUT_MS) {
-  const r = spawnSync("playwright-cli", [`-s=${session}`, ...args], { cwd, env, encoding: "utf8", timeout: timeoutMillis });
+/**
+ * Execute a `playwright-cli` invocation for a session, enforcing platform resolution on win32.
+ * @param {string} cwd
+ * @param {string} session
+ * @param {readonly string[]} args
+ * @param {NodeJS.ProcessEnv | undefined} [env]
+ * @param {number} [timeoutMillis]
+ * @param {PlatformContext} [context]
+ * @returns {PlaywrightResult}
+ */
+export function playwright(cwd, session, args, env, timeoutMillis = CALL_TIMEOUT_MS, context = {}) {
+  const effectiveEnv = context.env ?? env ?? process.env;
+  /** @type {PlatformRunnerOptions} */
+  const spawnOptions = { cwd, env: effectiveEnv, encoding: "utf8", timeout: timeoutMillis };
+  const resolved = spawnNodeCli(
+    { kind: "playwright-cli", file: "playwright-cli", args: [`-s=${session}`, ...args], options: spawnOptions },
+    { ...context, env: effectiveEnv },
+  );
+  if (resolved.refusal) return mapSpawnRefusal(resolved.refusal);
+  const runner = context.run ?? defaultPlatformRunner;
+  const r = runner(resolved.file, resolved.args, resolved.options);
   if (/** @type {NodeJS.ErrnoException | undefined} */ (r.error)?.code === "ENOENT") return { missing: true };
   const stderr = redactPageText(typeof r.stderr === "string" ? r.stderr : "");
   if (r.error) return { text: redactPageText(typeof r.stdout === "string" ? r.stdout : ""), error: /** @type {NodeJS.ErrnoException} */ (r.error).code === "ETIMEDOUT" ? "playwright-cli timed out" : r.error.message, ...(stderr && { stderr }) };
@@ -325,13 +375,24 @@ export function sectionsOf(text) {
  * still looks like a credential (a console line, a page's text) is redacted as a `request` body is.
  * @param {string} text
  * @param {string | undefined} typed
+ * @param {ReadonlySet<string>} [exempt] Lower-case names pinned in the Execution guard.
  * @returns {string}
  */
-export function keptOutput(text, typed) {
+export function keptOutput(text, typed, exempt) {
   const keep = ["Result", "Page", "Snapshot", "Modal state", "Error"];
-  const shown = sectionsOf(text).filter((s) => keep.includes(s.name)).map((s) => `### ${s.name}\n${maskTyped(s.body, typed)}`).join("\n");
-  return redactPageText(shown);
+  // Exemptions only widen page text: playwright's own Error text keeps the unexempted scrub.
+  return sectionsOf(text).filter((s) => keep.includes(s.name))
+    .map((s) => `### ${s.name}\n${redactPageText(maskTyped(s.body, typed), s.name === "Error" ? undefined : exempt)}`)
+    .join("\n");
 }
+
+/**
+ * The redaction exemptions a Tester's page text and bodies honour: only the list `execute open`
+ * pinned into the guard, never one a Tester-supplied root names.
+ * @param {ExecutionGuard} guard
+ * @returns {ReadonlySet<string>}
+ */
+export const guardExempt = (guard) => new Set(guard.redaction_exempt ?? []);
 
 /**
  * What touches a short typed text without being it: part of a word, a path, a URL or a query.
@@ -368,7 +429,7 @@ const PASSWORD_SHOWN = "() => document.querySelector('input[type=password]') !==
  */
 export function passwordShown(cwd, session, env) {
   const asked = playwright(cwd, session, ["eval", PASSWORD_SHOWN], env);
-  if (asked.error || asked.missing) return false;
+  if (asked.error || asked.missing || asked.refused) return false;
   return sectionsOf(asked.text).find((section) => section.name === "Result")?.body.split("\n")[0].trim() === "true";
 }
 
@@ -399,7 +460,7 @@ export const ELEMENT_EXCERPT_PROBE = [
 ].join(" ");
 
 /** A probe's own bound: five seconds, separate from a command's. */
-const PROBE_TIMEOUT_MS = 5000;
+export const PROBE_TIMEOUT_MS = 5000;
 
 /**
  * What the wrapper's fixed excerpt probe returned for `ref` before an action: its parsed object,
@@ -412,7 +473,7 @@ const PROBE_TIMEOUT_MS = 5000;
  */
 export function elementExcerpt(cwd, session, ref, env) {
   const asked = playwright(cwd, session, ["eval", ELEMENT_EXCERPT_PROBE, ref], env, PROBE_TIMEOUT_MS);
-  if (asked.missing || asked.error) return { ok: false };
+  if (asked.missing || asked.refused || asked.error) return { ok: false };
   const result = sectionsOf(asked.text).find((section) => section.name === "Result");
   if (!result) return { ok: false };
   try {
@@ -431,18 +492,24 @@ const PAGE_URL = /^- Page URL: (\S.*)$/m;
  * @param {string} session
  * @param {string} text
  * @param {NodeJS.ProcessEnv | undefined} [env]
+ * @param {PlatformContext} [context]
  * @returns {SessionObservation}
  */
-export function observe(cwd, session, text, env) {
+export function observe(cwd, session, text, env, context = {}) {
   const modal = sectionsOf(text).some((s) => s.name === "Modal state");
   const page = sectionsOf(text).find((s) => s.name === "Page");
   let url = page && PAGE_URL.exec(page.body)?.[1].trim();
   /** @type {string | undefined} */
   let error;
+  /** @type {boolean | undefined} */
+  let refused;
   if (!url && !modal) {
-    const asked = playwright(cwd, session, ["eval", "() => location.href"], env);
+    const asked = playwright(cwd, session, ["eval", "() => location.href"], env, CALL_TIMEOUT_MS, context);
     if (asked.missing) error = "playwright-cli is not on the PATH";
-    else if (asked.error) error = redactPageText(asked.error);
+    else if (asked.refused) {
+      refused = true;
+      error = asked.refusal.message;
+    } else if (asked.error) error = redactPageText(asked.error);
     else {
       const result = sectionsOf(asked.text).find((s) => s.name === "Result");
       if (!result) error = "the page probe returned no result";
@@ -456,7 +523,7 @@ export function observe(cwd, session, text, env) {
       }
     }
   }
-  return { url: typeof url === "string" && url ? url : undefined, modal, ...(error && { error }) };
+  return { url: typeof url === "string" && url ? url : undefined, modal, ...(error && { error }), ...(refused && { refused }) };
 }
 
 /**
@@ -481,11 +548,13 @@ export const pageGone = (observation) => Boolean(observation.error) || unreadabl
  * @param {string} cwd
  * @param {string} session
  * @param {NodeJS.ProcessEnv | undefined} [env]
+ * @param {PlatformContext} [context]
  * @returns {TabsObservation}
  */
-export function tabsOf(cwd, session, env) {
-  const listed = playwright(cwd, session, ["tab-list"], env);
+export function tabsOf(cwd, session, env, context = {}) {
+  const listed = playwright(cwd, session, ["tab-list"], env, CALL_TIMEOUT_MS, context);
   if (listed.missing) return { tabs: [], error: "playwright-cli is not on the PATH" };
+  if (listed.refused) return { tabs: [], error: listed.refusal.message, refused: true };
   if (listed.error) return { tabs: [], error: redactPageText(listed.error) };
   const tabs = [...listed.text.matchAll(/^- (\d+):( \(current\))? \[[^\]]*\]\((\S+?)\)(?: \[crashed\])?$/gm)]
     .map((m) => ({ index: Number(m[1]), current: Boolean(m[2]), url: m[3] }));

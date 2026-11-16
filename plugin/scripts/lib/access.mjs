@@ -13,6 +13,7 @@
  * @import { ParsedEntry, ParsedFile } from "./knowledge-file.mjs"
  * @import { TrainFile } from "./training.mjs"
  */
+import { isHeaderOnly, isNoLogin } from "./access-note.mjs";
 import { credentialIn, secretsIn, shownKey } from "./credentials.mjs";
 import { isMap } from "./dialect.mjs";
 import { compileKeyPattern } from "./keys.mjs";
@@ -43,6 +44,8 @@ import { trainFile } from "./training.mjs";
  *   statement?: string,
  *   match?: string[],
  *   via?: string,
+ *   header_via?: string,
+ *   expired_via?: string,
  *   host?: string,
  *   identifiers?: Record<string, string>,
  *   credential_from?: string,
@@ -94,6 +97,8 @@ export function matchAccessNotes(uris, notes, { role = null } = {}) {
 //   key, statement      the heading: `acc_<slug>` and what the note reaches
 //   match               the URI prefixes it covers
 //   role                the Role of the test account it logs in as, on an app test-account note
+//   header_via          the CLI-only Header credential source: `env:NAME`
+//   expired_via         its optional expired source: `env:NAME`
 //   via                 where the credential lives: `env:NAME`, `mcp:name`, `cli:name` or `file:<path>`
 //   host, identifiers   non-secret facts: the host, and e.g. a user, tenant or org
 //   credential_from     where a person gets the credential, in a sentence
@@ -107,16 +112,17 @@ export const FIELDS = ["match", "via", "host", "identifiers", "credential_from",
 /**
  * @param {ParsedEntry} e
  * @param {readonly string[]} lines
+ * @param {boolean} [headerCredentials]
  * @returns {ShownAccessNote}
  */
-function readable(e, lines) {
+function readable(e, lines, headerCredentials = false) {
   const entry = lines.slice(e.line - 1, e.end).join("\n");
   if (secretsIn(e.data).length > 0 || credentialIn(entry) !== null) return { key: /** @type {string} */ (shownKey(e.key)), withheld: true };
   const quirks = e.prose.map((p) => p.text).join("\n").trim();
   return {
     key: e.key,
     statement: e.statement,
-    ...Object.fromEntries(FIELDS.filter((f) => e.data[f] !== undefined).map((f) => [f, e.data[f]])),
+    ...Object.fromEntries([...FIELDS, ...(headerCredentials ? ["header_via", "expired_via"] : [])].filter((f) => e.data[f] !== undefined).map((f) => [f, e.data[f]])),
     ...(quirks && { quirks }),
   };
 }
@@ -127,21 +133,37 @@ function readable(e, lines) {
 // and `code:` URI, which no `match` can hold. `source` is a Key index of the working tree or the
 // path of the `.qa/` directory, as `trainFor` takes. With no `train/access.md`, every URI is null.
 // A note keeping a password in a `file:` (ADR-0019) is the CLI's alone to read: it is null too,
-// so a model fetch goes as if no note matched, unless the caller passes `passwordFiles` (`scout brief ui`).
+// so a model fetch goes as if no note matched, unless a trusted scout, execution or codegen caller
+// passes `passwordFiles`. Header-only notes are hidden unless a trusted execution or codegen
+// caller passes `headerCredentials`; this also includes Header credential metadata in shown notes.
 /**
  * @param {string | Record<string, unknown>} source
  * @param {readonly string[]} uris
- * @param {{ passwordFiles?: boolean, role?: string | null }} [options]
+ * @param {{ passwordFiles?: boolean, headerCredentials?: boolean, role?: string | null }} [options]
  * @returns {Record<string, ShownAccessNote | null>}
  */
-export function accessFor(source, uris, { passwordFiles = false, role = null } = {}) {
+export function accessFor(source, uris, { passwordFiles = false, headerCredentials = false, role = null } = {}) {
   const file = /** @type {TrainAccessFile | null} */ (trainFile(source, ACCESS_TRAIN_KEY));
   if (!file) return Object.fromEntries(uris.map((uri) => [uri, null]));
   const lines = textLines(file);
-  const shown = new Map(file.access_notes.map((e) => [e.key, readable(e, lines)]));
+  const shown = new Map(file.access_notes.map((e) => [e.key, readable(e, lines, headerCredentials)]));
   const matched = matchAccessNotes(uris, accessNotes(file), { role });
-  const hidden = (/** @type {ParsedAccessNote} */ note) => !passwordFiles && typeof note.via === "string" && note.via.startsWith("file:");
+  const hidden = (/** @type {ParsedAccessNote} */ note) => (!headerCredentials && isHeaderOnly(note)) || (!passwordFiles && typeof note.via === "string" && note.via.startsWith("file:"));
   return Object.fromEntries(Object.entries(matched).map(([uri, note]) => [uri, note && !hidden(note) ? /** @type {ShownAccessNote} */ (shown.get(note.key)) : null]));
+}
+
+// Whether any Access note in `source`'s `train/access.md` reaches `uri`, whatever its Role and
+// whatever it holds: the coverage check a signed-out observation makes, since it reads no
+// credential and inlines no note. With no `train/access.md`, false.
+/**
+ * @param {string | Record<string, unknown>} source
+ * @param {string} uri
+ * @returns {boolean}
+ */
+export function noteReaches(source, uri) {
+  const file = /** @type {TrainAccessFile | null} */ (trainFile(source, ACCESS_TRAIN_KEY));
+  if (!file) return false;
+  return accessNotes(file).some((note) => (Array.isArray(note.match) ? note.match : []).some((m) => typeof m === "string" && m && covers(m, uri)));
 }
 
 // The distinct Roles, in note order, of the Role-tagged `notes` whose `match` covers `uri` (a
@@ -160,21 +182,36 @@ export function rolesCovering(uri, notes) {
   return [...new Set(roles)];
 }
 
+// The distinct Roles, in note order, of the no-login notes in `source`'s `train/access.md`: the
+// Roles whose session opens with no login (ADR-0063). With no `train/access.md`, none.
+/**
+ * @param {string | Record<string, unknown>} source
+ * @returns {string[]}
+ */
+export function noLoginRoles(source) {
+  const file = /** @type {TrainAccessFile | null} */ (trainFile(source, ACCESS_TRAIN_KEY));
+  if (!file) return [];
+  const roles = accessNotes(file)
+    .filter((note) => isNoLogin(note) && typeof note.role === "string" && note.role !== "" && note.role === note.role.trim())
+    .map((note) => /** @type {string} */ (note.role));
+  return [...new Set(roles)];
+}
+
 // `rolesCovering` over `source`'s `train/access.md`, leaving out the notes `accessFor` would not
 // show: one holding what looks like a credential, and (without `passwordFiles`) one keeping a
 // password in a `file:`. With no `train/access.md`, none.
 /**
  * @param {string | Record<string, unknown>} source
  * @param {string} uri
- * @param {{ passwordFiles?: boolean }} [options]
+ * @param {{ passwordFiles?: boolean, headerCredentials?: boolean }} [options]
  * @returns {string[]}
  */
-export function rolesCoveringIn(source, uri, { passwordFiles = false } = {}) {
+export function rolesCoveringIn(source, uri, { passwordFiles = false, headerCredentials = false } = {}) {
   const file = /** @type {TrainAccessFile | null} */ (trainFile(source, ACCESS_TRAIN_KEY));
   if (!file) return [];
   const lines = textLines(file);
-  const shown = new Map(file.access_notes.map((e) => [e.key, readable(e, lines)]));
-  const hidden = (/** @type {ParsedAccessNote} */ note) => shown.get(note.key)?.withheld || (!passwordFiles && typeof note.via === "string" && note.via.startsWith("file:"));
+  const shown = new Map(file.access_notes.map((e) => [e.key, readable(e, lines, headerCredentials)]));
+  const hidden = (/** @type {ParsedAccessNote} */ note) => (!headerCredentials && isHeaderOnly(note)) || shown.get(note.key)?.withheld || (!passwordFiles && typeof note.via === "string" && note.via.startsWith("file:"));
   return rolesCovering(uri, accessNotes(file).filter((note) => !hidden(note)));
 }
 
@@ -184,12 +221,13 @@ export function rolesCoveringIn(source, uri, { passwordFiles = false } = {}) {
 /**
  * @param {string | Record<string, unknown>} source
  * @param {string} key
+ * @param {{ headerCredentials?: boolean }} [options]
  * @returns {ShownAccessNote | null}
  */
-export function accessNoteNamed(source, key) {
+export function accessNoteNamed(source, key, { headerCredentials = false } = {}) {
   const file = /** @type {TrainAccessFile | null} */ (trainFile(source, ACCESS_TRAIN_KEY));
   const entry = file?.access_notes.find((e) => e.key === key);
-  return entry ? readable(entry, textLines(/** @type {TrainAccessFile} */ (file))) : null;
+  return entry && (headerCredentials || !isHeaderOnly(entry.data)) ? readable(entry, textLines(/** @type {TrainAccessFile} */ (file)), headerCredentials) : null;
 }
 
 /**

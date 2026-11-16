@@ -6,7 +6,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { carrierNames, filesUnder } from "../code-source.mjs";
 import { listFiles } from "../git.mjs";
-import { kotlinAssertionContracts, parseKotlin } from "./kotlin.mjs";
+import { kotlinAssertionContracts, kotlinAssertionSpans, parseKotlin } from "./kotlin.mjs";
 import { splice } from "./splice.mjs";
 import { isKotlinJUnit5Stack } from "./descriptors.mjs";
 
@@ -32,6 +32,7 @@ import { isKotlinJUnit5Stack } from "./descriptors.mjs";
  *   line: number,
  *   classPath: string,
  *   carriers: KotlinAnnotation[],
+ *   end: number,
  * }} KotlinTestFunction
 
 /**
@@ -260,6 +261,7 @@ import { isKotlinJUnit5Stack } from "./descriptors.mjs";
  * @typedef {{
  *   never: readonly { id: string, pattern: RegExp }[],
  *   assertions: (text: string) => number,
+ *   assertionAt: (text: string, line: number) => boolean,
  *   contracts: (text: string) => import("../fix-assertions.mjs").AssertionContract[],
  * }} KotlinGuard
  */
@@ -309,6 +311,16 @@ export const KOTLIN_JUNIT5 = {
   load: () => ({ adapter: KOTLIN }),
 };
 
+// The assertion callees and matchers counted by `GUARD.assertions` and checked per line by
+// `GUARD.assertionAt`. Kept without the `g` flag so `.test()` stays stateless.
+/** @type {readonly RegExp[]} */
+const ASSERTION_PATTERNS = [
+  /\bassert(?:[A-Z]\w*)?\s*\(/,
+  /\bfail\s*\(/,
+  /\bverify\s*\(/,
+  /\bshould(?:Be|Equal|Contain|Not|Throw|Match)\w*\b/,
+];
+
 // The tokens a fix may never add, in the language this adapter reads. They are matched on added
 // lines only, so an existing disable elsewhere in the file is not a new one.
 /** @type {KotlinGuard} */
@@ -324,12 +336,12 @@ const GUARD = {
   ],
   assertions: (text) => {
     let count = 0;
-    for (const _ of text.matchAll(/\bassert(?:[A-Z]\w*)?\s*\(/g)) count++;
-    for (const _ of text.matchAll(/\bfail\s*\(/g)) count++;
-    for (const _ of text.matchAll(/\bverify\s*\(/g)) count++;
-    for (const _ of text.matchAll(/\bshould(?:Be|Equal|Contain|Not|Throw|Match)\w*\b/g)) count++;
+    for (const pattern of ASSERTION_PATTERNS) {
+      for (const _ of text.matchAll(new RegExp(pattern.source, "g"))) count++;
+    }
     return count;
   },
+  assertionAt: (text, line) => kotlinAssertionSpans(text, ASSERTION_PATTERNS).some((span) => line >= span.start && line <= span.end),
 };
 
 /** @type {KotlinAdapter} */
@@ -417,17 +429,19 @@ function keys(carriers, names) {
   return out;
 }
 
-// parseKotlin's declarations, each with its annotations as its Key carriers.
+// parseKotlin's declarations, each with its annotations as its Key carriers, and each function with
+// `end`, the line closing its body.
 /**
  * @param {string} text
  * @returns {KotlinParsedFile}
  */
 function parse(text) {
   const { package: pkg, classes, functions } = parseKotlin(text);
+  const lines = text.replace(/\r\n/g, "\n").split("\n");
   return {
     package: pkg,
     classes: classes.map(({ annotations, ...c }) => ({ ...c, carriers: annotations })),
-    functions: functions.map(({ annotations, ...f }) => ({ ...f, carriers: annotations })),
+    functions: functions.map(({ annotations, ...f }) => ({ ...f, carriers: annotations, end: blockEnd(lines, f.line) })),
   };
 }
 

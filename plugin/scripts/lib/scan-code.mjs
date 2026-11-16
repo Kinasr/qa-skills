@@ -3,6 +3,8 @@
 // invariants, the code Divergences, and the binding proposals of
 // `/qa-sync` that it applies. Nothing here writes: a dead `automates` entry, a copied key or a
 // wrong tracker key is reported and proposed, never corrected.
+import { automationLevel, codegenApproaches } from "./codegen-approaches.mjs";
+import { trainFile } from "./training.mjs";
 import { buildCodeIndex, keyPatterns } from "./code-index.mjs";
 import { blameLine } from "./git.mjs";
 import { PATTERN, prefixFits, prefixRule, suggestPrefix } from "./keys.mjs";
@@ -201,6 +203,7 @@ import { PATTERN, prefixFits, prefixRule, suggestPrefix } from "./keys.mjs";
  *   class: string,
  *   name: string,
  *   feature: string | undefined,
+ *   level: string | null,
  * }} AutomationIndexEntry
  */
 
@@ -491,12 +494,13 @@ function retiredKeys(ctx) {
  * @param {BindingFacts} facts
  * @returns {Map<string, AutomationIndexEntry>}
  */
-function automationIndex({ scope, single, duplicate, binders }) {
+function automationIndex({ ctx, scope, single, duplicate, binders }) {
+  const approaches = codegenApproaches(trainFile(ctx.index, "codegen"), ctx.config.levels);
   /** @type {Map<string, AutomationIndexEntry>} */
   const out = new Map();
   for (const [aut, fns] of [...single].map(([k, fn]) => /** @type {[string, IndexedFunction[]]} */ ([k, [fn]])).concat([...duplicate])) {
     const fn = fns[0];
-    out.set(aut, { ...fnRef(fn), feature: featureOf(scope.ofChain(fn.classes)) ?? binders.get(aut)?.[0].feature });
+    out.set(aut, { ...fnRef(fn), level: automationLevel(fn.file, approaches), feature: featureOf(scope.ofChain(fn.classes)) ?? binders.get(aut)?.[0].feature });
   }
   return out;
 }

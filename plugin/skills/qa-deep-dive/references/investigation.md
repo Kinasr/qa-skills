@@ -9,9 +9,13 @@ A channel is an evidence source for a question, never a way to exercise the syst
 | Channel | Gets you | Limits |
 |---|---|---|
 | `observe:` | what the live application shows, through the UI scout | navigates and reads only; a part that needs input is unseen |
-| `code:` | one source file: handlers, validators, API specs in the repo | what runs, not what is required |
+| Contract (`file:`, `code:` or `url:`) | an API contract | what the contract says, not what is required |
+| `code:` | one source file: handlers, validators | what runs, not what is required |
 | `file:` / `url:` / `tracker:` | a committed document, a page, or a tracker issue | what a document says, not what the system now does |
 | `human:` | the engineer's answer | the only channel that settles required behaviour |
+
+An API contract is read on the Contract row whatever scheme it entered by: a contract under
+`module_paths` is inferred `code:`.
 
 An active probe is unavailable: settle intent with the engineer or park. It confers no execution
 capability. An Access note changes how a channel is reached, never what it can settle.

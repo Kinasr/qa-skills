@@ -53,7 +53,7 @@ import { relianceOf } from "./reliance.mjs";
 import { causeRefs, isOpenFinding, restsOn } from "./stored-findings.mjs";
 import { staleObligations } from "./stale-obligations.mjs";
 import { impactProjection, claimProjection, unifiedDiff } from "./stripped.mjs";
-import { isExecutionFile } from "./schema.mjs";
+import { isBesideKnowledge } from "./schema.mjs";
 /** @import { DependencyIndex } from "./rule-ref.mjs" */
 /** @import { AffectedRulesFacts } from "./affected-rules.mjs" */
 /** @import { StaleObligation } from "./stale-obligations.mjs" */
@@ -203,12 +203,17 @@ import { isExecutionFile } from "./schema.mjs";
  */
 
 /**
+ * One `.qa/` file whose stripped content differs between the working tree and HEAD.
+ * @typedef {{ file: string, change: "added" | "deleted" | "modified" }} PersistChange
+ */
+
+/**
  * The dirty check `--persist` needs: `.qa/`'s stripped content, in the working tree, equals HEAD's.
  * @typedef {{
  *   clean: boolean,
  *   head: string | null,
  *   reason?: string,
- *   changed: { file: string, change: "added" | "deleted" | "modified" }[],
+ *   changed: PersistChange[],
  * }} PersistCheck
  */
 
@@ -576,13 +581,14 @@ function identities(files, config) {
 
 // `.qa/` at one state: its Key index and stripped files, cases and Rules. Raw stripped files are
 // kept separately for the persist dirty check, which must still see an uncommitted Key rewrite.
+// A file kept beside the knowledge, an Execution record or a Bug draft, is never part of one.
 /**
  * @param {HistoryFile[]} files
  * @param {(scope: string, field: string, value: unknown) => unknown} [identity]
  * @returns {Snapshot}
  */
 function snapshot(files, identity = (_scope, _field, v) => v) {
-  files = files.filter((f) => !isExecutionFile(f));
+  files = files.filter((f) => !isBesideKnowledge(f));
   const index = buildIndex(files);
   /** @type {Map<string, string>} */
   const stripped = new Map();
@@ -1118,7 +1124,8 @@ function sameFinding(result, evidence, caseKey) {
 }
 
 // The dirty check `--persist` needs: `.qa/`'s stripped content, in the working tree,
-// equals HEAD's.
+// equals HEAD's. Both sides read the same file set: Bug drafts and Execution records are beside the
+// knowledge (ADR-0053), so neither can make the tree dirty.
 /**
  * @param {{ ctx: ScanContext, repo: Repository | null, snapshotAt: (commit: string) => Snapshot }} h
  * @returns {PersistCheck}
@@ -1127,7 +1134,7 @@ function persistCheck({ ctx, repo, snapshotAt }) {
   if (!repo) return { clean: false, head: null, reason: "not_a_repository", changed: [] };
   const head = resolveRef(repo.top, "HEAD");
   const work = ctx.target ? loadWorkingTree(ctx.root) : ctx.files;
-  const mine = new Map(work.filter((f) => !isExecutionFile(f)).map((f) => /** @type {[string, string | null]} */ ([f.rel, f.unreadable ? null : claimProjection(/** @type {StrippableFile} */ (f)).text])));
+  const mine = new Map(work.filter((f) => !isBesideKnowledge(f)).map((f) => /** @type {[string, string | null]} */ ([f.rel, f.unreadable ? null : claimProjection(/** @type {StrippableFile} */ (f)).text])));
   /** @type {Map<string, string>} */
   const base = head ? snapshotAt(head).rawStripped : new Map();
   /** @type {{ file: string, change: "added" | "deleted" | "modified" }[]} */

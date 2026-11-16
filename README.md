@@ -13,7 +13,7 @@
 - 🔁 **Stay in sync.** When a change lands, it flags the cases that are now stale or conflicting.
 - 🐞 **Close the loop.** It drafts bugs for failures and repairs broken test code.
 
-**Claude Code only.** The [support matrix](https://github.com/Kinasr/qa-skills/blob/v0.3.6/docs/support.md)
+**Claude Code only.** The [support matrix](https://github.com/Kinasr/qa-skills/blob/v0.14.1/docs/support.md)
 says what is tested, what the CLI does with your data and what a Run keeps.
 
 ## 🔄 How it works
@@ -35,8 +35,11 @@ flowchart LR
 
 ### You need
 
-- **Claude Code 2.1.308 or newer.** `/qa-execute` refuses a host it cannot verify at that version
-  ([details](https://github.com/Kinasr/qa-skills/blob/v0.3.6/docs/support.md#claude-code)).
+- **Claude Code 2.1.308 or newer.** `/qa-execute` refuses a host it cannot verify at that version.
+  Guarded Execution is supported on macOS, from recorded live runs in the terminal CLI on Claude
+  Code 2.1.308 and in the desktop app on its bundled 2.1.321, on qa-skills 0.13.1 and 0.13.2
+  (Header credentials on 0.13.2, mocking on 0.13.3, terminal CLI only). Linux end-to-end is pending
+  ([details](https://github.com/Kinasr/qa-skills/blob/v0.14.1/docs/support.md#claude-code)).
 - **Node 22 or newer**, Git, and a repository with at least one commit.
 - **`playwright-cli` 0.1.22 or newer.** Playwright Test in your project does not replace it.
 
@@ -50,7 +53,7 @@ flowchart LR
 > [!WARNING]
 > Executions create and change real application data, and you clean up what they leave behind.
 > Anything the app shows (page text, screenshots, browser artifacts) can carry credentials, so
-> confidentiality is not guaranteed. Read [data handling](https://github.com/Kinasr/qa-skills/blob/v0.3.6/docs/support.md#data-handling)
+> confidentiality is not guaranteed. Read [data handling](https://github.com/Kinasr/qa-skills/blob/v0.14.1/docs/support.md#data-handling)
 > before you point it at an application.
 
 ### Install
@@ -68,17 +71,19 @@ in the repository you want to test.
 ### First run
 
 1. **Configure.** Run `/qa-skills:qa-init` and answer its questions. Accepting its Card writes
-   `.qa/project.md` with your application targets and execution levels.
+   `.qa/project.md` with your application targets and execution levels, and a fresh project names
+   exactly one next step.
 2. **Log in** (if your app needs it). Run `/qa-skills:qa-train access` and save the login state when
-   it asks. It offers the `.gitignore` line that keeps those files out of Git.
-3. **Learn a feature.** `/qa-skills:qa-deep-dive first-feature file:docs/requirements.md`
+   it asks. It offers the `.gitignore` line that keeps those files out of Git, and on a fresh setup
+   its close hands off to the deep-dive command.
+3. **Learn a feature.** `/qa-skills:qa-deep-dive first-feature file:docs/requirements.md --focus "<verb phrase>"`
 4. **Design its test cases.** `/qa-skills:qa-design first-feature`
-5. **Run them.** `/qa-skills:qa-execute first-feature target:staging`, then read the Execution record
-   before you commit it.
+5. **Run them.** `/qa-skills:qa-execute first-feature level:ui level:api target:staging`, then read
+   the Execution record before you commit it.
 
-📖 The full walk-through, covering all three tracker paths, Access notes, Roles, YAML quoting and
-interrupted-run recovery, is in [docs/first-run.md](docs/first-run.md). CLI commands are in
-[docs/cli.md](docs/cli.md).
+📖 The full walk-through, covering all three tracker paths, the API-only and SSO variants, Access
+notes, Roles, YAML quoting and interrupted-run recovery, is in [docs/first-run.md](docs/first-run.md).
+CLI commands are in [docs/cli.md](docs/cli.md).
 
 ## 🧰 The skills
 
@@ -126,7 +131,7 @@ Run directories in the OS temp directory hold pinned case text, briefs, reports 
 artifacts. Ordinary artifacts survive ingest; ingest removes temporary auth, while your saved login
 files stay yours to renew or delete.
 
-The [storage and lifecycle table](https://github.com/Kinasr/qa-skills/blob/v0.3.6/docs/support.md#storage-and-lifecycle)
+The [storage and lifecycle table](https://github.com/Kinasr/qa-skills/blob/v0.14.1/docs/support.md#storage-and-lifecycle)
 covers retention, retry and reset deletion, crash leftovers, model costs, concurrency and incomplete Runs.
 
 </details>
@@ -143,9 +148,12 @@ covers retention, retry and reset deletion, crash leftovers, model costs, concur
   carry credentials or other data. Confidentiality is not guaranteed.
 - macOS and Linux are expected to work (live release evidence is pending). CI runs the CLI test
   suite on Linux. Windows is unsupported.
+- Knowledge, design and running cases through the Tester work on any test stack. Binding,
+  running bound Automations, generating and repairing test code need a supported stack: Kotlin with JUnit 5, or
+  TypeScript/JavaScript with Playwright Test ([stack coverage](https://github.com/Kinasr/qa-skills/blob/v0.14.1/docs/support.md#test-stacks)).
 
 Exact configurations, stack coverage and the full data-handling rules are in the
-[support matrix](https://github.com/Kinasr/qa-skills/blob/v0.3.6/docs/support.md#data-handling).
+[support matrix](https://github.com/Kinasr/qa-skills/blob/v0.14.1/docs/support.md#data-handling).
 
 </details>
 

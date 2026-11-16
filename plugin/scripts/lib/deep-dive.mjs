@@ -13,7 +13,8 @@
 //                        effective level and the scan's Review freshness, `openQuestions`: its
 //                        Parked question texts, `categories`: the effective Coverage category list,
 //                        `coverage`: its `## Coverage` lines or null, `deferred_count`: the count beside
-//                        Coverage, `deferred_functionality`: the items to reconcile, and `train`:
+//                        Coverage, `deferred_functionality`: the items to reconcile,
+//                        `proposed_rules`: the kept Proposed Rules a full inventory settles, and `train`:
 //                        `train/deep-dive.md` as lib/training.mjs returns it (printed only for a
 //                        usable key)
 //   roles <name>...      which roles `project.roles` lacks, with the `/qa-init --add-role` command
@@ -37,6 +38,7 @@
  * @import { DependencyEnd } from "./rule-ref.mjs"
  * @import { HistorySection } from "./scan-history.mjs"
  */
+import { readDesignQuestions, questionText } from "./design-questions.mjs";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { accessFor } from "./access.mjs";
 import { caseLevel } from "./case-fields.mjs";
@@ -46,6 +48,7 @@ import { HANDOFF_FILE, readHandoff, uncommittedKnowledge } from "./change-handof
 import { openRunDir } from "./run-dir.mjs";
 import { coverageDigest, coverageProblems, parseCoverage } from "./coverage.mjs";
 import { deferredProblems, parseDeferred } from "./deferred.mjs";
+import { parseProposedRules, proposedRulesProblems } from "./proposed-rules.mjs";
 import { listOf } from "./dialect.mjs";
 import { UsageError } from "./cli.mjs";
 import { isUncommitted } from "./git.mjs";
@@ -189,6 +192,7 @@ export const command = {
             coverage: feature ? parseCoverage(feature.text)?.lines ?? null : null,
             deferred_count: deferred.length,
             deferred_functionality: deferred,
+            proposed_rules: feature ? parseProposedRules(feature.text) : [],
             train: trainFor(ctx.index, DEEP_DIVE_TRAIN_KEY),
           },
           exit: 0,
@@ -221,7 +225,7 @@ export const command = {
       usage: "<key> --stdin [--dir <run-dir>] [--root <qa-dir>]",
       run(args, { root, stdin, dir }) {
         if (args.length !== 1) throw new UsageError("deep-dive reconcile takes exactly one <key>");
-        if (!stdin) throw new UsageError("deep-dive reconcile reads the confirmed forecast from --stdin");
+        if (!stdin) throw new UsageError("deep-dive reconcile reads the confirmed forecast from --input <file> or --stdin");
         const guard = refuseSuiteSchema(/** @type {string} */ (root));
         if (guard) return guard;
         return reconcile(load(root), args[0], parseForecast(stdin()), dir);
@@ -237,13 +241,20 @@ export const command = {
         if (args.length !== 0) throw new UsageError("deep-dive resume takes no arguments, only --dir <run-dir>");
         const opened = openRunDir(dir, { cmd: "deep-dive", action: "resume", from: "impact quick" });
         if (opened.error) throw new UsageError(opened.error);
+        const design = readDesignQuestions(/** @type {string} */ (opened.dir));
+        if (design.error) throw new UsageError(design.error);
         const held = readHandoff(/** @type {string} */ (opened.dir));
         if (held.error) throw new UsageError(held.error);
-        if (!held.handoff) {
+        const designData = design.data?.questions.length ? design.data : null;
+        if (!held.handoff && !designData) {
           return { json: { action: "resume", ok: false, errors: [{ code: "no_handoff", message: `no ${HANDOFF_FILE} in ${opened.dir}: the quick path wrote none, so there is nothing to resume` }] }, exit: 1 };
         }
-        const { references, edits, open_questions: openQuestions, written } = held.handoff;
-        const feature = edits[0]?.feature ?? null;
+        // Preserve the quick path's confirmed edits when design reuses its Run.
+        const prior = held.handoff ?? { references: [], edits: [], open_questions: [], written: [] };
+        const references = designData === null ? prior.references : [...new Set([...prior.references, ...designData.references])];
+        const { edits, written } = prior;
+        const openQuestions = [...prior.open_questions, ...(designData?.questions ?? []).map(questionText)];
+        const feature = designData?.feature ?? edits[0]?.feature ?? null;
         const now = new Set(uncommittedKnowledge(/** @type {string} */ (root)));
         return {
           json: {
@@ -254,9 +265,10 @@ export const command = {
             references,
             edits,
             open_questions: openQuestions,
+            ...(designData !== null && { design_questions: designData.questions }),
             written,
             uncommitted: written.filter((file) => now.has(file)),
-            next_step: ["/qa-deep-dive", ...(feature ? [feature] : []), ...references].join(" "),
+            next_step: designData !== null ? `/qa-deep-dive ${feature} --dir ${opened.dir}` : ["/qa-deep-dive", ...(feature ? [feature] : []), ...references].join(" "),
           },
           exit: 0,
         };
@@ -281,7 +293,7 @@ export const command = {
       usage: "<key> --stdin [--confirm <link>,...] [--root <qa-dir>]",
       run(args, { root, stdin, confirm }) {
         if (args.length !== 1) throw new UsageError("deep-dive check takes exactly one <key>");
-        if (!stdin) throw new UsageError("deep-dive check reads the drafted Feature file from --stdin");
+        if (!stdin) throw new UsageError("deep-dive check reads the drafted Feature file from --input <file> or --stdin");
         const guard = refuseSuiteSchema(/** @type {string} */ (root));
         if (guard) return guard;
         const json = { action: "check", ...checkDraft(load(root), args[0], stdin(), confirmList(confirm)) };
@@ -510,7 +522,7 @@ function committedFeature(ctx, rel) {
 //   coverage_*          the `## Coverage` section's own contract (lib/coverage.mjs)
 //   deferred_*          the `## Deferred` section's syntax and sources (lib/deferred.mjs)
 //   bookkeeping         `watermark`, `watermark_digest`, `finding` or an existing `mirror` changed, or `formerly` shrank
-//   rule_outside_rules  a `### rule_` heading outside `## Rules`
+//   rule_outside_rules  a `rule_` heading or numbered item outside `## Rules`
 // Warnings add `retired_feature_key` to check-file's `unknown_key`.
 /**
  * @param {DeepDiveContext} ctx
@@ -548,6 +560,7 @@ function checkDraft(ctx, key, text, confirmed = []) {
   const current = committedFeature(ctx, state.rel);
   errors.push(...coverageProblems(draft, effectiveCategories(ctx.root), { current }));
   errors.push(...deferredProblems(draft, ctx));
+  errors.push(...proposedRulesProblems(draft));
   // The draft replaces this Feature in the tree, so a Dependency it adds resolves against every
   // other Feature as it stands, with the Scan's own checks.
   const files = state.status === "existing"
@@ -644,7 +657,7 @@ function checkDraft(ctx, key, text, confirmed = []) {
   }
 
   for (const h of ruleHeadingsOutsideRules(draft)) {
-    report("rule_outside_rules", "a `### rule_` heading belongs under `## Rules`; a parked question is prose", h.line, "rule");
+    report("rule_outside_rules", "a Rule belongs under `## Rules`, as a `### rule_<key>: <statement>` heading or a numbered `1. **rule_<key>**: <statement>` item; a parked question is prose", h.line, "rule");
   }
 
   const ok = errors.length === 0;
@@ -655,6 +668,8 @@ function checkDraft(ctx, key, text, confirmed = []) {
     file: state.file,
     path: state.path,
     coverage_digest: coverageDigest(text),
+    // The kept Proposed Rules the draft still holds (ADR-0067): a full inventory's gate needs none.
+    proposed_rules_left: parseProposedRules(text),
     errors: errors.sort((a, b) => (a.line ?? 0) - (b.line ?? 0)),
     warnings,
     rules: { added, edited, retired },
@@ -684,19 +699,23 @@ function runObservations(ctx, sources) {
   return [...new Set(files)].filter((f) => isUncommitted(ctx.repo, f)).sort();
 }
 
-// The `### rule_` headings of a parsed file whose nearest `##` above is not `## Rules`.
+// The `rule_` headings and numbered `rule_` items of a parsed file whose nearest `##` above is not
+// `## Rules`.
 /**
  * @param {ParsedFile} file
- * @returns {ParsedSection[]}
+ * @returns {Array<{ line: number }>}
  */
 function ruleHeadingsOutsideRules(file) {
   /** @type {string | null} */
   let section = null;
-  /** @type {ParsedSection[]} */
+  /** @type {Array<{ line: number }>} */
   const out = [];
   for (const e of file.sections) {
     if (e.level <= 2) section = e.level === 2 ? e.title : null;
     else if (e.level === 3 && e.title.startsWith("rule_") && section !== "Rules") out.push(e);
   }
-  return out;
+  for (const item of file.items ?? []) {
+    if (item.key.startsWith("rule_") && item.section !== "Rules") out.push(item);
+  }
+  return out.sort((a, b) => a.line - b.line);
 }

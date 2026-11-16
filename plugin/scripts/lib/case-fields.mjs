@@ -12,15 +12,74 @@ export const PROSE_FIELDS = MIRROR_PROSE;
  */
 export const stripListMarker = (text) => text.trim().replace(/^([-*+]|\d+[.)])\s+/, "");
 
+/**
+ * A validated case binding: absent for a Layer-free case, one slug or a non-empty list of distinct
+ * project level slugs. File checking owns validation; normalisation never drops a binding.
+ * @typedef {string | string[] | undefined} CaseLevel
+ */
+
+/**
+ * Canonical binding for claims and comparisons. A one-item list is its slug; longer lists sort.
+ * @param {CaseLevel} level
+ * @returns {CaseLevel}
+ */
+export const normalizeCaseLevel = (level) => Array.isArray(level) ? (level.length === 1 ? level[0] : [...level].sort()) : level;
+
 // A case's level: the one its block names, or, on a project still below the level-on-case schema,
 // the one its Scenario carries, which every case without its own inherits until the project migrates.
 /**
  * @param {Record<string, unknown>} entryData
  * @param {Record<string, unknown>} fileData
  * @param {number | null | undefined} schemaVersion
- * @returns {unknown}
+ * @returns {CaseLevel}
  */
-export const caseLevel = (entryData, fileData, schemaVersion) => entryData.level ?? (typeof schemaVersion === "number" && schemaVersion < LEVEL_ON_CASE_SCHEMA_VERSION ? fileData.level : undefined);
+export const caseLevel = (entryData, fileData, schemaVersion) => /** @type {CaseLevel} */ (entryData.level ?? (typeof schemaVersion === "number" && schemaVersion < LEVEL_ON_CASE_SCHEMA_VERSION ? fileData.level : undefined));
+
+/**
+ * The canonical form two bindings compare in: absent, null and an empty list all mean no binding;
+ * a one-item list is its slug; a longer list sorts.
+ * @param {unknown} level
+ * @returns {Exclude<CaseLevel, undefined> | null}
+ */
+export const comparisonLevel = (level) => {
+  const canonical = normalizeCaseLevel(/** @type {CaseLevel} */ (level ?? undefined));
+  return canonical === undefined || (Array.isArray(canonical) && canonical.length === 0) ? null : canonical;
+};
+
+/**
+ * Whether two Test Case bindings are one claim: absent and empty are the same, a one-item list is
+ * its slug, and list order is immaterial.
+ * @param {unknown} a
+ * @param {unknown} b
+ * @returns {boolean}
+ */
+export const sameCaseLevel = (a, b) => JSON.stringify(comparisonLevel(a)) === JSON.stringify(comparisonLevel(b));
+
+/**
+ * Enumerate a case's canonical bindings, including legacy Scenario inheritance below schema 4.
+ * A Layer-free case yields no bindings; choosing an execution or automation level belongs to callers.
+ * @param {Record<string, unknown>} entryData
+ * @param {Record<string, unknown>} [fileData]
+ * @param {number | null} [schemaVersion]
+ * @returns {string[]}
+ */
+export function caseLevels(entryData, fileData = {}, schemaVersion) {
+  const level = normalizeCaseLevel(caseLevel(entryData, fileData, schemaVersion));
+  return level === undefined ? [] : Array.isArray(level) ? level : [level];
+}
+
+/**
+ * Whether a level filter selects a case: every Layer-free case, or any matching bound level.
+ * @param {Record<string, unknown>} entryData
+ * @param {Record<string, unknown>} fileData
+ * @param {number | null | undefined} schemaVersion
+ * @param {ReadonlySet<string>} requested
+ * @returns {boolean}
+ */
+export function caseMatchesLevels(entryData, fileData, schemaVersion, requested) {
+  const bound = caseLevels(entryData, fileData, schemaVersion);
+  return requested.size === 0 || bound.length === 0 || bound.some((level) => requested.has(level));
+}
 
 // Steps require the actor prefix's trailing space; preconditions recognise any named prefix.
 /**
@@ -40,7 +99,7 @@ export function stepActor(text, { precondition = false } = {}) {
  *   prose?: Array<{ text: string, [key: string]: unknown }>,
  *   data: {
  *     roles?: string[],
- *     level?: string,
+ *     level?: CaseLevel,
  *     [key: string]: unknown,
  *   },
  *   [key: string]: unknown,
@@ -55,7 +114,7 @@ export function stepActor(text, { precondition = false } = {}) {
  *   steps: string | null,
  *   expected: string | null,
  *   roles: string[],
- *   level?: string,
+ *   level?: CaseLevel,
  *   scenario?: string,
  *   [key: string]: unknown,
  * }} CaseFields
@@ -118,6 +177,7 @@ export function sameOwned(field, a, b) {
     return text(a) === text(b);
   }
   if (field === "roles") return JSON.stringify([...(/** @type {unknown[]} */ (a ?? []))].sort()) === JSON.stringify([...(/** @type {unknown[]} */ (b ?? []))].sort());
+  if (field === "level") return sameCaseLevel(a, b);
   if (field === "summary" && typeof a === "string" && typeof b === "string") return sameSummary(a, b);
   return (a ?? null) === (b ?? null);
 }

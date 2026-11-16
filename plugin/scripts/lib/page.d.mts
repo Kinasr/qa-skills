@@ -371,6 +371,8 @@ export interface ShowCaseRow {
   key: string;
   title: string;
   line: number;
+  // Canonical enumeration of the case's bindings; empty for a Layer-free case.
+  levels: string[];
   data: Record<string, unknown>;
   sections: ShowCaseSection[];
 }
@@ -383,10 +385,12 @@ export interface ShowScenarioRow {
 }
 export interface ShowScenariosSection { rows: Readonly<Record<string, ShowScenarioRow>> }
 export interface ShowKnowledgeSection {
-  // Transcribed from deferred.mjs's `DeferredFunctionality` and parked-questions.mjs's
-  // `ParkedQuestion`, which own the shapes; this contract has no Node imports.
+  // Transcribed from deferred.mjs's `DeferredFunctionality`, parked-questions.mjs's
+  // `ParkedQuestion` and proposed-rules.mjs's `ProposedRule`, which own the shapes; this contract
+  // has no Node imports.
   deferred: Array<{ functionality: string; reason: string; reference: string; place: string | null; line: number }>;
   parked: Array<{ text: string; line: number }>;
+  proposed: Array<{ statement: string; why: string | null; scenario: string | null; line: number }>;
   boundaries: ShowBoundary[];
   waivers: Array<{ key: string; reason: string; elaboration: string }>;
   coverage: ShowCoverage | null;

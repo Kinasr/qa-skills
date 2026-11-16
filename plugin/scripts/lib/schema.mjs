@@ -20,6 +20,13 @@ export const isExecutionFile = (file) => file.type === "execution" || file.rel.s
  * @returns {boolean}
  */
 export const isBugFile = (file) => file.type === "bug" || file.rel.startsWith("bugs/");
+// A file kept beside the knowledge rather than in it (ADR-0053): an Execution record or a Bug draft.
+// No knowledge comparison reads one, so neither ever makes `.qa/` dirty against HEAD.
+/**
+ * @param {{ type?: unknown, rel: string }} file
+ * @returns {boolean}
+ */
+export const isBesideKnowledge = (file) => isExecutionFile(file) || isBugFile(file);
 /** @type {readonly string[]} */
 export const BUG_STATUSES = ["draft", "published"];
 /** @type {readonly string[]} */
@@ -43,7 +50,7 @@ export const AUTOMATION_DIAGNOSTICS_MAX = 5;
 /** @type {RegExp} */
 export const AUTOMATION_ATTEMPT = /^(?:passed|failed|blocked:(?:no-command|runner-error|no-result|skipped|not-run))$/;
 // A case block's reasons an Execution did not run, in their canonical order.
-export const EXECUTION_SKIPPED = ["no-steps", "no-expected", "not-run"];
+export const EXECUTION_SKIPPED = ["manual", "no-steps", "no-expected", "not-run"];
 
 // The latest `project.md` schema this CLI reads (ADR-0027): `schema_version`, where a `project.md`
 // without one is version 1. A `.qa/` declaring a newer one, or a malformed one, is refused by every
@@ -57,11 +64,29 @@ export const SUITE_KEYS_SCHEMA_VERSION = 3;
 /** @type {number} */
 export const LEVEL_ON_CASE_SCHEMA_VERSION = 4;
 /** @type {number} */
-export const SCHEMA_VERSION = LEVEL_ON_CASE_SCHEMA_VERSION;
+export const LAYER_FREE_CASE_SCHEMA_VERSION = 5;
+/** @type {number} */
+export const RULE_LIST_SCHEMA_VERSION = 6;
+/**
+ * The schema versions a migration writes into a carried pin's `migrated:` marker: the level step
+ * and the Rule-list step. No other value is a migrated pin.
+ * @type {readonly number[]}
+ */
+export const MIGRATED_SCHEMA_VERSIONS = [LEVEL_ON_CASE_SCHEMA_VERSION, RULE_LIST_SCHEMA_VERSION];
+/**
+ * Whether a schema accepts Layer-free and list-bound cases.
+ * @param {number | null | undefined} schemaVersion
+ * @returns {boolean}
+ */
+export const allowsLayerFree = (schemaVersion) => typeof schemaVersion === "number" && schemaVersion >= LAYER_FREE_CASE_SCHEMA_VERSION;
+
+/** @type {number} */
+export const SCHEMA_VERSION = RULE_LIST_SCHEMA_VERSION;
 
 /**
  * Pending schema boundaries in the order the engineer runs them. Keys and Suite keys share one
- * migration command, which establishes both boundaries before levels can move.
+ * migration command, which establishes both boundaries before levels can move. The Rule list form
+ * is the last step of the same plain command.
  * @param {number} version
  * @returns {{ version: number, command: string }[]}
  */
@@ -69,6 +94,8 @@ export function pendingMigrations(version) {
   return [
     { version: SUITE_KEYS_SCHEMA_VERSION, command: "migrate-keys" },
     { version: LEVEL_ON_CASE_SCHEMA_VERSION, command: "migrate-keys --levels" },
+    { version: LAYER_FREE_CASE_SCHEMA_VERSION, command: "migrate-keys" },
+    { version: RULE_LIST_SCHEMA_VERSION, command: "migrate-keys" },
   ].filter((step) => version < step.version);
 }
 // New projects start with permanent Case, Scenario and Suite keys.
@@ -80,6 +107,15 @@ export const INIT_SCHEMA_VERSION = SCHEMA_VERSION;
  * @returns {boolean}
  */
 export const isSchemaVersion = (v) => Number.isInteger(v) && /** @type {number} */ (v) >= 1;
+
+/**
+ * How a command treats the commit of the files it wrote (ADR-0062).
+ * @typedef {"print" | "ask" | "auto"} CommitMode
+ */
+
+// Whether `v` is a Commit mode `project.md` may declare.
+/** @type {(v: unknown) => v is CommitMode} */
+export const isCommitMode = (v) => v === "print" || v === "ask" || v === "auto";
 
 // Each type's keys in the order a writer places them; `case` is a Test Case's block.
 /**
@@ -97,20 +133,20 @@ export const isSchemaVersion = (v) => Number.isInteger(v) && /** @type {number} 
 export const KNOWN = {
   project: [
     "type", "key", "schema_version", "stack", "tracker", "annotation_map", "module_paths", "roles", "role_meaning", "tags", "retired_tags", "custom_fields", "bug_fields", "level_migrations",
-    "concurrency_cap", "tiers", "scout", "targets", "execute_levels", "test_runner", "code_host", "retired_features", "automation_key_pattern", "automation_key_mint",
+    "concurrency_cap", "tiers", "scout", "targets", "execute_levels", "level_targets", "test_runner", "code_host", "retired_features", "automation_key_pattern", "automation_key_mint", "commit_mode",
   ],
   feature: ["type", "key", "suite_key", "watermark", "watermark_digest", "coverage_digest", "mirror", "finding", "repairs", "retired", "formerly", "generated", "sources"],
   scenario: ["type", "key", "migrate_as", "feature", "tracker", "tracker_formerly", "mirror", "formerly", "generated", "sources"],
   train: ["type", "key"],
-  observation: ["type", "observed_at", "url", "app_version", "request"],
-  execution: ["type", "run", "executed_at", "target", "url", "commit", "playwright_cli", "skipped", "selection"],
-  execution_case: ["automation", "key", "tracker", "feature", "result", "reason", "execution_skipped", "digest", "dirty", "review", "stale", "roles", "access", "reached", "actions", "at_login", "redacted", "created", "preconditions", "interpretations"],
+  observation: ["type", "observed_at", "url", "app_version", "request", "signed_out"],
+  execution: ["type", "run", "executed_at", "target", "url", "commit", "playwright_cli", "skipped", "excluded", "not_run", "selection"],
+  execution_case: ["automation", "key", "level", "bound_levels", "selected_levels", "omitted_levels", "tracker", "feature", "result", "reason", "execution_skipped", "digest", "dirty", "review", "stale", "roles", "access", "reached", "actions", "at_login", "redacted", "routes", "created", "preconditions", "interpretations", "interpretations_dropped"],
   bug: [
     "type", "key", "status", "case", "feature", "case_digest", "run", "commit", "drafted_at", "route", "target", "record",
     "roles", "automations", "redacted", "tracker", "published_at",
   ],
   case: [
-    "key", "migrate_as", "tracker", "tracker_formerly", "automates", "automatable", "level", "roles", "tags", "covers", "relies_on", "mirror", "mirror_fields", "mirror_field_targets", "review", "review_by",
+    "key", "migrate_as", "tracker", "tracker_formerly", "automates", "automatable", "manual", "level", "roles", "tags", "covers", "relies_on", "mirror", "mirror_fields", "mirror_field_targets", "review", "review_by",
     "finding", "formerly", "generated", "sources",
   ],
 };
@@ -199,8 +235,12 @@ export const FIELD_RENDER = {
   },
   project: { roles: { item: "role" }, custom_fields: { blockList: true, quoted: ["description"] }, bug_fields: { blockList: true } },
   feature: { repairs: { blockList: true } },
-  execution: { skipped: { blockList: true } },
-  execution_case: { automation: { blockList: true }, roles: { item: "role", keepEmpty: true }, access: { keepEmpty: true }, preconditions: { blockList: true } },
+  execution: { skipped: { blockList: true }, excluded: { blockList: true } },
+  execution_case: {
+    automation: { blockList: true }, roles: { item: "role", keepEmpty: true }, access: { keepEmpty: true },
+    bound_levels: { keepEmpty: true }, selected_levels: { keepEmpty: true }, omitted_levels: { keepEmpty: true },
+    preconditions: { blockList: true },
+  },
 };
 
 // Training is one file per target (ADR-0015): `train/<key>.md`, its key from this closed

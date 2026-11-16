@@ -7,6 +7,7 @@ import { readFileSync } from "node:fs";
 import { UsageError } from "./cli.mjs";
 import { checkFile, parse } from "./knowledge-file.mjs";
 import { locate } from "./qa-index.mjs";
+import { credentialSourceProblems, credentialSourceWarnings } from "./credential-source.mjs";
 
 // With `--stdin` the contents come from stdin and <path> is where they are about to be written.
 // Exit 0 if ok, 1 if not.
@@ -25,8 +26,12 @@ export const command = {
       if (/** @type {NodeJS.ErrnoException} */ (e).code === "ENOENT") throw new UsageError(`no such file: ${file}`);
       throw e;
     }
-    const { rel, config } = locate(file, { root });
-    const result = checkFile(parse(rel, text), config);
+    const { rel, config, root: qa } = locate(file, { root });
+    const parsed = parse(rel, text);
+    const result = checkFile(parsed, config);
+    result.errors.push(...credentialSourceProblems(qa, parsed, { draft: Boolean(stdin) }));
+    result.warnings.push(...credentialSourceWarnings(qa, parsed));
+    result.ok = result.errors.length === 0;
     return { exit: result.ok ? 0 : 1, json: { file, ...result } };
   },
 };

@@ -47,6 +47,7 @@
 // set of `mirror.suite` values) and the cases under both. The separate marked lists are
 // project-wide; other entries outside that scope are ignored.
 /** @import { ConfirmedLabel, LabelDestination, LabelDestinationRequest, LabelCopies } from "./publish-labels.mjs" */
+/** @import { CaseLevel } from "./case-fields.mjs" */
 /** @import { LabelDefinitions } from "./case-labels.mjs" */
 import { accessFor, trackerUri } from "./access.mjs";
 import { list } from "./markdown.mjs";
@@ -54,11 +55,12 @@ import { isMap } from "./dialect.mjs";
 import { labelDefinitions } from "./case-labels.mjs";
 import { projectConfig } from "./knowledge-file.mjs";
 import { canPublishLabels, configuredLabelDestinations, recoveredLabelCopies, sameLabelValue, managedTags, hasPublishTags, singleLabelValue } from "./publish-labels.mjs";
+import { normalizeCaseLevel, sameCaseLevel } from "./case-fields.mjs";
 import { PATTERN, trackerReference } from "./keys.mjs";
 import { featureFile } from "./qa-index.mjs";
 import { proseLines } from "./markdown.mjs";
 import { line, role } from "./render.mjs";
-import { MIRROR_FIELDS, MIRROR_LISTS, noList, oneLine, QUOTED, sameSummary } from "./schema.mjs";
+import { allowsLayerFree, LAYER_FREE_CASE_SCHEMA_VERSION, LEVEL_ON_CASE_SCHEMA_VERSION, MIRROR_FIELDS, MIRROR_LISTS, noList, oneLine, QUOTED, sameSummary } from "./schema.mjs";
 
 /**
  * A tracker scenario item as reported in tracker.json.
@@ -100,7 +102,7 @@ import { MIRROR_FIELDS, MIRROR_LISTS, noList, oneLine, QUOTED, sameSummary } fro
  *   summary?: string | null,
  *   status?: string | null,
  *   auto_status?: string | null,
- *   level?: string | null,
+ *   level?: string | string[] | null,
  *   roles?: string[] | null,
  *   labels?: string[],
  *   linked_issues?: TrackerLinkedIssue[],
@@ -154,7 +156,7 @@ import { MIRROR_FIELDS, MIRROR_LISTS, noList, oneLine, QUOTED, sameSummary } fro
  *   summary?: string | null,
  *   status?: string | null,
  *   auto_status?: string | null,
- *   level?: string | null,
+ *   level?: string | string[] | null,
  *   roles?: string[] | null,
  *   labels?: string[],
  *   preconditions?: string | null,
@@ -192,6 +194,7 @@ import { MIRROR_FIELDS, MIRROR_LISTS, noList, oneLine, QUOTED, sameSummary } fro
  * @typedef {{
  *   at?: string,
  *   label_destinations?: LabelDestination[],
+ *   level_destinations?: LabelDestination[],
  *   error?: unknown,
  *   access_note?: string | null,
  *   scenarios?: TrackerScenarioRecord[],
@@ -236,6 +239,7 @@ import { MIRROR_FIELDS, MIRROR_LISTS, noList, oneLine, QUOTED, sameSummary } fro
  *   suitesNotFound: Set<string>,
  *   stories: Map<string, TrackerStoryItem>,
  *   label_destinations: LabelDestination[],
+ *   level_destinations: LabelDestination[],
  * } | {
  *   ok: false,
  *   note: TrackerNote | null,
@@ -305,8 +309,9 @@ import { MIRROR_FIELDS, MIRROR_LISTS, noList, oneLine, QUOTED, sameSummary } fro
  *   key: string,
  *   summary: string,
  *   file: string | null,
- *   level: string | null,
- *   tracker_level?: string | null,
+ *   level: CaseLevel | null,
+ *   offered_level?: CaseLevel,
+ *   tracker_level?: string | string[] | null,
  *   roles?: string[],
  *   unknown_roles?: string[],
  *   automatable?: boolean,
@@ -340,6 +345,7 @@ import { MIRROR_FIELDS, MIRROR_LISTS, noList, oneLine, QUOTED, sameSummary } fro
  *     autPattern?: RegExp,
  *     levels: Set<string>,
  *     roles: Set<string>,
+ *     schemaVersion?: number | null,
  *     [key: string]: unknown,
  *   },
  *   scan: {
@@ -630,8 +636,9 @@ export function readTracker(ctx, text) {
   const destinations = configuredLabelDestinations(definitions, project.tracker ?? {});
   /** @param {TrackerCaseItem} e */
   const checkCase = (e) => {
-    const f = scalars(e, ["scenario", "summary", "status", "auto_status", "level"]);
+    const f = scalars(e, ["scenario", "summary", "status", "auto_status"]);
     if (f) return `\`${f}\` must be a string or null`;
+    if (e.level === undefined || (e.level !== null && !((typeof e.level === "string" && e.level.trim()) || (Array.isArray(e.level) && e.level.every((l) => typeof l === "string" && l.trim()))))) return "`level` must be a non-empty string, a list of them, or null";
     const bad = markFault(e);
     if (bad) return bad;
     if (e.roles === undefined || (e.roles !== null && (!Array.isArray(e.roles) || e.roles.some((r) => typeof r !== "string")))) return "`roles` must be a list of strings or null";
@@ -766,7 +773,7 @@ export function readTracker(ctx, text) {
     const shown = missing.length > 5 ? [...missing.slice(0, 5), `${missing.length - 5} more`] : missing;
     return invalid(`leaves out ${counts.join(" and ")} to fetch, ${list(shown)}: fetch what is missing, or mark each one the tracker no longer holds as \`not_found\``);
   }
-  return { ok: true, at: /** @type {string} */ (p.at), scenarios, cases, requests, markedCases, markedScenarios, markedSuites, markedBugs, bugStatuses, suites, suitesNotFound: notFound.suites, stories, label_destinations: readLabelDestinations(p.label_destinations) };
+  return { ok: true, at: /** @type {string} */ (p.at), scenarios, cases, requests, markedCases, markedScenarios, markedSuites, markedBugs, bugStatuses, suites, suitesNotFound: notFound.suites, stories, label_destinations: readLabelDestinations(p.label_destinations), level_destinations: readLabelDestinations(p.level_destinations) };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -790,11 +797,13 @@ const stringsIn = (v) => (Array.isArray(v) ? v.filter((k) => typeof k === "strin
  * @returns {boolean}
  */
 const sameValue = (field, a, b) =>
-  MIRROR_LISTS.includes(field)
-    ? (noList(a) && noList(b)) || (Array.isArray(a) && Array.isArray(b) && sameSet(a, b))
-    : field === "summary" && typeof a === "string" && typeof b === "string"
-      ? sameSummary(a, b)
-      : JSON.stringify(a) === JSON.stringify(b);
+  field === "level"
+    ? sameCaseLevel(a, b)
+    : MIRROR_LISTS.includes(field)
+      ? (noList(a) && noList(b)) || (Array.isArray(a) && Array.isArray(b) && sameSet(a, b))
+      : field === "summary" && typeof a === "string" && typeof b === "string"
+        ? sameSummary(a, b)
+        : JSON.stringify(a) === JSON.stringify(b);
 
 // The Mirrored values of one tracker entry of `kind`, in the order a mirror is written, before
 // `at`. The payload names each field as the mirror does (lib/schema.mjs's MIRROR_FIELDS); a
@@ -1117,9 +1126,10 @@ function scenarioPath(ctx, feature, key, summary) {
 
 // One intake item: the case as it will be written, except its Key (minted by `apply`, or the marked
 // Key an Unlanded case reuses) and its prose, which `apply` renders from
-// the payload. The level is the tracker's, else a `ui`/`api` summary prefix, else asked (a tracker
-// level outside `project.stack.levels` is shown as `tracker_level`). The roles are seeded from the
-// tracker's; one outside `project.roles` is asked about rather than written as an Integrity error.
+// the payload. A tracker level is only offered for confirmation (`offered_level`); the case is
+// written Layer-free until a person binds it. A tracker level outside `project.stack.levels` is
+// shown as `tracker_level` and never offered. The roles are seeded from the tracker's; one outside
+// `project.roles` is asked about rather than written as an Integrity error.
 /**
  * @param {SyncTrackerContext} ctx
  * @param {string} F
@@ -1130,12 +1140,14 @@ function scenarioPath(ctx, feature, key, summary) {
 export function intakeCase(ctx, F, tc, { file, requires }) {
   const levels = ctx.config.levels;
   const summary = oneLine(tc.summary);
-  const tracked = typeof tc.level === "string" ? tc.level.trim().toLowerCase() : null;
-  const prefix = summary.match(/^\[?(ui|api)\b/i)?.[1].toLowerCase() ?? null;
-  const level = [tracked, prefix].find((l) => l && levels.has(l)) ?? null;
+  const raw = tc.level;
+  const tracked = [...new Set((Array.isArray(raw) ? raw : typeof raw === "string" ? [raw] : []).map((l) => l.trim().toLowerCase()).filter(Boolean))];
+  const offered = tracked.length && tracked.every((l) => levels.has(l))
+    ? normalizeCaseLevel(/** @type {import("./case-fields.mjs").CaseLevel} */ (tracked.length === 1 ? tracked[0] : tracked)) ?? null
+    : null;
   const roles = tc.roles ?? [];
   const unknownRoles = roles.filter((r) => !ctx.config.roles.has(r));
-  const needs = [...(PROSE.some(([f]) => tc[f] === undefined) ? ["prose"] : []), ...(level ? [] : ["level"]), ...(unknownRoles.length ? ["roles"] : [])];
+  const needs = [...(PROSE.some(([f]) => tc[f] === undefined) ? ["prose"] : []), ...(offered === null ? [] : ["level"]), ...(unknownRoles.length ? ["roles"] : [])];
   return {
     code: "intake_case",
     feature: F,
@@ -1143,13 +1155,14 @@ export function intakeCase(ctx, F, tc, { file, requires }) {
     key: tc.key,
     summary,
     file,
-    level,
-    ...(tracked && !levels.has(tracked) && { tracker_level: tc.level }),
+    level: null,
+    ...(offered !== null && { offered_level: offered }),
+    ...(tracked.length && { tracker_level: raw }),
     roles,
     unknown_roles: unknownRoles,
     automatable: tc.auto_status !== "Not Applicable",
     automates: automationsNaming(ctx, tc.key),
-    mirror: { ...mirrored("case", tc), at: ctx.tracker.at },
+    mirror: { ...mirrored("case", tc), ...(tracked.length && { level: offered ?? raw }), at: ctx.tracker.at },
     ...(requires && { requires }),
     needs,
     edits: ["level", "roles"],
@@ -1198,7 +1211,7 @@ function yamlLines(fields) {
 /**
  * @param {IntakeItem} item
  * @param {Record<string, unknown>} tc
- * @param {string | null} level
+ * @param {CaseLevel | null} level
  * @param {string | undefined} at
  * @returns {FrontmatterResult}
  */
@@ -1208,7 +1221,7 @@ function caseEntry(item, tc, level, at) {
     ["tracker", item.key],
     ["automates", item.automates],
     ["automatable", item.automatable],
-    ["level", level],
+    ...(level === undefined || level === null ? [] : [/** @type {[string, unknown]} */ (["level", level])]),
     ["roles", item.roles],
     ["covers", []],
     ["mirror", item.mirror],
@@ -1324,8 +1337,20 @@ export const intake = {
       return null;
     }
     if (item.needs.includes("prose")) return { code: "prose_not_fetched", message: `fetch \`${item.key}\`'s preconditions, steps and expected result, then build the card again` };
-    if (item.level === null || item.level === undefined) return { code: "needs_edit", message: `name \`${item.key}\`'s level (edit item ${item.n} with \`level\`)` };
-    if (!ctx.config.levels.has(item.level)) return { code: "bad_level", message: `\`${item.level}\` is not one of \`project.stack.levels\`: ${[...ctx.config.levels].join(", ")}` };
+    // A tracker level is an offer: the item stays Layer-free until the engineer answers `level`
+    // with a binding, or with an empty string to decline it.
+    if (item.needs.includes("level") && (item.level === null || item.level === undefined)) return { code: "needs_edit", message: `confirm \`${item.key}\`'s tracker level as a binding, or leave it empty to take the case in Layer-free (edit item ${item.n} with \`level\`)` };
+    const answered = item.level === undefined || item.level === null || (typeof item.level === "string" && !item.level.trim()) ? null : normalizeCaseLevel(/** @type {CaseLevel} */ (item.level));
+    const schema = ctx.config.schemaVersion ?? 0;
+    if (answered === null && schema >= LEVEL_ON_CASE_SCHEMA_VERSION && !allowsLayerFree(schema)) return { code: "needs_edit", message: `a Layer-free case needs schema ${LAYER_FREE_CASE_SCHEMA_VERSION}: run \`migrate-keys\`, or name \`${item.key}\`'s level (edit item ${item.n} with \`level\`)` };
+    // Below the level-on-case schema an absent case level inherits its Scenario's; writing it there
+    // is Layer-free only when the Scenario carries none.
+    if (answered === null && schema < LEVEL_ON_CASE_SCHEMA_VERSION && typeof (/** @type {{ data?: { level?: unknown } } | undefined} */ (item.file ? ctx.files.find((f) => f.rel === item.file) : undefined))?.data?.level === "string") return { code: "needs_edit", message: `\`${item.scenario}\` carries a legacy Scenario level that an absent case level inherits: name \`${item.key}\`'s level (edit item ${item.n} with \`level\`), or run \`migrate-keys --levels\` and then \`migrate-keys\` to make it Layer-free` };
+    if (Array.isArray(answered) && !allowsLayerFree(schema)) return { code: "needs_edit", message: `a list of levels needs schema ${LAYER_FREE_CASE_SCHEMA_VERSION}: run \`migrate-keys\`, or name one level for \`${item.key}\`` };
+    if (answered !== null) {
+      const chosen = Array.isArray(answered) ? answered : [answered];
+      if (!chosen.length || new Set(chosen).size !== chosen.length || chosen.some((level) => typeof level !== "string" || !ctx.config.levels.has(level))) return { code: "bad_level", message: `\`${chosen.join(", ")}\` is not a list of distinct \`project.stack.levels\`: ${[...ctx.config.levels].join(", ")}` };
+    }
     const roles = badRoles(ctx, /** @type {Extract<IntakeItem, { code: "intake_case" }>} */ (item));
     if (roles) return roles;
     // A case with no file requires its new scenario's intake, applied before it. A reply dropping
@@ -1336,7 +1361,7 @@ export const intake = {
     const permanent = /** @type {{ key: string, error?: string }} */ (plan.permanentKey("tc", item.permanent_key));
     if (permanent.error) return { code: "mint", item: item.n, message: permanent.error };
     const taken = { ...item, permanent_key: permanent.key };
-    const entry = /** @type {{ text: string, error?: string }} */ (caseEntry(taken, /** @type {Record<string, unknown>} */ (T.markedCases.get(item.key) ?? T.cases.get(item.key)), item.level, T.at));
+    const entry = /** @type {{ text: string, error?: string }} */ (caseEntry(taken, /** @type {Record<string, unknown>} */ (T.markedCases.get(item.key) ?? T.cases.get(item.key)), answered, T.at));
     if (entry.error) return { code: "unwritable", item: item.n, value: entry.error, message: `${entry.error}: drop this item and fix the value in the tracker` };
     const clash = plan.claim(permanent.key, item.n) ?? plan.claim(item.key, item.n);
     if (clash) return clash;

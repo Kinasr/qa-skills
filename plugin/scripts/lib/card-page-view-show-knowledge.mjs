@@ -41,6 +41,13 @@ export function showKnowledgeView(request) {
       if (item.place !== null) ctx.node('span', `, ${item.place}`, row);
     }
   });
+  if (knowledge.proposed.length) ctx.lazy(parent, 'Proposed Rules', body => {
+    for (const item of knowledge.proposed) {
+      ctx.node('p', item.statement, body);
+      if (item.why !== null) ctx.node('p', `Why: ${item.why}`, body).className = 'knowledge-prose';
+      if (item.scenario !== null) ctx.keyed(ctx.node('p', 'Scenario: ', body), item.scenario, feature.key);
+    }
+  });
   if (knowledge.parked.length) ctx.lazy(parent, 'Parked questions', body => {
     for (const question of knowledge.parked) ctx.node('p', question.text, body);
   });

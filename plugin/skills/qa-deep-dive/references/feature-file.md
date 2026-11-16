@@ -19,14 +19,14 @@ scope it covers.>
 
 ## Rules
 
-### rule_<key>: <statement carrying the whole claim>
-Depends on: <feature_key>/<rule_key>
-Waived: <reason>
+1. **rule_<key>**: <statement carrying the whole claim>
+   Depends on: <feature_key>/<rule_key>
+   Waived: <reason>
 
 ## Boundaries
 
-### boundary_<key>: <statement>
-Owner: <feature_key | none>
+1. **boundary_<key>**: <statement>
+   Owner: <feature_key | none>
 
 ## Coverage
 
@@ -38,11 +38,24 @@ Owner: <feature_key | none>
 
 - **<functionality as a verb phrase>**: <reason>. From: <reference uri>[, <place>]
 
+## Proposed Rules
+
+1. <statement>
+   Why: <why no Rule covers it>
+   Scenario: <scenario key>
+
 ## Open questions
 
 1. **<question>**: <what the References say, and why it is still open>
 ```
 
+- **Rules and Boundaries are numbered list items.** A Rule's statement is its item's first line,
+  as one physical line; its field block follows directly beneath, indented to the item. A Boundary
+  reads the same way, its `Owner:` in the field block directly under the statement. Elaboration
+  comes after a blank line, indented to the item's content. Append a new Rule or Boundary at the
+  end of its list, numbered one past the last item, and renumber the items after one you delete,
+  so the numbers run 1, 2, 3 in each list. The number only counts them; the key stays the identity,
+  and nothing cites a number.
 - **Bookkeeping** (`suite_key`, `watermark`, `finding`, `coverage_digest`, `mirror`, `formerly`) is the framework's. Write a
   `mirror` for a new Feature only, and only when a fetched tracker issue is of the Group-level type
   in `project.tracker.issue_types` (the first of Suite / Scenario / Case). With no `issue_types`,
@@ -61,17 +74,22 @@ Owner: <feature_key | none>
   non-empty verb phrase, reason and Reference URI, with an optional place. Each URI is listed in
   `sources`. It claims no behaviour and has no keys. Omit the section when empty. Follow
   [the Deferred reference](deferred.md) when a full inventory defers or reconciles items.
+- **Proposed Rules** are kept by `/qa-design` (`design keep`) for a deep dive to settle: numbered,
+  unkeyed items, each a one-line statement with optional `Why:` and `Scenario:` lines under it. They
+  claim no behaviour. A full inventory settles each: it becomes Rules, an existing Rule states it,
+  it is rejected with its reason, or it is parked; drop it then, and omit the section once empty. An
+  amendment keeps them unless the engineer pulls one in.
 - Omit `retired`, `## Open questions` and every other empty collection. Never write `[]`.
-- A Boundary's `Owner:` is its first non-blank line and names another existing Feature.
-  `none` hands the behaviour to no Feature.
+- A Boundary's `Owner:` is in the field block directly under its statement and names another
+  existing Feature. `none` hands the behaviour to no Feature.
 - A Waiver and a Dependency share a Rule's field block: contiguous `Waived: <reason>` and
-  `Depends on: <feature_key>/<rule_key>[, <feature_key>/<rule_key>…]` lines at its first non-blank
-  line, in either order. `Waived:` records why the Rule has no Test Case; keep the Rule.
+  `Depends on: <feature_key>/<rule_key>[, <feature_key>/<rule_key>…]` lines directly under the
+  statement, in either order. `Waived:` records why the Rule has no Test Case; keep the Rule.
   `Depends on:` names the Upstream Rule the Rule rests on, in another Feature; keep the local Rule,
   whose statement carries the behaviour. A broken Dependency is the Scan's to report, for the
   engineer to settle.
-- Mint each Boundary key with `mint boundary --feature <slug>`. Keep it stable; add a withdrawn key
-  to `retired:`.
+- Mint each Boundary key with `mint boundary --feature <slug>`. Keep it stable; retire one by
+  deleting the Boundary's item and appending its key to `retired:`.
 - `generated.at` is today; a re-run refreshes it and keeps `generated.by`.
 - Stay inside the YAML dialect: no comments, no block scalars, and quote any value that holds
   `: `.

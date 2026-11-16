@@ -1,5 +1,5 @@
 // @ts-check
-// `migrate-keys`: the ordered rewrites of legacy `.qa/` Keys and case levels.
+// `migrate-keys`: ordered legacy Key and level rewrites, then the schema-5 marker.
 // lib/migration-plan.mjs decides what changes; this applies it to the working tree and nothing else:
 //
 //   - a Case or Scenario declaration takes its minted Key, its old Key and any `new_…` history go to
@@ -13,6 +13,7 @@
 // verbatim and lib/scan-history.mjs sees no comparable change. It refuses a `.qa/` with uncommitted
 // changes, so an interrupted run is undone with git: restore `.qa/` from the starting commit, then
 // run it again. Every refusal comes before the first write.
+// On schema 4, `migrate-keys` advances only the schema-5 marker, preserving cases and pins.
 // `--levels` follows the Key rewrite: it moves levels onto cases and carries only verified fresh
 // Reviews and Dismissals with a new digest and `migrated: 4`, preserving their original provenance.
 //
@@ -23,9 +24,10 @@
 // exit 1.
 /** @import { CheckProblem } from "./check-file.mjs" */
 /** @import { CommandDefinition } from "./cli.mjs" */
-/** @import { EditError, ParsedFile, ProjectConfig } from "./knowledge-file.mjs" */
+/** @import { EditChange, EditError, ParsedBoundary, ParsedFile, ParsedRule, ProjectConfig } from "./knowledge-file.mjs" */
 /** @import { LegacyMigrationIndex, LevelMigrationPlan, MigrationMappingRow, MigrationPlanSuccess, MigrationRewrite } from "./migration-plan.mjs" */
 /** @import { MintedKeys } from "./mint.mjs" */
+/** @import { PinDigests } from "./pin-digest.mjs" */
 /** @import { RefusalFact, RefusalResult } from "./refusal.mjs" */
 /** @import { ScanFinding, KnowledgeIndex } from "./scan-integrity.mjs" */
 /** @import { UnreadSchemaRefusal } from "./schema-guard.mjs" */
@@ -35,17 +37,18 @@ import { writeAll } from "./changeset.mjs";
 import { scan } from "./scan.mjs";
 import { isMap } from "./dialect.mjs";
 import { UsageError } from "./cli.mjs";
-import { defaultBranch, hasOrigin, uncommittedUnder } from "./git.mjs";
-import { repositoryOf } from "./git-tree.mjs";
-import { checkFile, edit, parse, projectConfig } from "./knowledge-file.mjs";
+import { defaultBranch, hasOrigin, resolveCommits, uncommittedUnder } from "./git.mjs";
+import { loadQaAt, repositoryOf } from "./git-tree.mjs";
+import { checkFile, edit, parse, projectConfig, ruleItem } from "./knowledge-file.mjs";
 import { planLevelMigration, planMigration } from "./migration-plan.mjs";
-import { backfill, digests } from "./pin-digest.mjs";
+import { backfill, digests, isMigratedPin, pinsOf, writtenDigest } from "./pin-digest.mjs";
 import { buildIndex, loadWorkingTree } from "./qa-index.mjs";
 import { refusalsFor } from "./refusal.mjs";
 import { refuseUnreadSchema } from "./schema-guard.mjs";
-import { ANY_SCHEMA_VERSION, LEVEL_ON_CASE_SCHEMA_VERSION, SUITE_KEYS_SCHEMA_VERSION } from "./schema.mjs";
+import { ANY_SCHEMA_VERSION, LAYER_FREE_CASE_SCHEMA_VERSION, LEVEL_ON_CASE_SCHEMA_VERSION, RULE_LIST_SCHEMA_VERSION, SUITE_KEYS_SCHEMA_VERSION } from "./schema.mjs";
 import { mint } from "./mint.mjs";
 import { run as integrity } from "./scan-integrity.mjs";
+import { coverageDigest } from "./coverage.mjs";
 
 const NOTHING = "Nothing was written.";
 const { fact } = refusalsFor({
@@ -61,6 +64,9 @@ const { fact } = refusalsFor({
   unresolved_ancestry: `An entry's \`new_…\` history does not resolve to one oldest ancestor. ${NOTHING}`,
   rewrite_failed: `A rewrite of the file could not be applied. ${NOTHING}`,
   rename_target_exists: `A Scenario file would be renamed onto another file. ${NOTHING}`,
+  rule_outside_section: `A Rule or Boundary heading outside \`## Rules\` or \`## Boundaries\` cannot become a list item there. Move it under its section, then run the migration again. ${NOTHING}`,
+  prose_in_section: `A \`## Rules\` or \`## Boundaries\` section has prose before its first entry, which the migration would leave outside every item. Move that prose above the section heading or into a Rule's elaboration, then run the migration again. ${NOTHING}`,
+  changed_tree: `\`.qa/\` changed while the migration ran, so its result would overwrite a newer edit. Run it again. ${NOTHING}`,
 });
 // Refusals are states of the tree, not usage errors: exit 1.
 /**
@@ -141,6 +147,7 @@ const COLLISION_FIX = [
  *   consumed: string[],
  *   schema: { from: number, to: number },
  *   checkErrors: MigrationCheckError[],
+ *   pins?: PinOutcome[],
  * }} MigrationOutcome
  */
 
@@ -155,16 +162,17 @@ const COLLISION_FIX = [
  *   renamed: { from: string, to: string }[],
  *   rewritten: string[],
  *   check: { errors: MigrationCheckError[] },
+ *   pins?: PinOutcome[],
  * }} MigrationSuccess
  */
 
 // Migrates the `.qa/` directory `root` in place.
 /**
  * @param {string} root
- * @param {{ levels?: boolean, levelMap?: string }} [options]
+ * @param {{ levels?: boolean, levelMap?: string, currentTree?: () => ReadonlyArray<{ rel: string, text?: unknown }> }} [options] `currentTree` is the final changed-tree read; a test injects one to hold a concurrent edit still.
  * @returns {LevelMigrationResult | UnreadSchemaRefusal | RefusalResult | { exit: 0, json: MigrationSuccess }}
  */
-export function migrateKeys(root, { levels = false, levelMap = "" } = {}) {
+export function migrateKeys(root, { levels = false, levelMap = "", currentTree } = {}) {
   if (levels) return migrateLevels(root, levelMap);
   const newer = refuseUnreadSchema(root, ANY_SCHEMA_VERSION);
   if (newer) return newer;
@@ -201,27 +209,340 @@ export function migrateKeys(root, { levels = false, levelMap = "" } = {}) {
   }
   const result = apply(files, plan, index.project);
   if (result.refusal) return refused(fact(result.refusal.code, result.refusal.data));
+  const final = result.schema.from === LAYER_FREE_CASE_SCHEMA_VERSION
+    ? migrateRuleList(root, files, result, currentTree)
+    : { result };
+  if ("refusal" in final) return refused(fact(final.refusal.code, final.refusal.data));
+  const migrated = final.result;
 
-  const errors = integrityFindings(root, result.after, result.config).filter((e) => e.kind === "integrity_error" &&
+  const errors = integrityFindings(root, migrated.after, migrated.config).filter((e) => e.kind === "integrity_error" &&
     (["duplicate_key", "duplicate_suite_key", "duplicate_tracker_key", "retired_key_live", "heading"].includes(e.code) || e.field === "mirror.suite" ||
       ["key", "suite_key", "tracker", "tracker_formerly", "retired", "retired_features", "formerly", "rule"].includes(/** @type {string} */ (e.field?.split(".").at(-1)))));
   if (errors.length) return refused(fact("identity_error", { errors }));
 
-  for (const [rel, text] of result.writes) {
+  for (const [rel, text] of migrated.writes) {
     mkdirSync(dirname(join(root, rel)), { recursive: true });
     writeFileSync(join(root, rel), backfill(root, rel, text));
   }
-  for (const { from } of result.renamed) unlinkSync(join(root, from));
+  for (const { from } of migrated.renamed) unlinkSync(join(root, from));
   return { exit: 0, json: {
     ok: true,
-    changed: result.writes.size > 0,
-    schema_version: result.schema,
+    changed: migrated.writes.size > 0,
+    schema_version: migrated.schema,
     mapping: plan.mapping,
-    consumed: result.consumed,
-    renamed: result.renamed,
-    rewritten: [...result.writes.keys()].sort(),
-    check: { errors: result.checkErrors },
+    consumed: migrated.consumed,
+    renamed: migrated.renamed,
+    rewritten: [...migrated.writes.keys()].sort(),
+    check: { errors: migrated.checkErrors },
+    ...(migrated.pins ? { pins: migrated.pins } : {}),
   } };
+}
+
+// The check errors a rewrite introduced: in a file it changed, the occurrences of a `(code, field)`
+// pair beyond the count the same file already reported before the rewrite. Lines move, so none is
+// compared; an error already in another file is never the rewrite's.
+/**
+ * @param {readonly MigrationCheckError[]} before
+ * @param {readonly MigrationCheckError[]} after
+ * @param {ReadonlySet<string>} rewritten
+ * @returns {MigrationCheckError[]}
+ */
+export function introducedCheckErrors(before, after, rewritten) {
+  /** @type {Map<string, number>} */
+  const remaining = new Map();
+  /** @param {{ file: string, code: string, field?: string }} error */
+  const key = (error) => `${error.file}\0${error.code}\0${error.field ?? ""}`;
+  for (const error of before) remaining.set(key(error), (remaining.get(key(error)) ?? 0) + 1);
+  /** @type {MigrationCheckError[]} */
+  const introduced = [];
+  for (const error of after) {
+    if (!rewritten.has(error.file)) continue;
+    const count = remaining.get(key(error)) ?? 0;
+    if (count > 0) remaining.set(key(error), count - 1);
+    else introduced.push(error);
+  }
+  return introduced;
+}
+
+// The schema 6 step (ADR-0061): the Rule and Boundary heading form becomes the numbered item form.
+// The rewrite changes layout only; `checkFile` and the identity pass read the result before anything
+// is written. The neutral canonical form changes every stored digest once, so the step decides which
+// pins were fresh under the OLD (raw entry) computation before it re-pins them with the NEW digest and
+// `migrated: 6`, as `migrateLevels` carries a pin across the level rewrite.
+/**
+ * @param {string} root
+ * @param {MigrationFile[]} files
+ * @param {Extract<MigrationOutcome, { writes: Map<string, string> }>} applied
+ * @param {() => ReadonlyArray<{ rel: string, text?: unknown }>} [currentTree]
+ * @returns {{ refusal: MigrationRefusal } | { result: Extract<MigrationOutcome, { writes: Map<string, string> }> }}
+ */
+function migrateRuleList(root, files, applied, currentTree = () => loadWorkingTree(root)) {
+  /** @type {Map<string, string>} */
+  const texts = new Map(files.map((f) => [f.rel, applied.writes.get(f.rel) ?? f.text]));
+  // 1. Rewrite every heading entry into an item, word for word.
+  for (const file of files) {
+    if (file.type !== "feature") continue;
+    const text = /** @type {string} */ (texts.get(file.rel));
+    const done = rewriteFeatureRules(file.rel, text);
+    if (done.refusal) return done;
+    if (done.text !== text) texts.set(file.rel, done.text);
+  }
+  // 2. Recompute each Feature's Coverage digest from the rewritten entries.
+  for (const file of files) {
+    if (file.type !== "feature") continue;
+    const current = parse(file.rel, /** @type {string} */ (texts.get(file.rel)));
+    if (current.data.coverage_digest === undefined) continue;
+    const digest = coverageDigest(current.text);
+    if (current.data.coverage_digest === digest) continue;
+    const done = edit(current, [{ set: { coverage_digest: digest } }]);
+    if (!done.ok) return { refusal: { code: "rewrite_failed", data: { file: file.rel, errors: done.errors } } };
+    texts.set(file.rel, done.text);
+  }
+
+  const afterRules = [...texts].map(([rel, text]) => parse(rel, text));
+  const nowDigests = digests(afterRules);
+  const legacyNow = digests(files, { legacy: true });
+  const repo = /** @type {import("./git-tree.mjs").Repository} */ (repositoryOf(root));
+  const resolved = resolveCommits(root, files.flatMap((f) => pinsOf(f).map((p) => p.commit))).resolved;
+  const { pins, changes } = carryPins(files, { nowDigests, legacyNow, resolved, repo });
+
+  for (const [rel, edits] of changes) {
+    const done = edit(parse(rel, /** @type {string} */ (texts.get(rel))), edits);
+    if (!done.ok) return { refusal: { code: "rewrite_failed", data: { file: rel, errors: done.errors } } };
+    texts.set(rel, done.text);
+  }
+
+  // 3. The schema marker moves with the format.
+  const project = files.find((f) => f.type === "project" && !f.unreadable);
+  if (!project) return { refusal: { code: "no_project", data: { root } } };
+  const marked = edit(parse(project.rel, /** @type {string} */ (texts.get(project.rel))), [{ set: { schema_version: RULE_LIST_SCHEMA_VERSION } }]);
+  if (!marked.ok) return { refusal: { code: "rewrite_failed", data: { file: project.rel, errors: marked.errors } } };
+  texts.set(project.rel, marked.text);
+
+  // 4. Nothing is written until every result reads: the rewrite may carry an error that was already
+  // in the tree, as the earlier steps' `check.errors` do, but it may not introduce one.
+  const writes = new Map([...texts].filter(([rel, text]) => files.find((f) => f.rel === rel)?.text !== text));
+  const beforeConfig = projectConfig(files.find((f) => f.type === "project"));
+  const errorsBefore = files.flatMap((f) => checkFile(f, beforeConfig).errors.map((e) => ({ file: f.rel, ...e })));
+  const after = [...texts].map(([rel, text]) => parse(rel, text));
+  const config = projectConfig(after.find((f) => f.type === "project"));
+  const checkErrors = after.flatMap((f) => checkFile(f, config).errors.map((e) => ({ file: f.rel, ...e })));
+  const introduced = introducedCheckErrors(errorsBefore, checkErrors, new Set(writes.keys()));
+  if (introduced.length) return { refusal: { code: "rewrite_failed", data: { errors: introduced } } };
+  // 5. The `.qa/` read at the end must be the one the step started from.
+  const current = currentTree();
+  if (current.length !== files.length || current.some((f) => files.find((before) => before.rel === f.rel)?.text !== f.text)) {
+    return { refusal: { code: "changed_tree", data: {} } };
+  }
+
+  return {
+    result: {
+      ...applied,
+      writes,
+      after,
+      config,
+      schema: { from: applied.schema.from, to: RULE_LIST_SCHEMA_VERSION },
+      checkErrors,
+      pins,
+    },
+  };
+}
+
+// The pin-carry pass: a Watermark, Review or Dismissal that was fresh under the old (raw entry)
+// computation takes the new neutral digest; one that had already changed is reported stale, and one
+// whose commit is gone with no stored digest is unverified. Neither of the last two is touched.
+/**
+ * @param {MigrationFile[]} files
+ * @param {{
+ *   nowDigests: PinDigests,
+ *   legacyNow: PinDigests,
+ *   resolved: Map<string, string | null>,
+ *   repo: import("./git-tree.mjs").Repository,
+ * }} context
+ * @returns {{ pins: PinOutcome[], changes: Map<string, EditChange[]> }}
+ */
+function carryPins(files, { nowDigests, legacyNow, resolved, repo }) {
+  /** @type {Map<string, { legacy: PinDigests, now: PinDigests }>} */
+  const byCommit = new Map();
+  /** @param {string} commit */
+  const at = (commit) => {
+    if (!byCommit.has(commit)) {
+      const qa = loadQaAt(repo, commit);
+      byCommit.set(commit, { legacy: digests(qa, { legacy: true }), now: digests(qa) });
+    }
+    return /** @type {{ legacy: PinDigests, now: PinDigests }} */ (byCommit.get(commit));
+  };
+  /** @param {unknown} commit @returns {string | null} */
+  const full = (commit) => (typeof commit === "string" ? resolved.get(commit) ?? null : null);
+
+  /** @type {PinOutcome[]} */
+  const pins = [];
+  /** @type {Map<string, EditChange[]>} */
+  const changes = new Map();
+  /** @param {string} rel @param {EditChange} change */
+  const change = (rel, change) => {
+    if (!changes.has(rel)) changes.set(rel, []);
+    /** @type {EditChange[]} */ (changes.get(rel)).push(change);
+  };
+
+  for (const file of files) {
+    if (file.unreadable) continue;
+    const feature = file.type === "feature" ? /** @type {string} */ (file.data.key) : null;
+    // The Watermark is a commit pin too: it carries the Feature digest the pin was taken at.
+    if (file.type === "feature") {
+      const raw = file.data.watermark;
+      if (raw !== undefined && raw !== null) {
+        const W = full(raw);
+        const stored = writtenDigest(file.data.watermark_digest);
+        /** @type {PinOutcome["status"] | null} */
+        let status = null;
+        /** @type {string | null} */
+        let digest = null;
+        if (W !== null) {
+          // With a stored digest, re-pin only a digest that was fresh at that commit; otherwise
+          // the pin had already moved and stays as it is. With none, there is nothing to re-pin.
+          if (stored === null) status = "carried";
+          else if (stored === at(W).legacy.feature(/** @type {string} */ (feature))) {
+            status = "carried";
+            digest = at(W).now.feature(/** @type {string} */ (feature));
+          } else status = "stale";
+        } else if (stored !== null && stored === legacyNow.feature(/** @type {string} */ (feature))) {
+          status = "carried";
+          digest = nowDigests.feature(/** @type {string} */ (feature));
+        } else if (stored !== null && stored === legacyNow.featureLocal(/** @type {string} */ (feature))) {
+          status = "carried";
+          digest = nowDigests.featureLocal(/** @type {string} */ (feature));
+        }
+        pins.push({ file: file.rel, key: feature, pin: "watermark", status: status ?? "unverified" });
+        if (status === "carried" && digest !== null) change(file.rel, { set: { watermark_digest: digest } });
+      }
+    }
+    // A Review is fresh under the old computation when its commit's claim equals the target's, or,
+    // with the commit gone, when its stored digest matches the target's.
+    for (const entry of file.type === "scenario" ? file.cases : []) {
+      const review = entry.data.review;
+      if (!isMap(review)) continue;
+      const R = full(review.commit);
+      /** @type {PinOutcome["status"]} */
+      let status;
+      if (R !== null && !isMigratedPin(review)) {
+        status = at(R).legacy.review(entry.key) !== null && at(R).legacy.review(entry.key) === legacyNow.review(entry.key) ? "carried" : "stale";
+      } else {
+        const stored = writtenDigest(review.digest);
+        status = stored === null ? "unverified" : stored === legacyNow.review(entry.key) ? "carried" : "stale";
+      }
+      pins.push({ file: file.rel, key: entry.key, pin: "review", status });
+      if (status === "carried") change(file.rel, { at: entry.key, set: { review: { ...review, digest: nowDigests.review(entry.key), migrated: RULE_LIST_SCHEMA_VERSION } } });
+    }
+    // Dismissals, Feature-level and case-level, by the same before/after rule.
+    const owners = file.type === "feature" ? [{ key: null, data: file.data }] : file.type === "scenario" ? file.cases.map((c) => ({ key: c.key, data: c.data })) : [];
+    for (const owner of owners) {
+      if (!Array.isArray(owner.data.finding)) continue;
+      let touched = false;
+      const finding = owner.data.finding.map((x) => {
+        if (!isMap(x) || !isMap(x.dismissed)) return x;
+        const key = owner.key ?? (typeof x.subject_key === "string" ? x.subject_key : typeof x.rule === "string" ? x.rule : null);
+        const dismissed = x.dismissed;
+        const D = full(dismissed.commit);
+        const noText = owner.key === null && !(x.kind === "Overreach" && typeof x.rule === "string");
+        /** @type {PinOutcome["status"]} */
+        let status;
+        if (D !== null && !isMigratedPin(dismissed)) {
+          status = noText || at(D).legacy.dismissal(owner.key, x, feature) === legacyNow.dismissal(owner.key, x, feature) ? "carried" : "stale";
+        } else {
+          const stored = writtenDigest(dismissed.digest);
+          status = stored === null ? "unverified" : stored === legacyNow.dismissal(owner.key, x, feature) ? "carried" : "stale";
+        }
+        pins.push({ file: file.rel, key, pin: "dismissed", status });
+        if (status !== "carried") return x;
+        touched = true;
+        return { ...x, dismissed: { ...dismissed, digest: nowDigests.dismissal(owner.key, x, feature), migrated: RULE_LIST_SCHEMA_VERSION } };
+      });
+      if (touched) change(file.rel, { at: owner.key === null ? undefined : owner.key, set: { finding } });
+    }
+  }
+  return { pins, changes };
+}
+
+// One Feature's heading-form entries rewritten as numbered items, in file order and number, with
+// their fields and elaboration indented to the content indent. A heading outside its section cannot
+// become an item there, and prose before a section's first entry would fall outside every item, so
+// each refuses rather than moving text.
+/**
+ * @param {string} rel
+ * @param {string} text
+ * @returns {{ refusal: MigrationRefusal, text?: never } | { refusal?: never, text: string }}
+ */
+function rewriteFeatureRules(rel, text) {
+  const file = parse(rel, text);
+  const normalized = text.replace(/\r\n/g, "\n");
+  const lines = normalized.split("\n");
+  const finalNewline = normalized.endsWith("\n");
+  /** @type {Array<{ line: number, end: number, rendered: string }>} */
+  const replacements = [];
+  /** @type {Array<[string, Array<ParsedRule | ParsedBoundary>]>} */
+  const sections = [["Rules", file.rules ?? []], ["Boundaries", file.boundaries ?? []]];
+  for (const [expected, list] of sections) {
+    const ordered = [...list].sort((a, b) => a.line - b.line);
+    const inSection = ordered.filter((entry) => headingSection(file, entry.line) === expected);
+    const firstRewrite = inSection.find((entry) => entry.form === "heading");
+    const heading = (file.sections ?? []).find((section) => section.level === 2 && section.title === expected);
+    if (firstRewrite && heading) {
+      for (let line = heading.line + 1; line < firstRewrite.line; line++) {
+        const lineText = lines[line - 1];
+        if (!lineText.trim() || /^#{1,6}[ \t]/.test(lineText) || inSection.some((entry) => line >= entry.line && line <= entry.end)) continue;
+        return { refusal: { code: "prose_in_section", data: { file: rel, line, section: expected } } };
+      }
+    }
+    for (const entry of ordered) {
+      const section = headingSection(file, entry.line);
+      if (section !== expected) {
+        return { refusal: { code: "rule_outside_section", data: { file: rel, line: entry.line, key: entry.key, section } } };
+      }
+      if (entry.form !== "heading") continue;
+      const number = inSection.indexOf(entry) + 1;
+      /** @type {{ name: string, value: string }[]} */
+      let fields = [];
+      if (expected === "Rules") {
+        const ruleFields = /** @type {{ fields?: Array<{ name: string, value: string }> }} */ (entry).fields ?? [];
+        fields = ruleFields.map(({ name, value }) => ({ name, value }));
+      } else {
+        const owner = /** @type {{ owner: string | null }} */ (entry).owner;
+        if (owner !== null) fields = [{ name: "Owner", value: owner }];
+      }
+      replacements.push({
+        line: entry.line,
+        end: entry.end,
+        rendered: ruleItem({ number, key: entry.key, statement: entry.statement, fields, elaboration: entry.elaboration }),
+      });
+    }
+  }
+  if (!replacements.length) return { text };
+  const out = [...lines];
+  for (const replacement of replacements.sort((a, b) => b.line - a.line)) {
+    const body = replacement.rendered.split("\n");
+    // Keep one blank line before whatever follows the entry, as the heading form had.
+    if (replacement.end < out.length) body.push("");
+    out.splice(replacement.line - 1, replacement.end - replacement.line + 1, ...body);
+  }
+  const joined = out.join(file.eol);
+  return { text: finalNewline && !joined.endsWith(file.eol) ? `${joined}${file.eol}` : joined };
+}
+
+// The `##` heading a line sits under; an H1 ends it, as the parser's section membership says.
+/**
+ * @param {ParsedFile} file
+ * @param {number} line
+ * @returns {string | null}
+ */
+function headingSection(file, line) {
+  /** @type {string | null} */
+  let title = null;
+  for (const section of file.sections ?? []) {
+    if (section.line >= line) break;
+    if (section.level <= 2) title = section.level === 2 ? section.title : null;
+  }
+  return title;
 }
 
 // The new text of every file the plan touches, in memory: `{writes: Map(rel after rename → text),
@@ -246,8 +567,11 @@ function apply(files, plan, project) {
     if (done.rename) renames.set(rel, done.rename);
   }
   const schemaFrom = projectConfig(project).schemaVersion;
-  if (schemaFrom < SUITE_KEYS_SCHEMA_VERSION) {
-    const done = edit(project, [{ set: { schema_version: SUITE_KEYS_SCHEMA_VERSION } }]);
+  // Schema 5 is a pure marker after the level-on-case migration; legacy projects still cross
+  // the Key/Suite and level-rewrite boundaries separately, preserving inherited claims.
+  const schemaTo = schemaFrom >= LEVEL_ON_CASE_SCHEMA_VERSION ? Math.max(schemaFrom, LAYER_FREE_CASE_SCHEMA_VERSION) : SUITE_KEYS_SCHEMA_VERSION;
+  if (schemaFrom < schemaTo) {
+    const done = edit(project, [{ set: { schema_version: schemaTo } }]);
     if (!done.ok) return { refusal: { code: "rewrite_failed", data: { file: project.rel, errors: done.errors } } };
     changed.set(project.rel, done.text);
   }
@@ -268,7 +592,7 @@ function apply(files, plan, project) {
     writes, after, config,
     renamed: [...renames].map(([from, to]) => ({ from, to })),
     consumed: /** @type {string[]} */ (consumed.filter(Boolean)),
-    schema: { from: schemaFrom, to: Math.max(schemaFrom, SUITE_KEYS_SCHEMA_VERSION) },
+    schema: { from: schemaFrom, to: schemaTo },
     checkErrors,
   };
 }
@@ -333,7 +657,7 @@ export const command = {
 /**
  * What happened to one Review or Dismissal pin: `carried` was fresh and took a migrated digest,
  * `stale` had already changed and stays so, `unverified` could not be checked and is untouched.
- * @typedef {{ file: string, key: string | null, pin: "review" | "dismissed", status: "carried" | "stale" | "unverified" }} PinOutcome
+ * @typedef {{ file: string, key: string | null, pin: "watermark" | "review" | "dismissed", status: "carried" | "stale" | "unverified" }} PinOutcome
  */
 
 /**
@@ -388,7 +712,7 @@ function migrateLevels(root, levelMap) {
   /** @type {PinOutcome[]} */
   const pins = [];
   for (const file of files) {
-    /** @type {import("./knowledge-file.mjs").EditChange[]} */
+    /** @type {EditChange[]} */
     const changes = [];
     const cases = file.type === "scenario" ? file.cases : [];
     for (const entry of cases) {
