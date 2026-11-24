@@ -6,8 +6,8 @@
 // only through Reliance is Uncovered; a Waived Rule is deliberately left without a case, so it is
 // never Uncovered. (The code's "unlinked" is a case with no Tracker key: a different report.)
 import { listOf } from "./dialect.mjs";
+import { casesCoveringRule } from "./qa-index.mjs";
 import { relianceOf, reverseReliance } from "./reliance.mjs";
-import { casesCoveringRule } from "./rule-coverage.mjs";
 
 /** @import { CaseEntry } from "./knowledge-file.mjs" */
 /** @import { ScanContext } from "./scan.mjs" */

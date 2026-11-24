@@ -15,7 +15,7 @@ import { randomUUID } from "node:crypto";
 import { readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { dropProfile, ensureProfileFlag, profileFlag } from "./browser-profile.mjs";
-import { defaultPlatformRunner, mapSpawnRefusal, spawnNodeCli } from "./platform.mjs";
+import { defaultPlatformRunner, mapSpawnRefusal, platformRefusalFacts, spawnNodeCli } from "./platform.mjs";
 import { ensurePrivateDir, writeSecretFile } from "./platform-privacy.mjs";
 
 /** @import { PrivacyContext } from "./platform-privacy.mjs" */
@@ -37,6 +37,7 @@ import { ensurePrivateDir, writeSecretFile } from "./platform-privacy.mjs";
  *   error: string,
  *   check?: string,
  *   command?: string,
+ *   facts?: Record<string, unknown>,
  *   unreachable?: boolean,
  *   state?: never,
  * }} LogInFailure
@@ -76,6 +77,7 @@ export const LOGIN_STATE_FILE = "login-state.json";
 
 // The default selectors: the first password field, and the nearest input before it that a person types
 // into, so a search box in the page's header is passed over.
+const CALL_TIMEOUT_MS = 60000;
 const PASS_FIELD = "input[type=password] >> nth=0";
 const USER_FIELD = "xpath=(//input[@type='password'])[1]/preceding::input[not(@type='hidden' or @type='checkbox' or @type='radio' or @type='submit' or @type='button')][1]";
 
@@ -92,15 +94,15 @@ export function logIn({ dir, session, url, password, identifiers = {}, platformC
   const platform = context.platform ?? process.platform;
   if (platform === "win32") {
     const dirCheck = ensurePrivateDir(dir, context);
-    if (!dirCheck.ok) return { reason: dirCheck.refusal.code, error: dirCheck.refusal.message, ...(dirCheck.refusal.command && { command: dirCheck.refusal.command }) };
+    if (!dirCheck.ok) return { reason: dirCheck.refusal.code, error: dirCheck.refusal.message, facts: platformRefusalFacts(dirCheck.refusal), ...(dirCheck.refusal.command && { command: dirCheck.refusal.command }) };
     const profileCheck = ensureProfileFlag(dir, name, context);
-    if (!profileCheck.ok) return { reason: profileCheck.refusal.code, error: profileCheck.refusal.message, ...(profileCheck.refusal.command && { command: profileCheck.refusal.command }) };
+    if (!profileCheck.ok) return { reason: profileCheck.refusal.code, error: profileCheck.refusal.message, facts: platformRefusalFacts(profileCheck.refusal), ...(profileCheck.refusal.command && { command: profileCheck.refusal.command }) };
   }
   const pw = (/** @type {string[]} */ ...args) => playwright(dir, name, args, platformContext);
   try {
     const opened = pw("open", loginUrl, profileFlag(dir, name));
     if (opened.missing) return { reason: "no_playwright_cli", error: "`playwright-cli` is not on your PATH, so the CLI cannot log in to the app: install it, then observe again" };
-    if (opened.refused) return { reason: "refused_playwright_cli", error: opened.refusal.message, check: opened.refusal.code };
+    if (opened.refused) return { reason: "refused_playwright_cli", error: opened.refusal.message, check: opened.refusal.code, facts: { check: opened.refusal.code, ...platformRefusalFacts(opened.refusal) } };
     if (opened.error) return { ...failed(`could not open ${loginUrl}: ${opened.error}`), unreachable: true };
     if (pw("fill", userField, /** @type {string} */ (/** @type {LogInIdentifiers} */ (identifiers).user)).error) return failed(`found no user name field on ${loginUrl}: give the note's \`identifiers\` a \`user_field\` selector with \`/qa-train access\``);
     if (pw("fill", passField, password, "--submit").error) return failed(`found no password field on ${loginUrl}: give the note's \`identifiers\` a \`pass_field\` selector with \`/qa-train access\``);
@@ -116,7 +118,7 @@ export function logIn({ dir, session, url, password, identifiers = {}, platformC
         if (saved.error) return failed(`could not save the login state: ${saved.error}`);
         const raw = context.fs?.readFileSync ? context.fs.readFileSync(tmpState, "utf8") : readFileSync(tmpState);
         const written = writeSecretFile(state, raw, context);
-        if (!written.ok) return { reason: written.refusal.code, error: written.refusal.message };
+        if (!written.ok) return { reason: written.refusal.code, error: written.refusal.message, facts: platformRefusalFacts(written.refusal) };
         return { state: written.path };
       } finally {
         try {
@@ -157,7 +159,7 @@ const NO_MATCH = /does not match any elements/;
 function playwright(dir, session, args, platformContext = {}) {
   const env = platformContext.env ?? process.env;
   /** @type {PlatformRunnerOptions} */
-  const spawnOptions = { cwd: dir, env, encoding: "utf8" };
+  const spawnOptions = { cwd: dir, env, encoding: "utf8", timeout: CALL_TIMEOUT_MS };
   const resolved = spawnNodeCli(
     { kind: "playwright-cli", file: "playwright-cli", args: [`-s=${session}`, ...args], options: spawnOptions },
     { ...platformContext, env },
@@ -166,7 +168,7 @@ function playwright(dir, session, args, platformContext = {}) {
   const runner = platformContext.run ?? defaultPlatformRunner;
   const r = runner(resolved.file, resolved.args, resolved.options);
   if ((/** @type {NodeJS.ErrnoException | undefined} */ (r.error))?.code === "ENOENT") return { missing: true };
-  if (r.error) return { error: r.error.message };
+  if (r.error) return { error: /** @type {NodeJS.ErrnoException} */ (r.error).code === "ETIMEDOUT" ? "playwright-cli timed out" : r.error.message };
   const out = `${r.stdout}\n${r.stderr}`;
   const at = out.search(/^### Error/m);
   if (r.status !== 0 || at !== -1) return { error: errorLine(out.slice(at === -1 ? 0 : at)) };

@@ -127,8 +127,8 @@ no type mapping: use the created names directly.
 The labels the engineer picked in section 2, one field per Tier: `tiers.deep`, `tiers.standard` and
 `tiers.light`. Each is
 `{"value": "<label>", "evidence": {"picked": true}}`: a pick is an answer, so the card asks nothing
-more. Each pick is a `picked_tiers` line on the Card with its label and, when one ran, its smoke-test result:
-it has no item number and needs no answer. Leave a skipped Tier out: it then runs on `inherit`. A
+more. Each pick is listed unnumbered under Picked Tiers on the Card with its label and, when one ran,
+its smoke-test result: it has no item number and needs no answer. Leave a skipped Tier out: it then runs on `inherit`. A
 label other than `inherit` goes on only once its smoke test passed, in the run dir passed to
 `init card`.
 

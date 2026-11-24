@@ -14,12 +14,12 @@
 // pushed or retried, and a failed commit puts those paths' index entries back as they were.
 /** @import { CommandDefinition } from "./cli.mjs" */
 /** @import { CommitMode } from "./schema.mjs" */
-import { spawnSync } from "node:child_process";
-import { isAbsolute, resolve, sep } from "node:path";
+import { resolve } from "node:path";
 import { commitLine } from "./changeset.mjs";
-import { UsageError } from "./cli.mjs";
-import { defaultBranch } from "./git.mjs";
+import { parseShellWords, UsageError } from "./cli.mjs";
+import { defaultBranch, gitReason, runGit } from "./git.mjs";
 import { repositoryOf } from "./git-tree.mjs";
+import { isContained, isSafeRelativePath } from "./paths.mjs";
 import { rootConfig } from "./qa-index.mjs";
 
 /**
@@ -74,7 +74,7 @@ export function commit({ mode, repo, line: given, confirmed = false }) {
  * @returns {{ paths: string[], message: string } | null}
  */
 export function parseCommitLine(line) {
-  const words = shellWords(line);
+  const words = parseShellWords(line, { allowDoubleQuotes: true, allowNewlines: true, allowAndOperator: true });
   if (!words) return null;
   const and = words.indexOf("&&");
   if (and < 0) return null;
@@ -86,44 +86,6 @@ export function parseCommitLine(line) {
   return commitLine(paths, message) === line ? { paths, message } : null;
 }
 
-// The POSIX shell words of `line` in the forms `commitLine` writes: bare characters, a
-// double-quoted run with no character special inside double quotes, single-quoted runs, and `\'`
-// between them. Null for any other quoting.
-/**
- * @param {string} line
- * @returns {string[] | null}
- */
-function shellWords(line) {
-  /** @type {string[]} */
-  const words = [];
-  let word = null;
-  for (let i = 0; i < line.length; i++) {
-    const c = line[i];
-    if (c === " ") {
-      if (word !== null) words.push(word);
-      word = null;
-      continue;
-    }
-    word ??= "";
-    if (c === "'" || c === '"') {
-      const end = line.indexOf(c, i + 1);
-      if (end < 0) return null;
-      const inside = line.slice(i + 1, end);
-      if (c === '"' && /["$`\\!]/.test(inside)) return null;
-      word += inside;
-      i = end;
-    } else if (c === "\\") {
-      if (line[i + 1] !== "'") return null;
-      word += "'";
-      i++;
-    } else {
-      word += c;
-    }
-  }
-  if (word !== null) words.push(word);
-  return words;
-}
-
 // Whether `path` is relative to `repo` and stays inside it: not absolute, no `..` segment, and no
 // path that resolves outside. A NUL byte is no path at all.
 /**
@@ -132,13 +94,41 @@ function shellWords(line) {
  * @returns {boolean}
  */
 function safePath(repo, path) {
-  if (path === "" || path.includes("\0") || isAbsolute(path) || path.split(/[\\/]/).includes("..")) return false;
-  const abs = resolve(repo, path);
-  return abs !== repo && abs.startsWith(`${repo}${sep}`);
+  if (!isSafeRelativePath(path)) return false;
+  const top = resolve(repo);
+  const abs = resolve(top, path);
+  return abs !== top && isContained(top, abs);
 }
 
 // The path-scoped commit: `git add` the paths, then `git commit --only` them. A failure is reported
 // as git words it and never retried; the paths' index entries go back to what they were before.
+/**
+ * Stage and commit only `paths` in `repo` (`git commit --only`), restoring those paths' prior
+ * index entries if staging or committing fails.
+ * @param {string} repo
+ * @param {readonly string[]} paths
+ * @param {string} message
+ * @returns {{ ok: true, sha: string } | { ok: false, stage: "ls-files" | "add" | "commit" | "rev-parse", reason: string }}
+ */
+export function commitPaths(repo, paths, message) {
+  if (paths.length === 0) return { ok: false, stage: "add", reason: "no paths specified" };
+  const before = runGit(repo, ["--literal-pathspecs", "ls-files", "--stage", "-z", "--", ...paths]);
+  if (before.error || before.status !== 0) return { ok: false, stage: "ls-files", reason: gitReason(before, "ls-files") };
+  const added = runGit(repo, ["--literal-pathspecs", "add", "--", ...paths]);
+  if (added.error || added.status !== 0) {
+    return { ok: false, stage: "add", reason: restoreStagedIndex(repo, paths, before.stdout, gitReason(added, "add")) };
+  }
+  const made = runGit(repo, ["--literal-pathspecs", "commit", "-m", message, "--only", "--", ...paths]);
+  if (made.error || made.status !== 0) {
+    return { ok: false, stage: "commit", reason: restoreStagedIndex(repo, paths, before.stdout, gitReason(made, "commit")) };
+  }
+  const head = runGit(repo, ["rev-parse", "HEAD"]);
+  if (head.error || head.status !== 0) return { ok: false, stage: "rev-parse", reason: gitReason(head, "rev-parse") };
+  const sha = head.stdout.trim();
+  if (!sha) return { ok: false, stage: "rev-parse", reason: "git committed but HEAD cannot be read" };
+  return { ok: true, sha };
+}
+
 /**
  * @param {string} repo
  * @param {CommitMode} mode
@@ -148,19 +138,9 @@ function safePath(repo, path) {
  * @returns {CommitResult}
  */
 function make(repo, mode, paths, message, line) {
-  /** @param {string} reason */
-  const failed = (reason) => outcome(mode, "failed", reason, line);
-  const git = (/** @type {string[]} */ ...args) => spawnSync("git", ["-C", repo, ...args], { encoding: "utf8" });
-  const before = git("ls-files", "--stage", "-z", "--", ...paths);
-  if (before.error || before.status !== 0) return failed(reasonOf(before));
-  const added = git("add", "--", ...paths);
-  if (added.error || added.status !== 0) return failed(restored(repo, paths, before.stdout, reasonOf(added)));
-  const made = git("commit", "-m", message, "--only", "--", ...paths);
-  if (made.error || made.status !== 0) return failed(restored(repo, paths, before.stdout, reasonOf(made)));
-  const head = git("rev-parse", "HEAD");
-  const sha = head.status === 0 ? head.stdout.trim() : "";
-  if (!sha) return failed(reasonOf(head) || "git committed but HEAD cannot be read");
-  return { ok: true, mode, status: "committed", sha, commit: line };
+  const res = commitPaths(repo, paths, message);
+  if (!res.ok) return outcome(mode, "failed", res.reason, line);
+  return { ok: true, mode, status: "committed", sha: res.sha, commit: line };
 }
 
 // Puts the index entries of `paths` back to `stage` (`git ls-files --stage -z` from before the
@@ -173,13 +153,13 @@ function make(repo, mode, paths, message, line) {
  * @param {string} reason
  * @returns {string}
  */
-function restored(repo, paths, stage, reason) {
+function restoreStagedIndex(repo, paths, stage, reason) {
   const entries = stage.split("\0").filter(Boolean);
   const had = new Set(entries.map((e) => e.slice(e.indexOf("\t") + 1)));
   const gone = paths.filter((p) => !had.has(p));
   const steps = [
-    ...(gone.length ? [spawnSync("git", ["-C", repo, "rm", "-q", "--cached", "--ignore-unmatch", "--", ...gone], { encoding: "utf8" })] : []),
-    ...(entries.length ? [spawnSync("git", ["-C", repo, "update-index", "-z", "--index-info"], { input: entries.map((e) => `${e}\0`).join(""), encoding: "utf8" })] : []),
+    ...(gone.length ? [runGit(repo, ["--literal-pathspecs", "rm", "-q", "--cached", "--ignore-unmatch", "--", ...gone])] : []),
+    ...(entries.length ? [runGit(repo, ["--literal-pathspecs", "update-index", "-z", "--index-info"], { input: entries.map((e) => `${e}\0`).join("") })] : []),
   ];
   return steps.every((s) => !s.error && s.status === 0) ? reason : `${reason}\n(the index of these paths could not be put back as it was)`;
 }
@@ -194,19 +174,12 @@ function restored(repo, paths, stage, reason) {
  */
 const outcome = (mode, status, reason, commit) => ({ ok: status === "ask", mode, status, reason, commit });
 
-// What git said, trimmed: its stderr, else the spawn's error, else its stdout.
-/**
- * @param {import("node:child_process").SpawnSyncReturns<string>} r
- * @returns {string}
- */
-const reasonOf = (r) => r.stderr?.trim() || r.error?.message || r.stdout?.trim() || `git exited with status ${r.status}`;
-
 // The command line's `commit` (scripts/scan.mjs): the project's Commit mode, then the one `commit`
 // line from `--input <file>` or stdin.
 /** @type {CommandDefinition} */
 export const command = {
   options: { stdin: "flag", confirmed: "flag", root: "qa-dir" },
-  usage: "--stdin [--confirmed] [--root <qa-dir>]",
+  usage: "--input <path> [--confirmed] [--root <qa-dir>]",
   run(args, ctx) {
     if (args.length) throw new UsageError("commit takes no argument: write the command's `commit` line to a file and pass it with --input <file>");
     if (!ctx.stdin) throw new UsageError("commit reads the command's `commit` line from --input <file> or --stdin");

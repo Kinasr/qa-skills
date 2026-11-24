@@ -72,18 +72,36 @@ export function inline(v, { strings = [], item = token } = {}) {
 
 // `field: value` as one line, or an error message when it would not read back as `value`.
 /**
+ * Format an unrenderable value error safely without throwing on circular structures or BigInt.
+ * @param {string} field
+ * @param {unknown} value
+ * @returns {{ error: string }}
+ */
+function renderError(field, value) {
+  let rendered;
+  try {
+    rendered = JSON.stringify(value) ?? String(value);
+  } catch {
+    rendered = String(value);
+  }
+  return { error: `\`${field}\` cannot be written in the YAML dialect: ${rendered}` };
+}
+
+/**
  * @param {string} field
  * @param {unknown} value
  * @param {RenderOptions} [options]
  * @returns {RenderLineResult}
  */
 export function line(field, value, options) {
-  const text = `${field}: ${inline(value, options)}`;
-  const back = parseYaml(text);
-  if (back.errors.length || !isDeepStrictEqual(back.data[field], value)) {
-    return { error: `\`${field}\` cannot be written in the YAML dialect: ${JSON.stringify(value)}` };
+  try {
+    const text = `${field}: ${inline(value, options)}`;
+    const back = parseYaml(text);
+    if (back.errors.length || !isDeepStrictEqual(back.data[field], value)) return renderError(field, value);
+    return { text };
+  } catch {
+    return renderError(field, value);
   }
-  return { text };
 }
 
 // `field` and a list of maps as a block list, one map per line, or an error message when it would
@@ -95,12 +113,11 @@ export function line(field, value, options) {
  * @returns {RenderLineResult}
  */
 export function block(field, value, options) {
-  const error = { error: `\`${field}\` cannot be written in the YAML dialect: ${JSON.stringify(value)}` };
   try {
     const text = [`${field}:`, ...value.map((x) => `  - ${inline(x, options)}`)].join("\n");
     const back = parseYaml(text);
-    return back.errors.length || !isDeepStrictEqual(back.data[field], value) ? error : { text };
+    return back.errors.length || !isDeepStrictEqual(back.data[field], value) ? renderError(field, value) : { text };
   } catch {
-    return error;
+    return renderError(field, value);
   }
 }

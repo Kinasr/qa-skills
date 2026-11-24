@@ -9,7 +9,6 @@
  * @import { TrackerCaseItem, TrackerNote, TrackerPayload, TrackerScenarioItem, TrackerState, TrackerSuiteItem, SyncTrackerContext } from "./sync-tracker.mjs"
  */
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
 import { join, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { accessNoteNamed } from "./access.mjs";
@@ -17,20 +16,20 @@ import { cardRun } from "./card-run.mjs";
 import { UsageError } from "./cli.mjs";
 import { changedPaths } from "./changeset.mjs";
 import { checkFile } from "./check-file.mjs";
+import { commitPaths } from "./commit.mjs";
 import { hasBugPublishTracker } from "./knowledge-file.mjs";
 import { loadBugs } from "./bug.mjs";
 import { bugAttachmentsFor, bugCandidates, bugFieldsFor, bugMissing, bugNeedsConfirm, bugResultMatches, publishedBugs, publishDecisions } from "./publish-bugs.mjs";
-import { uncommittedPaths } from "./git.mjs";
+import { runGit, uncommittedPaths } from "./git.mjs";
 import { PATTERN, readTrackerReference, trackerReference } from "./keys.mjs";
 import { glossaryOf, keyLabel, summaries } from "./labels.mjs";
 import { table } from "./markdown.mjs";
 import { featureFile } from "./qa-index.mjs";
-import { refusalsFor, object } from "./refusal.mjs";
-import { newRunDir, openRunDir, readRunFile } from "./run-dir.mjs";
+import { refusalsWithoutLines, object } from "./refusal.mjs";
+import { newRunDir, openRunDir, readRunFile, writeJsonAtomic } from "./run-dir.mjs";
 import { refuseUnreadSchema } from "./schema-guard.mjs";
 import { ANY_SCHEMA_VERSION, oneLine, PUBLISH_TRAIN_KEY } from "./schema.mjs";
 import { loadSyncContext, sourceSeal } from "./sync.mjs";
-import { REFUSALS as SYNC_REFUSALS } from "./sync-json.mjs";
 import { cascade } from "./sync-plan.mjs";
 import { readTracker, trackerAccess, trackerScope } from "./sync-tracker.mjs";
 import { suiteCandidates } from "./publish-suite.mjs";
@@ -42,6 +41,8 @@ import { labelDefinitions, caseLabelProblems } from "./case-labels.mjs";
 import { publishedLabels, configuredLabelDestinations, canPublishLabels, hasPublishTags, declaresTags, labelsDiffer, resolveLabelDestinations, confirmedLabelsMatch, sameLabelValue, confirmedLabelCopies, publishDestinationProblems, recoveredLabelCopies, levelDestinationIsMultiple } from "./publish-labels.mjs";
 /** @import { LabelOperation, ConfirmedLabel, LabelDestinationRequest, PublishedLabel, LabelCopies } from "./publish-labels.mjs" */
 import { parkedCandidates, parkedMatches, parkedStories, parkedWrites } from "./publish-parked.mjs";
+import { buildPublishCardJson, buildPublishConfirmJson, buildPublishRecordJson, publishCardItems } from "./publish-json.mjs";
+/** @import { PublishCardJson, PublishConfirmInput, PublishRecordInput } from "./publish-json.mjs" */
 /** @import { RunFileResult } from "./run-dir.mjs" */
 
 /**
@@ -214,7 +215,6 @@ import { parkedCandidates, parkedMatches, parkedStories, parkedWrites } from "./
  *     record: { usage: string, run: (args: string[], options: PublishActionContext) => CommandResult },
  *     [key: string]: { usage?: string | readonly string[], run: (args: string[], options: PublishActionContext) => CommandResult },
  *   },
- *   refuse: (e: UsageError) => CommandResult,
  * }} PublishCommand
  */
 
@@ -302,9 +302,7 @@ import { parkedCandidates, parkedMatches, parkedStories, parkedWrites } from "./
  *   counts: { changes: number, questions: number },
  *   items: PublishCardItem[],
  *   skipped: PublishSkippedItem[],
- *   fields: Record<string, string>,
  *   glossary: Array<{ term: string, explanation: string }>,
- *   labels: Record<string, string>,
  * }} PublishCardData
  */
 
@@ -328,36 +326,9 @@ const PUBLISH_FIELDS = ["suite_type", "scenario_type", "case_type", "link_type",
 const FIELD_LABELS = { summary: "summary", preconditions: "preconditions", steps: "steps", expected: "Expected-result paragraph", roles: "Roles", level: "level", scenario: "Test Scenario", status: "initial status", issue_type: "issue type", marker: "publish marker", links: "story links", confirm: "overwrite tracker changes" };
 const EMPTY = { writes: [], deletes: [] };
 const MESSAGE = "qa: /qa-publish tracker links and Mirrors";
-const { fact, refuse, refusalOf } = refusalsFor({
-  ...SYNC_REFUSALS,
-  unknown_action: "The requested publish action is unavailable.",
-  execute_run_mismatch: "The publish Run is scoped to a different execute Run.",
-  bug_card_incomplete: "The bug Card needs complete create metadata, fields and a current case link before publishing.",
-  bug_type_unknown: "The configured bug type is not on the tracker's create screen.",
-  bug_link_type_unknown: "The configured bug link type is not one the tracker offers.",
-  bug_field_unknown: "A `bug_fields` default names no field on the bug create screen.",
-  bug_field_ambiguous: "A `bug_fields` default names more than one field on the bug create screen.",
-  bug_field_invalid: "A `bug_fields` default or a Card answer does not fit its field's schema or allowed values.",
-  answer_conflict: "An item is answered in more than one of `take`, `drop` and `discard`.",
-  ambiguous_case_drafts: "Two in-scope Bug drafts share a case; take or discard them by number.",
-  draft_in_tracker: "A draft already exists in the tracker; it cannot be discarded without a new Card.",
-  no_follow_ups: "The Run has no follow-ups.json; run execute follow-ups first.",
-  state_unreadable: "The Run follow-ups are unreadable.",
-  run_with_feature: "A Run scope cannot name a Feature.",
-  bug_publishing_not_configured: "Bug publishing is not configured; use /qa-init.",
-  no_tracker: "No tracker is configured, so there is nothing to publish to.",
-  publishing_not_configured: "Publishing isn't configured; set the publish fields with /qa-init.",
-  publish_config_missing: "Publish needs the named tracker fields in .qa/project.md; set them with /qa-init.",
-  dirty_publish_paths: "The paths Publish would rewrite have uncommitted changes.",
-  tracker_not_ready: "The tracker fetch is unavailable or invalid.",
-  publish_labels_invalid: "Publish label configuration has Integrity errors; fix them with /qa-init.",
-  repairs_invalid: "The Feature's pending tracker repairs are malformed.",
-  no_reply: "No accepted Reply is recorded in the run directory.",
-  no_publisher_brief: "No Publisher brief is recorded in the run directory.",
-  publisher_output_invalid: "The Publisher output does not match the accepted writes.",
-  git_failed: "Git could not commit the Publish; the named paths remain uncommitted.",
-  git_status_failed: "Git could not check the Publish paths for uncommitted changes.",
-});
+// Publish words its own refusals until the rollout: the entries it can emit, owned here rather than
+// borrowed from `/qa-sync`'s table.
+const { fact, refuse, refusalOf } = refusalsWithoutLines();
 
 /**
  * @param {string} dir
@@ -395,19 +366,19 @@ export function missingPublishFields(project) {
  */
 function withRun(action, args, { root, dir, seed, stdin, run: executeRun }, act) {
   if (executeRun && args.length) return refuse("run_with_feature");
-  if (["apply", "record", "publisher"].includes(action) && args.length) return refuse("apply_takes_no_feature");
+  if (["apply", "record", "publisher"].includes(action) && args.length) return refuse("apply_takes_no_feature", { feature_from: "run_dir" });
   if (args.length > 1) return refuse("too_many_features", { action });
   if (args[0] !== undefined && !PATTERN.slug.test(args[0])) return refuse("not_feature_key", { given: args[0] });
   const newer = refuseUnreadSchema(root, ANY_SCHEMA_VERSION);
   if (newer) return newer;
-  if (action === "apply" && !stdin) return refuse("apply_needs_stdin");
+  if (action === "apply" && !stdin) return refuse("apply_needs_stdin", { input: "--input <path> | --stdin" });
   const run = /** @type {PublishRunDir} */ (action === "scope" ? newRunDir(dir, "qa-publish-") : openRunDir(dir, { cmd: "publish", action, from: RUN.restart }));
   if (run.error) return refuse("run_dir", { reason: run.error });
   /** @type {RunFileResult<PublishRunRecord>} */
   const saved = run.exists === false ? { value: null } : readRunFile(/** @type {string} */ (run.dir), "run.json", RUN);
   if (saved.error) return refuse("run_dir", { reason: saved.error });
-  if (!saved.value && action !== "scope") return refuse("run_dir", { reason: `No publish run in ${run.dir}: run publish scope first.` });
-  if (saved.value && saved.value.command !== "publish") return refuse("run_dir", { reason: "The run belongs to another command." });
+  if (!saved.value && action !== "scope") return refuse("run_dir", { dir: run.dir, next: "publish scope" });
+  if (saved.value && saved.value.command !== "publish") return refuse("run_dir", { dir: run.dir, ...(saved.value.command ? { owner: saved.value.command } : {}), expected: "publish" });
   if (saved.value?.execute_run && args.length) return refuse("run_with_feature");
   if (saved.value && args[0] !== undefined && saved.value.feature !== args[0]) return refuse("run_scoped_elsewhere", { scoped: saved.value.feature, named: args[0] });
   if (saved.value && executeRun && saved.value.execute_run !== resolve(executeRun)) return refuse("execute_run_mismatch");
@@ -416,12 +387,12 @@ function withRun(action, args, { root, dir, seed, stdin, run: executeRun }, act)
   let followUps;
   if (executeRun) {
     const path = join(executeRun, "follow-ups.json");
-    if (!existsSync(path)) return refuse("no_follow_ups");
+    if (!existsSync(path)) return refuse("no_follow_ups", { next: "execute follow-ups" });
     try {
       const state = /** @type {import("./follow-ups.mjs").FollowUps} */ (JSON.parse(readFileSync(path, "utf8")));
-      if (typeof state?.run !== "string" || !Array.isArray(state.items)) return refuse("state_unreadable");
+      if (typeof state?.run !== "string" || !Array.isArray(state.items)) return refuse("state_unreadable", { next: "a new Run" });
       followUps = state;
-    } catch { return refuse("state_unreadable"); }
+    } catch { return refuse("state_unreadable", { next: "a new Run" }); }
   }
   const feature = args[0] ?? saved.value?.feature ?? undefined;
   const payload = run.dir && existsSync(join(run.dir, "tracker.json")) ? readFileSync(join(run.dir, "tracker.json"), "utf8") : null;
@@ -448,7 +419,7 @@ function withRun(action, args, { root, dir, seed, stdin, run: executeRun }, act)
   if (ctx.tracker.ok) {
     const fetched = /** @type {TrackerPayload} */ (JSON.parse(/** @type {string} */ (payload)));
     if (![fetched.marked_cases, fetched.marked_scenarios, fetched.marked_suites].every(Array.isArray)) {
-      ctx.tracker = { ok: false, note: { code: "tracker_payload_invalid", message: "Publish needs marked_cases, marked_scenarios and marked_suites from the completed mark search." } };
+      ctx.tracker = { ok: false, note: { code: "tracker_payload_invalid", missing: ["marked_cases", "marked_scenarios", "marked_suites"] } };
     }
   }
   if (feature && !ctx.index.features.has(feature)) return refuse("no_feature", { slug: feature, root });
@@ -456,10 +427,10 @@ function withRun(action, args, { root, dir, seed, stdin, run: executeRun }, act)
   if (!object(ctx.index.project?.data.tracker)) return refuse("no_tracker");
   const missing = missingPublishFields(ctx.index.project);
   if (missing.length) {
-    if (missing.length === PUBLISH_FIELDS.length) return refuse("publishing_not_configured");
-    return refuse("publish_config_missing", { fields: missing.map((field) => `tracker.${field}`) });
+    if (missing.length === PUBLISH_FIELDS.length) return refuse("publishing_not_configured", { next: "/qa-init" });
+    return refuse("publish_config_missing", { fields: missing.map((field) => `tracker.${field}`), next: "/qa-init" });
   }
-  if (executeRun && !hasBugPublishTracker(ctx.index.project)) return refuse("bug_publishing_not_configured");
+  if (executeRun && !hasBugPublishTracker(ctx.index.project)) return refuse("bug_publishing_not_configured", { next: "/qa-init" });
   ctx.mapping = tracker;
   ctx.access = trackerAccess(ctx);
   // A Run scope carries only Bug drafts: case label configuration and pending repairs are not in
@@ -468,7 +439,7 @@ function withRun(action, args, { root, dir, seed, stdin, run: executeRun }, act)
     const destinationProblems = publishDestinationProblems(ctx.index.project?.data ?? {});
     const labelProblems = checkFile(ctx.index.project, ctx.config).errors.filter((e) =>
       ["tags", "retired_tags", "custom_fields", "tracker.tag_field"].some((prefix) => e.field === prefix || e.field?.startsWith(`${prefix}.`)) || destinationProblems.some((p) => p.field === e.field));
-    if (labelProblems.length) return refuse("publish_labels_invalid", { errors: labelProblems });
+    if (labelProblems.length) return refuse("publish_labels_invalid", { errors: labelProblems, next: "/qa-init" });
     for (const [key, declarations] of ctx.index.features) {
       if (ctx.feature && key !== ctx.feature) continue;
       for (const { file } of /** @type {Array<{ file: { rel: string, data: Record<string, unknown>, keyLines: Record<string, unknown> } }>} */ (declarations)) {
@@ -483,7 +454,7 @@ function withRun(action, args, { root, dir, seed, stdin, run: executeRun }, act)
     if (dirty.length) return refuse("dirty_publish_paths", { paths: dirty });
   }
   ctx.dir = run.make ? run.make() : /** @type {string} */ (run.dir);
-  if (!saved.value) writeFileSync(join(ctx.dir, "run.json"), `${JSON.stringify(/** @type {PublishRunRecord} */ ({ command: "publish", feature: feature ?? null, ...(executeRun && { execute_run: executeRun }) }))}\n`);
+  if (!saved.value) writeJsonAtomic(join(ctx.dir, "run.json"), /** @type {PublishRunRecord} */ ({ command: "publish", feature: feature ?? null, ...(executeRun && { execute_run: executeRun }) }));
   return act(ctx, action === "apply" ? (/** @type {() => string} */ (stdin))() : undefined);
 }
 
@@ -513,10 +484,17 @@ export const command = {
       return /** @type {PublishScopeResult} */ ({ exit: 0, json: { dir: ctx.dir, payload_file: join(ctx.dir, "tracker.json"), tracker, fields, label_destinations: canPublishLabels(ctx.config.schemaVersion) ? configuredLabelDestinations(labelDefinitions(ctx.index.project?.data ?? {}), ctx.mapping) : [], level_destinations: [{ name: "level", cardinality: "multiple" }], mark_field, mark_search: markSearch(ctx), scenarios, suites, cases: [...new Set([...cases, ...bugCases])].sort(), ...(scopedBugs.length && ctx.config.bug_publish && { bug_metadata: { issue_type: ctx.config.bug_publish.issue_type, project: ctx.mapping.project }, bug_statuses: [...new Set(bugStatuses)].sort() }), stories: ctx.execute_run ? [] : parkedStories(/** @type {import("./publish-parked.mjs").PublishContext} */ (/** @type {unknown} */ (ctx))), fetch_prose, access: trackerAccess(ctx), train: trainFor(ctx.index, PUBLISH_TRAIN_KEY) } });
     }) },
     card: { usage: "[<feature>] --dir <run-dir> [--root <qa-dir>]", run: (args, options) => withRun("card", args, options, (ctx) => finish((/** @type {(ctx: PublishContext, dir: string) => import("./card-run.mjs").CardShown<PublishCardData> | import("./card-run.mjs").CardRefused} */ (lifecycle.card))(ctx, ctx.dir))) },
-    apply: { usage: "--dir <run-dir> --stdin [--root <qa-dir>]", run: (args, options) => withRun("apply", args, options, (ctx, text) => finish(lifecycle.apply(ctx, ctx.dir, /** @type {string} */ (text)))) },
-    record: { usage: "--dir <run-dir> [--root <qa-dir>]", run: (args, options) => withRun("record", args, options, (ctx) => accepted(ctx, "record")) },
+    apply: { usage: "--dir <run-dir> --input <path> [--root <qa-dir>]", run: (args, options) => withRun("apply", args, options, (ctx, text) => {
+      const result = lifecycle.apply(ctx, ctx.dir, /** @type {string} */ (text));
+      if ("confirm" in result && result.confirm === true) return { exit: result.exit, json: buildPublishConfirmJson(/** @type {PublishConfirmInput} */ (/** @type {unknown} */ (result))) };
+      return finish(result);
+    }) },
+    record: { usage: "--dir <run-dir> [--root <qa-dir>]", run: (args, options) => withRun("record", args, options, (ctx) => {
+      const result = accepted(ctx, "record");
+      if (!result.json.ok) return result;
+      return { exit: result.exit, json: buildPublishRecordJson(/** @type {PublishRecordInput} */ (/** @type {unknown} */ (result.json))) };
+    }) },
   },
-  refuse: (e) => refuse(/** @type {string} */ (e.detail.code), e.detail),
 };
 
 /**
@@ -800,13 +778,6 @@ function candidates(ctx) {
 }
 
 /**
- * @param {PublishContext} ctx
- * @param {string[]} args
- * @returns {import("node:child_process").SpawnSyncReturns<string>}
- */
-const gitFor = (ctx, args) => spawnSync("git", ["--literal-pathspecs", ...args], { cwd: ctx.repo, encoding: "utf8" });
-
-/**
  * The publish paths that are dirty: an item's file changed in any way, or a bug file whose staged and
  * unstaged content differ (a split index). The dirty-tree check itself is `git.mjs`'s
  * `uncommittedPaths`; only the bug-file split-index rule is publish's own.
@@ -832,8 +803,8 @@ function splitIndexBugPaths(ctx) {
   const paths = [];
   for (const bug of (ctx.allBugs ?? ctx.bugs)) {
     const path = ctx.repoPath(bug.rel);
-    const status = gitFor(ctx, ["status", "--porcelain=v1", "-z", "--", path]);
-    if (status.status !== 0) throw new UsageError("Publish paths could not be checked", { code: "git_status_failed" });
+    const status = runGit(ctx.repo, ["--literal-pathspecs", "status", "--porcelain=v1", "-z", "--", path]);
+    if (status.error || status.status !== 0) throw new UsageError("Publish paths could not be checked", { code: "git_status_failed" });
     if (status.stdout.split("\0").some((line) => line.length > 2 && line[0] !== " " && line[0] !== "?" && line[1] !== " ")) paths.push(path);
   }
   return paths;
@@ -858,7 +829,8 @@ function build(ctx) {
   if (!ctx.tracker.ok) {
     const note = /** @type {TrackerNote | null | undefined} */ (ctx.tracker.note);
     const access = note?.access_note ? accessNoteNamed(ctx.index, /** @type {string} */ (note.access_note)) : null;
-    return { refused: [fact("tracker_not_ready", { note: access ? { ...note, access } : note })] };
+    const { message: _message, ...noteFacts } = note ?? {};
+    return { refused: [fact("tracker_not_ready", { note: access ? { ...noteFacts, access } : noteFacts })] };
   }
   const scoped = ctx.execute_run ? { items: /** @type {PublishCardItem[]} */ ([]), skipped: /** @type {PublishSkippedItem[]} */ ([]) } : candidates(ctx);
   const bugs = bugCandidates(ctx, { cases: scoped.items, skipped: scoped.skipped });
@@ -872,12 +844,12 @@ function build(ctx) {
   /** @type {PublishCardItem[]} */
   const items = [...cases, ...parked.items];
   const skipped = [...scoped.skipped, ...bugs.skipped, ...parked.skipped];
-  const card = { notices: labelNotices(ctx), counts: { changes: items.length, questions: items.filter((i) => i.diverges?.length).length }, items, skipped, fields: { ...FIELD_LABELS, ...Object.fromEntries(items.flatMap((i) => (i.labels ?? []).map((p) => [p.id, p.name]))) }, glossary: glossaryOf(new Set(["Publish", "Review", ...(items.some((i) => i.diverges?.length) ? ["Divergence", "Mirrored value"] : [])])), labels: Object.fromEntries([...items, ...skipped].map((i) => [i.key, i.label])) };
+  const card = { notices: labelNotices(ctx), counts: { changes: items.length, questions: items.filter((i) => i.diverges?.length).length }, items, skipped, glossary: glossaryOf(new Set(["Publish", "Review", ...(items.some((i) => i.diverges?.length) ? ["Divergence", "Mirrored value"] : [])])) };
   return { card, seal: { card, payload: ctx.payload, files: ctx.files.map((f) => [f.rel, f.text]), bugs: [...ctx.bugs, ...(ctx.olderBugs ?? [])].map((b) => [b.rel, b.file.text]), execute_run: ctx.execute_run, followUps: ctx.followUps, source: sourceSeal(/** @type {SyncContext} */ (/** @type {unknown} */ (ctx))) } };
 }
 
-const lifecycle = cardRun(/** @type {CardAdapter<PublishContext, unknown, PublishCardData, PublishCardData>} */ ({
-  kind: "publish", keepData: true, run: RUN, fact, build, data: (_ctx, card) => card,
+const lifecycle = cardRun(/** @type {CardAdapter<PublishContext, unknown, PublishCardData, PublishCardJson | Record<string, unknown>>} */ ({
+  kind: "publish", keepData: true, run: RUN, fact, build, data: (_ctx, card) => buildPublishCardJson(/** @type {import("./publish-json.mjs").PublishCardInternal} */ (card)),
   decisions: (_ctx, card, input) => {
     const decisions = publishDecisions(input, card.items);
     return { ...decisions, errors: decisions.errors.map(refusalOf) };
@@ -926,7 +898,7 @@ const lifecycle = cardRun(/** @type {CardAdapter<PublishContext, unknown, Publis
     }
     if (ctx.phase === "record") return record(ctx, items, discarded, reply);
     const { confirm: _confirm, confirmed: _confirmed, ...decisions } = reply.input;
-    writeFileSync(join(ctx.dir, "publish.json"), `${JSON.stringify(/** @type {PublishFileRecord} */ ({ decisions, confirmed: [...effectiveConfirmed] }), null, 2)}\n`);
+    writeJsonAtomic(join(ctx.dir, "publish.json"), /** @type {PublishFileRecord} */ ({ decisions, confirmed: [...effectiveConfirmed] }));
     return { changeset: EMPTY, data: { dir: ctx.dir, applied: items.map((i) => i.n), dropped: reply.drop, ...(discarded.length && { discarded: discarded.map((i) => i.n) }) }, report: () => null };
   },
 }));
@@ -955,8 +927,8 @@ export function publisherBrief(args, options) {
   return withRun("publisher", args, options, (ctx) => {
     const checked = accepted(ctx, "brief");
     if (!checked.json.ok) return checked;
-    const card = (/** @type {CardRecord<unknown, PublishCardData> & { card: PublishCardData }} */ (JSON.parse(readFileSync(join(ctx.dir, "card.json"), "utf8")))).card;
-    const items = card.items.filter((i) => (/** @type {number[]} */ (checked.json.applied)).includes(/** @type {number} */ (i.n)));
+    const card = (/** @type {CardRecord<unknown, PublishCardJson> & { card: PublishCardJson }} */ (JSON.parse(readFileSync(join(ctx.dir, "card.json"), "utf8")))).card;
+    const items = publishCardItems(card).filter((i) => (/** @type {number[]} */ (checked.json.applied)).includes(/** @type {number} */ (i.n)));
     /** @type {PublishFileRecord} */
     const saved = JSON.parse(readFileSync(join(ctx.dir, "publish.json"), "utf8"));
     const writes = writesFor(ctx, items, /** @type {PublishApplyDecisions} */ (saved.decisions));
@@ -965,7 +937,7 @@ export function publisherBrief(args, options) {
     const access = trackerAccess(ctx);
     const practices = practicesText(ctx.index, PUBLISH_TRAIN_KEY);
     const record = /** @type {ScoutPublisherRecord} */ ({ writes, output_file, at: ctx.tracker.at });
-    writeFileSync(join(ctx.dir, "scout-publisher.json"), `${JSON.stringify(record, null, 2)}\n`);
+    writeJsonAtomic(join(ctx.dir, "scout-publisher.json"), record);
     writeFileSync(brief_file, publisherPrompt({ writes, output: output_file, tracker: { provider: ctx.mapping.provider, project: ctx.mapping.project }, access, practices }));
     return { exit: 0, json: { ok: true, dir: ctx.dir, brief_file, output_file, access: access?.key ?? null, writes: writes.length, ...(writes.length ? {} : { no_publisher: true }) } };
   });
@@ -1015,7 +987,7 @@ function record(ctx, items, discarded, decisions) {
   if (writes.length && !isDeepStrictEqual(brief.value, { writes, output_file: join(ctx.dir, "publisher-results.json"), at: ctx.tracker.at })) return { refused: [fact("publisher_output_invalid")] };
   /** @type {RunFileResult<PublisherResultsRecord>} */
   const output = writes.length || existsSync(join(ctx.dir, "publisher-results.json")) ? readRunFile(ctx.dir, "publisher-results.json", RUN) : { value: { results: [] } };
-  if (output.error || !object(output.value) || !Array.isArray(output.value.results)) return { refused: [fact("publisher_output_invalid", { reason: output.error ?? "results must be a list" })] };
+  if (output.error || !object(output.value) || !Array.isArray(output.value.results)) return { refused: [fact("publisher_output_invalid", output.error ? { file: "publisher-results.json" } : { field: "results", expected: "list" })] };
   const results = /** @type {PublisherResultsRecord} */ (output.value).results;
   const former = new Set(ctx.files.flatMap((f) => [f.data.mirror?.suite, f.data.formerly, ...f.cases.map((c) => c.data.formerly)].flatMap((keys) => Array.isArray(keys) ? keys : [keys])));
   const held = (/** @type {string} */ key) => former.has(key) || ctx.index.tracker.resolve(key).status !== "absent";
@@ -1058,7 +1030,7 @@ function record(ctx, items, discarded, decisions) {
   const successes = [];
   /** @type {Array<{ n: number, key: string, label: string, error: string, rebuild?: boolean, requires?: number[], access?: unknown }>} */
   const failed = [];
-  /** @type {Array<{n: number, key: string, error: string, remedy: string}>} */
+  /** @type {Array<{n: number, key: string, label: string, error: string, remedy: string}>} */
   const manual = [];
   for (const item of items) {
     if (noPublisherWrite(item)) { successes.push(item); continue; }
@@ -1075,7 +1047,7 @@ function record(ctx, items, discarded, decisions) {
           ...(!result.error && (linked || missing.length) ? [`Inspect ${result.tracker_key} by hand; do not republish it.`] : []),
           ...(result.error && linked && !missing.length ? [`Inspect ${result.tracker_key} by hand; do not republish it.`] : []),
         ].join(" ");
-        manual.push({ n: /** @type {number} */ (item.n), key: item.key, error: result.error ?? (linked ? "An attachment was not uploaded." : "The case link was not completed."), remedy });
+        manual.push({ n: /** @type {number} */ (item.n), key: item.key, label: item.label, error: result.error ?? (linked ? "An attachment was not uploaded." : "The case link was not completed."), remedy });
       }
       continue;
     }
@@ -1092,16 +1064,32 @@ function record(ctx, items, discarded, decisions) {
   const deletes = discarded.map((item) => ctx.repoPath(/** @type {string} */ (item.file)));
   if (deletes.length) rendered.changeset.deletes = [...(rendered.changeset.deletes ?? []), ...deletes];
   const paths = changedPaths(/** @type {{ writes: Array<{ path: string, text: string, absent?: boolean }>, deletes?: string[] }} */ (rendered.changeset));
-  return { changeset: /** @type {CardChangeset} */ (rendered.changeset), data: { applied: successes.map((i) => i.n), failed, ...(manual.length && { manual }), ...(discarded.length && { discarded: discarded.map((i) => i.n) }), ...(failed.some((i) => i.rebuild) && { rebuild: true }) }, report: () => {
+  const applied_items = successes.map((item) => {
+    const r = results.find((entry) => entry.n === item.n);
+    const tracker_key = r?.tracker_key ?? item.tracker_key;
+    const comment_id = r?.comment_id ?? item.comment_id;
+    return {
+      n: /** @type {number} */ (item.n),
+      code: item.code,
+      key: item.key,
+      label: item.label,
+      ...(tracker_key !== undefined && { tracker_key }),
+      ...(comment_id !== undefined && { comment_id }),
+    };
+  });
+  const discarded_items = discarded.map((item) => ({
+    n: /** @type {number} */ (item.n),
+    key: item.key,
+    label: item.label,
+    ...(item.file && { file: item.file }),
+  }));
+  return { changeset: /** @type {CardChangeset} */ (rendered.changeset), data: { applied_items, failed, ...(manual.length && { manual }), ...(discarded_items.length && { discarded_items }) }, report: () => {
     if (!paths.length) return { files: [], commit: null };
-    const committed = paths.filter((path) => existsSync(join(ctx.repo, path)) || gitFor(ctx, ["ls-files", "--error-unmatch", "--", path]).status === 0);
+    const committed = paths.filter((path) => existsSync(join(ctx.repo, path)) || runGit(ctx.repo, ["--literal-pathspecs", "ls-files", "--error-unmatch", "--", path]).status === 0);
     if (!committed.length) return { files: [], commit: null };
-    for (const args of [["add", "--", ...committed], ["commit", "--only", "-m", MESSAGE, "--", ...committed]]) {
-      const result = gitFor(ctx, args);
-      if (result.status !== 0) throw new UsageError("Publish commit failed", { code: "git_failed", paths: committed, written: true, reason: result.stderr?.trim() || result.error?.message || `git ${args[0]} exited ${result.status}` });
-    }
-    const commit = gitFor(ctx, ["rev-parse", "HEAD"]).stdout.trim();
-    return { files: committed, commit };
+    const res = commitPaths(ctx.repo, committed, MESSAGE);
+    if (!res.ok) throw new UsageError("Publish commit failed", { code: "git_failed", paths: committed, written: true, reason: res.reason });
+    return { files: committed, commit: res.sha };
   } };
 }
 

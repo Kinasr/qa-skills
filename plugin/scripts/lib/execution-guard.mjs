@@ -26,11 +26,13 @@
 //   typed_secret      true once `fill-password` typed a Role's password: from then every output of the Execution is scrubbed of it (ADR-0066)
 //   closed            true once `execute close` closed the sessions
 /** @import { PlatformContext, PlatformRefusal, PlatformRunnerOptions } from "./platform.mjs" */
-import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, openSync, readFileSync, rmSync, statSync, writeSync } from "node:fs";
 import { join } from "node:path";
+import { UsageError } from "./cli.mjs";
 import { defaultPlatformRunner, mapSpawnRefusal, spawnNodeCli } from "./platform.mjs";
 import { covers } from "./access.mjs";
 import { redactPageText } from "./credentials.mjs";
+import { writeJsonAtomic } from "./run-dir.mjs";
 
 /**
  * Sticky stop reasons for an Execution guard.
@@ -203,6 +205,7 @@ export const GUARD_ONLY_STOPS = ["action-cap", "off-target", "connection-lost"];
  *   tabs: SessionTab[],
  *   error?: string,
  *   refused?: boolean,
+ *   unparseable?: boolean,
  * }} TabsObservation
  */
 
@@ -236,29 +239,125 @@ export const executionDir = (runDir, id) => join(runDir, "executions", id);
 
 /**
  * The guard of the Execution in `execDir`, or null when `execute open` has not made one.
+ * Fails closed (`UsageError`) when an existing `guard.json` cannot be read or is malformed.
  * @param {string} execDir
  * @returns {ExecutionGuard | null}
  */
 export function readGuard(execDir) {
   const file = join(execDir, GUARD_FILE);
-  if (!existsSync(file)) return null;
+  let raw;
   try {
-    return /** @type {ExecutionGuard} */ (JSON.parse(readFileSync(file, "utf8")));
+    raw = readFileSync(file, "utf8");
+  } catch (err) {
+    if (/** @type {NodeJS.ErrnoException} */ (err)?.code === "ENOENT") return null;
+    const reason = /** @type {NodeJS.ErrnoException} */ (err)?.code ?? /** @type {Error} */ (err)?.message ?? String(err);
+    throw new UsageError(`${file} cannot be read: ${reason}`, { code: "guard_unreadable", file, reason });
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
   } catch {
-    return null;
+    throw new UsageError(`${file} is not valid JSON: start a new Run`, { code: "guard_unreadable", file, reason: "invalid_json" });
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new UsageError(`${file} is not a guard object: start a new Run`, { code: "guard_unreadable", file, reason: "not_an_object" });
+  }
+  return /** @type {ExecutionGuard} */ (parsed);
+}
+
+const LOCK_FILE = "guard.lock";
+const LOCK_SLEEP = new Int32Array(new SharedArrayBuffer(4));
+
+/**
+ * Pause synchronously for `ms` milliseconds without busy-spinning while waiting on `guard.lock`.
+ * @param {number} ms
+ * @returns {void}
+ */
+const waitSync = (ms) => {
+  Atomics.wait(LOCK_SLEEP, 0, 0, ms);
+};
+
+/**
+ * Whether a held `guard.lock` belongs to a vanished PID or has outlived `staleMs`.
+ * @param {string} lockPath
+ * @param {number} staleMs
+ * @returns {boolean}
+ */
+function isStaleLock(lockPath, staleMs) {
+  try {
+    const raw = readFileSync(lockPath, "utf8").trim();
+    const pid = Number.parseInt(raw, 10);
+    if (Number.isInteger(pid) && pid > 0 && pid !== process.pid) {
+      try {
+        process.kill(pid, 0);
+      } catch (e) {
+        if (/** @type {NodeJS.ErrnoException} */ (e).code === "ESRCH") return true;
+      }
+    }
+    return Date.now() - statSync(lockPath).mtimeMs > staleMs;
+  } catch (e) {
+    return /** @type {NodeJS.ErrnoException} */ (e).code === "ENOENT";
   }
 }
 
 /**
- * Written whole through a rename, so a Tester killed mid-write never leaves half a guard behind.
+ * Run `fn` (sync or async) while holding an exclusive per-Execution file lock (`guard.lock`) so
+ * concurrent `tester do` / `tester request` calls serialize their guard mutations.
+ * @template T
+ * @param {string} execDir
+ * @param {() => T} fn
+ * @param {{ timeoutMs?: number, staleMs?: number }} [options]
+ * @returns {T}
+ */
+export function withExecutionLock(execDir, fn, { timeoutMs = 70000, staleMs = 120000 } = {}) {
+  if (!existsSync(execDir)) return fn();
+  const lockPath = join(execDir, LOCK_FILE);
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      const fd = openSync(lockPath, "wx");
+      try {
+        writeSync(fd, `${process.pid}\n`);
+      } finally {
+        closeSync(fd);
+      }
+      break;
+    } catch (e) {
+      if (/** @type {NodeJS.ErrnoException} */ (e).code !== "EEXIST") throw e;
+      if (isStaleLock(lockPath, staleMs)) {
+        try { rmSync(lockPath, { force: true }); } catch {}
+        continue;
+      }
+      if (Date.now() > deadline) throw new Error("execution lock timed out");
+      waitSync(10);
+    }
+  }
+  const release = () => {
+    try { rmSync(lockPath, { force: true }); } catch {}
+  };
+  let result;
+  try {
+    result = fn();
+  } catch (e) {
+    release();
+    throw e;
+  }
+  if (result && (result instanceof Promise || (typeof result === "object" && "then" in result && typeof result.then === "function"))) {
+    return /** @type {T} */ (/** @type {unknown} */ (Promise.resolve(result).finally(release)));
+  }
+  release();
+  return result;
+}
+
+/**
+ * Written whole through a unique temp file and rename, so concurrent callers never collide and a
+ * Tester killed mid-write never leaves half a guard behind.
  * @param {string} execDir
  * @param {ExecutionGuard} guard
  * @returns {void}
  */
 export function writeGuard(execDir, guard) {
-  const file = join(execDir, GUARD_FILE);
-  writeFileSync(`${file}.tmp`, `${JSON.stringify(guard, null, 2)}\n`);
-  renameSync(`${file}.tmp`, file);
+  writeJsonAtomic(join(execDir, GUARD_FILE), guard);
 }
 
 /**
@@ -297,6 +396,15 @@ export function namedSessions(run, id, sessions) {
  * @returns {boolean}
  */
 export const matchesNote = (match, href) => match.some((p) => covers(p, `url:${href}`));
+
+/**
+ * Whether `value` is on `origin`: it starts with `origin + "/"`, so the origin itself and a longer
+ * host that shares the prefix are not.
+ * @param {string} value a URL or route pattern
+ * @param {string} origin a URL origin
+ * @returns {boolean}
+ */
+export const urlUnder = (value, origin) => value.startsWith(`${origin}/`);
 
 /**
  * A note's `login_url` as `origin + path`, or null when it names none or only the root (a root login
@@ -425,10 +533,11 @@ const PASSWORD_SHOWN = "() => document.querySelector('input[type=password]') !==
  * @param {string} cwd
  * @param {string} session
  * @param {NodeJS.ProcessEnv | undefined} [env]
+ * @param {PlatformContext} [context]
  * @returns {boolean}
  */
-export function passwordShown(cwd, session, env) {
-  const asked = playwright(cwd, session, ["eval", PASSWORD_SHOWN], env);
+export function passwordShown(cwd, session, env, context = {}) {
+  const asked = playwright(cwd, session, ["eval", PASSWORD_SHOWN], env, CALL_TIMEOUT_MS, context);
   if (asked.error || asked.missing || asked.refused) return false;
   return sectionsOf(asked.text).find((section) => section.name === "Result")?.body.split("\n")[0].trim() === "true";
 }
@@ -469,10 +578,11 @@ export const PROBE_TIMEOUT_MS = 5000;
  * @param {string} session
  * @param {string} ref
  * @param {NodeJS.ProcessEnv | undefined} [env]
+ * @param {PlatformContext} [context]
  * @returns {{ ok: true, value: unknown } | { ok: false }}
  */
-export function elementExcerpt(cwd, session, ref, env) {
-  const asked = playwright(cwd, session, ["eval", ELEMENT_EXCERPT_PROBE, ref], env, PROBE_TIMEOUT_MS);
+export function elementExcerpt(cwd, session, ref, env, context = {}) {
+  const asked = playwright(cwd, session, ["eval", ELEMENT_EXCERPT_PROBE, ref], env, PROBE_TIMEOUT_MS, context);
   if (asked.missing || asked.refused || asked.error) return { ok: false };
   const result = sectionsOf(asked.text).find((section) => section.name === "Result");
   if (!result) return { ok: false };
@@ -508,7 +618,7 @@ export function observe(cwd, session, text, env, context = {}) {
     if (asked.missing) error = "playwright-cli is not on the PATH";
     else if (asked.refused) {
       refused = true;
-      error = asked.refusal.message;
+      error = asked.refusal.code;
     } else if (asked.error) error = redactPageText(asked.error);
     else {
       const result = sectionsOf(asked.text).find((s) => s.name === "Result");
@@ -551,13 +661,70 @@ export const pageGone = (observation) => Boolean(observation.error) || unreadabl
  * @param {PlatformContext} [context]
  * @returns {TabsObservation}
  */
+/**
+ * Checks whether parentheses inside a parsed tab URL balance cleanly.
+ * @param {string} url
+ * @returns {boolean}
+ */
+function hasBalancedParens(url) {
+  let depth = 0;
+  for (const ch of url) {
+    if (ch === "(") depth += 1;
+    else if (ch === ")") {
+      depth -= 1;
+      if (depth < 0) return false;
+    }
+  }
+  return depth === 0;
+}
+
+/**
+ * Parses one `- <n>: ...` tab entry from the right up to `](<url>)` (with optional ` [crashed]`),
+ * preserving HTML `<title>` values containing `]` and returning null when malformed.
+ * @param {string} rawLine
+ * @returns {SessionTab | null}
+ */
+function parseTabLine(rawLine) {
+  const clean = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+  const withoutCrashed = clean.endsWith(" [crashed]") ? clean.slice(0, -" [crashed]".length) : clean;
+  const head = /^- (\d+):( \(current\))? \[/.exec(withoutCrashed);
+  if (!head || !withoutCrashed.endsWith(")")) return null;
+  const inner = withoutCrashed.slice(head[0].length, -1);
+  /** @type {string | null} */
+  let fallbackUrl = null;
+  let idx = inner.lastIndexOf("](");
+  while (idx !== -1) {
+    const url = inner.slice(idx + 2);
+    if (url.length > 0 && !/\s/.test(url)) {
+      if (hasBalancedParens(url)) return { index: Number(head[1]), current: Boolean(head[2]), url };
+      fallbackUrl ??= url;
+    }
+    idx = inner.lastIndexOf("](", idx - 1);
+  }
+  return fallbackUrl === null ? null : { index: Number(head[1]), current: Boolean(head[2]), url: fallbackUrl };
+}
+
+/**
+ * Lists every open tab's URL in `session`. Fails closed when any `- <n>:` tab line is unparseable.
+ * @param {string} cwd
+ * @param {string} session
+ * @param {NodeJS.ProcessEnv} [env]
+ * @param {PlatformContext} [context]
+ * @returns {TabsObservation}
+ */
 export function tabsOf(cwd, session, env, context = {}) {
   const listed = playwright(cwd, session, ["tab-list"], env, CALL_TIMEOUT_MS, context);
   if (listed.missing) return { tabs: [], error: "playwright-cli is not on the PATH" };
-  if (listed.refused) return { tabs: [], error: listed.refusal.message, refused: true };
+  if (listed.refused) return { tabs: [], error: listed.refusal.code, refused: true };
   if (listed.error) return { tabs: [], error: redactPageText(listed.error) };
-  const tabs = [...listed.text.matchAll(/^- (\d+):( \(current\))? \[[^\]]*\]\((\S+?)\)(?: \[crashed\])?$/gm)]
-    .map((m) => ({ index: Number(m[1]), current: Boolean(m[2]), url: m[3] }));
+  /** @type {SessionTab[]} */
+  const tabs = [];
+  for (const rawLine of listed.text.split(/\r?\n/)) {
+    if (!/^\s*- \d+:/.test(rawLine)) continue;
+    const tab = parseTabLine(rawLine);
+    if (!tab) return { tabs: [], error: "Could not parse tab-list entry", unparseable: true };
+    tabs.push(tab);
+  }
   return { tabs };
 }
 
@@ -593,7 +760,7 @@ const RANK = { sso: 4, off: 3, login: 2, ok: 1, neutral: 0 };
 /**
  * The checks after a command: `urls` the page URL and, when `tabs` were listed, every tab's. Returns
  * `{kind, origin?}` of the worst one. On `off` and `sso` the offending tabs are put away first: a
- * new tab is closed, the original tab goes `go-back` once.
+ * new tab is closed, the original tab goes `go-back` once. Fails closed when tab listing failed to parse.
  * @param {{
  *   cwd: string,
  *   session: string,
@@ -602,19 +769,22 @@ const RANK = { sso: 4, off: 3, login: 2, ok: 1, neutral: 0 };
  *   url: string | undefined,
  *   tabs: readonly SessionTab[],
  *   env?: NodeJS.ProcessEnv,
+ *   context?: PlatformContext,
+ *   tabsUnparseable?: boolean,
  * }} options
  * @returns {PageClassification}
  */
-export function verdict({ cwd, session, origin, loginUrl, url, tabs, env }) {
+export function verdict({ cwd, session, origin, loginUrl, url, tabs, env, context = {}, tabsUnparseable = false }) {
+  if (tabsUnparseable) return { kind: "off", origin: "null" };
   /** @type {Array<SessionTab & PageClassification>} */
   const seen = tabs.length ? tabs.map((t) => ({ ...t, ...classify(t.url, origin, loginUrl) })) : url === undefined ? [] : [{ index: 0, current: true, url, ...classify(url, origin, loginUrl) }];
   const worst = seen.reduce((w, s) => (RANK[s.kind] > RANK[w.kind] ? s : w), /** @type {PageClassification} */ ({ kind: "ok" }));
   if (worst.kind === "off" || worst.kind === "sso") {
     const away = seen.filter((s) => s.kind === "off" || s.kind === "sso");
-    for (const s of away.filter((a) => a.index > 0).sort((a, b) => b.index - a.index)) playwright(cwd, session, ["tab-close", String(s.index)], env);
+    for (const s of away.filter((a) => a.index > 0).sort((a, b) => b.index - a.index)) playwright(cwd, session, ["tab-close", String(s.index)], env, CALL_TIMEOUT_MS, context);
     if (away.some((a) => a.index === 0)) {
-      if (tabs.length && !tabs.find((t) => t.index === 0)?.current) playwright(cwd, session, ["tab-select", "0"], env);
-      playwright(cwd, session, ["go-back"], env);
+      if (tabs.length && !tabs.find((t) => t.index === 0)?.current) playwright(cwd, session, ["tab-select", "0"], env, CALL_TIMEOUT_MS, context);
+      playwright(cwd, session, ["go-back"], env, CALL_TIMEOUT_MS, context);
     }
   }
   return worst;

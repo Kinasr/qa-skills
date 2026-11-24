@@ -4,7 +4,7 @@ The full walk from a fresh install to a first Execution record, with the edge ca
 quickstart is the short version of this walk. Set up first: Claude Code **2.1.308 or newer**,
 **Node >= 22**, `playwright-cli` **0.1.22 or newer**, and a repository with at least one commit —
 see the README's prerequisites and the
-[support matrix](https://github.com/Kinasr/qa-skills/blob/v0.14.1/docs/support.md). All three
+[support matrix](https://github.com/Kinasr/qa-skills/blob/v0.15.1/docs/support.md). All three
 tracker paths below reach a first Execution; the examples use a synthetic library-loans application
 at `https://staging.example.test` with two Test levels, `ui` as a browser level and `api` as an
 API level.
@@ -95,7 +95,7 @@ only the project frontmatter's `tracker` map differs.
   Scenario and Case issue types, the story link type, the initial status and the marker field and
   label. All three issue types must accept the marker field and label in the create call itself.
   This is expected to work until a named configuration passes the release checks
-  ([Trackers row](https://github.com/Kinasr/qa-skills/blob/v0.14.1/docs/support.md#trackers)).
+  ([Trackers row](https://github.com/Kinasr/qa-skills/blob/v0.15.1/docs/support.md#trackers)).
 
 **YAML quoting.** `.qa/project.md` is checked by a limited YAML dialect. Use double-quoted strings
 where quoting is needed, as in the Jira pattern above; a single-quoted string inside a nested flow
@@ -222,7 +222,7 @@ the Run is over. Read any `Excluded by filters` lines too: they name the cases t
 left out. Confirm to begin; no login or browser opens before you confirm, and the skill is
 interactive only: never run `/qa-execute` unattended. Before it schedules anything, the Run also
 verifies your Claude Code host against the
-[supported floor](https://github.com/Kinasr/qa-skills/blob/v0.14.1/docs/support.md#claude-code); a
+[supported floor](https://github.com/Kinasr/qa-skills/blob/v0.15.1/docs/support.md#claude-code); a
 refusal names the support-matrix row and the version found, and makes no login or browser call.
 Cases are then executed by background Testers inside the Run's guard, which allows the calls
 through the CLI's `tester` wrapper only. A case whose login access fails pauses once so you can fix
@@ -348,7 +348,7 @@ Commit reviewed knowledge (`.qa/`), with login files ignored. From here:
   `/qa-skills:qa-deep-dive`.
 - `/qa-skills:qa-ask` answers Business questions from recorded Rules.
 
-The [support document](https://github.com/Kinasr/qa-skills/blob/v0.14.1/docs/support.md) documents
+The [support document](https://github.com/Kinasr/qa-skills/blob/v0.15.1/docs/support.md) documents
 the full data-handling statement, storage and lifecycle, and operational limits — including that
 application-data confidentiality is not guaranteed and that non-production targets with test accounts
 are the supported use.

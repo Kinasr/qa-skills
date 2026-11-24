@@ -215,8 +215,8 @@ export function selectMerges(ctx, card, reply) {
     const loser = keysOf(p).find((k) => k !== p.survivor);
     const r = propose(new Plan(ctx, {}), p);
     if (r.error && r.error.code !== "merge_disposition") problems.push(r.error);
-    else if (ctx.feature && indexOf(ctx, p).get(/** @type {string} */ (p.survivor))?.[0].feature !== ctx.feature) problems.push({ code: "merge_out_of_scope", survivor: p.survivor, loser });
-    if (p.tracker_disposition !== null && !["keep", "retire"].includes(/** @type {string} */ (p.tracker_disposition))) problems.push({ code: "merge_disposition", survivor: p.survivor, loser });
+    else if (ctx.feature && indexOf(ctx, p).get(/** @type {string} */ (p.survivor))?.[0].feature !== ctx.feature) problems.push({ code: "merge_out_of_scope", survivor: p.survivor, loser, feature: ctx.feature });
+    if (p.tracker_disposition !== null && !["keep", "retire"].includes(/** @type {string} */ (p.tracker_disposition))) problems.push({ code: "merge_disposition", survivor: p.survivor, loser, allowed: ["keep", "retire"] });
   }
   if (problems.length) return { problems };
   const pairs = new Map((ctx.merges ?? []).map((p) => [pairId(keysOf(p)), p]));

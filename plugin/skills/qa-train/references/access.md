@@ -106,7 +106,8 @@ Under the note at the gate, tell the engineer to:
    `.qa/auth.example`, lists every key; the engineer copies it to `.qa/auth` in the main checkout
    and fills in the values once per clone.
 2. **Keep that file under a git-ignored path**, `.qa/.auth/` by default, and `.qa/auth` for the Auth
-   file. `train check access` returns `access_files`: each login-state, password or Auth file the
+   file. `train check access` returns `access_files`, the Access Files To Ignore section: each
+   login-state, password or Auth file the
    notes name that Git does not ignore, or already tracks, with the exact line to add to
    `.gitignore`. Have a draft checked
    before the gate — `check` writes nothing — so the report is in hand: at the gate, offer each
@@ -134,7 +135,7 @@ matches no Reference until an `observe:` has made an Observation at that URL: ex
 
 On a fresh setup (`evidence access` found no `access.md`), name the continuation last:
 `/qa-deep-dive <feature-slug> human:<you>`, adding `observe:<url> "<what to look at>"` when a note
-reaches the application.
+reaches the application; offer it once; run it on yes.
 
 ## Refusals
 

@@ -45,7 +45,7 @@
 import { codegenApproachErrors } from "./codegen-approaches.mjs";
 import { publishDestinationProblems } from "./publish-labels.mjs";
 import { caseLabelProblems, labelDefinitionProblems, labelDefinitions } from "./case-labels.mjs";
-import { cliLoginUser, headerCredential, isHeaderCredentialSource, isHeaderCredentialScheme, isCredentialHeaderName, isMatchPrefix, isNoLogin, NO_LOGIN_VIA, PASSWORD_VIA, signInUrl } from "./access-note.mjs";
+import { cliLoginUser, headerCredential, isHeaderCredentialSource, isHeaderCredentialScheme, isCredentialHeaderName, isMatchPrefix, isNoLogin, isRepoRelativePath, NO_LOGIN_VIA, PASSWORD_VIA, signInUrl } from "./access-note.mjs";
 import { parseCategoryDraft, validateCategories } from "./category-file.mjs";
 import { carrierSupported, stackCarriers, testRunnerMatchesStack } from "./stacks/descriptors.mjs";
 import { credentialIn, credentialMessage, redactionExemptName, redactPairs, secretsIn, tokenIn, WITHHELD } from "./credentials.mjs";
@@ -2241,11 +2241,16 @@ function checkAccessNote(ctx, h, headingLine, entry, { prefixes, accounts }) {
     if (!isHeaderCredentialScheme(ids.scheme)) ctx.report("pattern", f("identifiers.scheme"), "The optional scheme is one HTTP token", at("identifiers"));
     if (!Array.isArray(a.match) || a.match.some((m) => typeof m !== "string" || !m.startsWith("url:"))) ctx.report("invalid", f("match"), "A Header credential belongs to URL origins only", at("match"));
   }
+  if (isMap(a.identifiers) && nonEmptyString(a.identifiers.login_state) && !isRepoRelativePath(a.identifiers.login_state)) {
+    ctx.report("pattern", f("identifiers.login_state"), `\`${f("identifiers.login_state")}\` must name a relative path inside the repository`, at("identifiers"));
+  }
   if (a.via !== undefined && !(typeof a.via === "string" && VIA.test(a.via))) {
     ctx.report("pattern", f("via"), (typeof a.via === "string" ? authShape(a.via) : null) ?? `\`${f("via")}\` is \`auth:KEY\`, \`env:NAME\`, \`mcp:name\`, \`cli:name\`, \`file:<path>\` or \`none\`, naming where the credential lives outside anything git tracks, or that a Role logs in as nobody`, at("via"));
   } else if (typeof a.via === "string" && a.via.startsWith("file:")) {
     const urlsOnly = Array.isArray(a.match) && a.match.every((m) => typeof m === "string" && m.startsWith("url:"));
-    if (!cliLoginUser(a) || !urlsOnly) {
+    if (!isRepoRelativePath(a.via.slice("file:".length))) {
+      ctx.report("pattern", f("via"), `\`${f("via")}\` must name a relative path inside the repository`, at("via"));
+    } else if (!cliLoginUser(a) || !urlsOnly) {
       ctx.report("invalid", f("via"), `\`${f("via")}\` names a password file, which only the CLI reads to log in to an app: it needs \`identifiers.user\` and only \`url:\` prefixes in \`match\``, at("via"));
     }
   }

@@ -19,7 +19,8 @@
 // among the line comments before the file's first statement.
 import { createRequire } from "node:module";
 import { existsSync } from "node:fs";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, join, posix, relative, resolve, sep } from "node:path";
+import { isContained, within } from "../paths.mjs";
 import { splice } from "./splice.mjs";
 import { carrierSupported, isTsPlaywrightStack, TS_PLAYWRIGHT_CARRIERS } from "./descriptors.mjs";
 
@@ -98,8 +99,13 @@ import { carrierSupported, isTsPlaywrightStack, TS_PLAYWRIGHT_CARRIERS } from ".
  */
 
 /**
+ * A shorthand property assignment: `{ tag }`.
+ * @typedef {TsNode & { name: TsIdentifier }} TsShorthandPropertyAssignment
+ */
+
+/**
  * An object literal: the properties it holds.
- * @typedef {TsNode & { properties: TsPropertyAssignment[] }} TsObjectLiteralExpression
+ * @typedef {TsNode & { properties: readonly TsNode[] }} TsObjectLiteralExpression
  */
 
 /**
@@ -144,10 +150,9 @@ import { carrierSupported, isTsPlaywrightStack, TS_PLAYWRIGHT_CARRIERS } from ".
  * @property {(node: TsNode) => boolean} isWhileStatement
  * @property {(node: TsNode) => boolean} isDoStatement
  * @property {(node: TsNode) => node is TsPropertyAssignment} isPropertyAssignment
+ * @property {(node: TsNode) => node is TsShorthandPropertyAssignment} isShorthandPropertyAssignment
  * @property {(node: TsNode) => node is TsArrayLiteralExpression} isArrayLiteralExpression
  * @property {(node: TsNode) => node is TsObjectLiteralExpression} isObjectLiteralExpression
- * @property {(node: TsNode) => boolean} isAwaitExpression
- * @property {(node: TsNode) => boolean} isParenthesizedExpression
  * @property {{ TS: number, TSX: number, JS: number, JSX: number }} ScriptKind
  * @property {{ Latest: number }} ScriptTarget
  * @property {{ SingleLineCommentTrivia: number }} SyntaxKind
@@ -208,15 +213,17 @@ import { carrierSupported, isTsPlaywrightStack, TS_PLAYWRIGHT_CARRIERS } from ".
  * }} TsClass
 
 /**
- * The scope a test call is found in: the classes above it, whether it is generated, and the file's
- * own scope. `skipped` is read from a scope and never written to one.
+ * The scope a test call is found in: the classes above it, whether it is generated, whether an
+ * enclosing `describe` is skipped, and the file's own scope.
  * @typedef {{
  *   path: string[],
  *   cls: TsClass | null,
+ *   classes: TsClass[],
  *   generated: boolean,
  *   whole: { skipped: boolean },
  *   skipped?: boolean,
  * }} TsScope
+ */
 
 /**
  * A test of a parsed file, as the scope it was found in.
@@ -232,6 +239,7 @@ import { carrierSupported, isTsPlaywrightStack, TS_PLAYWRIGHT_CARRIERS } from ".
  *   call: { start: number },
  *   end: number,
  * }} TsFunction
+ */
 
 /**
  * A test of a parsed file, as the caller reads it.
@@ -239,6 +247,7 @@ import { carrierSupported, isTsPlaywrightStack, TS_PLAYWRIGHT_CARRIERS } from ".
  *   name: string,
  *   line: number,
  *   classPath: string,
+ *   classes: TsClass[],
  *   carriers: TsCarrier[],
  *   skipped: boolean,
  *   generated: boolean,
@@ -246,6 +255,7 @@ import { carrierSupported, isTsPlaywrightStack, TS_PLAYWRIGHT_CARRIERS } from ".
  *   call: { start: number },
  *   end: number,
  * }} TsTest
+ */
 
 /**
  * The file's Key prefixes, and the offset a new one goes at.
@@ -368,24 +378,11 @@ import { carrierSupported, isTsPlaywrightStack, TS_PLAYWRIGHT_CARRIERS } from ".
  *   fileKeyPrefix: boolean,
  *   headerText: (prefix: string) => string,
  *   words: TsAdapterWords,
- *   guard: TsGuard,
  *   render: (text: string, ops: TsRenderOps, carrier: TsWriteCarrier, file?: string) => TsRenderResult,
  *   carrierText: (name: string, value: string) => string,
  *   codegen: CodegenAdapter,
  *   needsDeclaration: boolean,
  * }} TsAdapter
-
-/**
- * The tokens and assertion helpers the shared test-code edit guards use: what a fix may never add,
- * how many assertions a file holds, whether a 1-based line belongs to an assertion statement, and
- * the file's assertion contracts.
- * @typedef {{
- *   never: readonly { id: string, pattern: RegExp }[],
- *   assertions: (text: string) => number,
- *   assertionAt: (text: string, line: number) => boolean,
- *   contracts: (text: string) => import("../fix-assertions.mjs").AssertionContract[],
- * }} TsGuard
- */
 
 /**
  * The stack a project names: its language and its framework.
@@ -465,35 +462,6 @@ const HEADER = /^\/\/[ \t]*qa-key-prefix:[ \t]*(\S+)[ \t]*$/;
  */
 const headerText = (prefix) => `// qa-key-prefix: ${prefix}`;
 
-// Assertion call prefixes shared between `guard.assertions` (file-wide count) and `guard.assertionAt`
-// (AST statement-span lookup).
-/** @type {readonly RegExp[]} */
-const ASSERTION_PATTERNS = [
-  /\bexpect(?:\s*\.\s*(?:soft|poll))?\s*\(/,
-  /\bassert(?:\s*\.\s*[A-Za-z_$][\w$]*)?\s*\(/,
-];
-
-// The tokens a fix may never add, in the language this adapter reads. They are matched on added
-// lines only, so an existing skip elsewhere in the file is not a new one.
-/** @type {Omit<TsGuard, "contracts" | "assertionAt">} */
-const GUARD = {
-  never: [
-    { id: "disable", pattern: /\b(?:test|describe)(?:\s*\.\s*[A-Za-z_$][\w$]*)*\s*\.\s*(?:skip|fixme)\b/ },
-    { id: "focus", pattern: /\b(?:test|describe)(?:\s*\.\s*[A-Za-z_$][\w$]*)*\s*\.\s*only\b/ },
-    { id: "assume", pattern: /\bassume(?:True|False|That)?\s*\(/ },
-    { id: "sleep", pattern: /\b(?:waitForTimeout|sleep|setTimeout)\s*\(/ },
-    { id: "retry", pattern: /\bretry(?:Count|Times|When|Until)?\s*[:=(]/ },
-    { id: "timeout", pattern: /\b(?:setDefaultTimeout|slow)\s*\(|\btimeout\s*:/ },
-  ],
-  assertions: (text) => {
-    let count = 0;
-    for (const pattern of ASSERTION_PATTERNS) {
-      for (const _ of text.matchAll(new RegExp(pattern.source, "g"))) count++;
-    }
-    return count;
-  },
-};
-
 /**
  * @param {TsApi} ts
  * @returns {TsAdapter}
@@ -530,11 +498,6 @@ function adapterWith(ts) {
       keyCarrier: "Key carrier",
       keyCarrierTitle: "Automation key's Key carrier",
       write: "mark",
-    },
-    guard: {
-      ...GUARD,
-      assertionAt: (text, line) => assertionAt(ts, text, line),
-      contracts: (text) => assertionContracts(ts, text),
     },
     render: (text, ops, carrier, file) => render(ts, text, ops, carrier, file),
     carrierText,
@@ -606,7 +569,7 @@ function codegenWith(ts) {
         const resolved = cts.resolveModuleName(specifier, join(p.repo, file), p.options, cts.sys).resolvedModule?.resolvedFileName;
         if (!resolved) continue;
         const rel = relative(p.repo, resolved).split(sep).join("/");
-        if (!rel || rel === file || rel.startsWith("../") || isAbsolute(rel)) continue;
+        if (!isContained(p.repo, resolved, { strict: true }) || rel === file) continue;
         if (!inside(rel, p.modulePaths) || !cts.sys.fileExists(join(p.repo, rel))) continue;
         out.add(rel);
       }
@@ -631,15 +594,18 @@ function codegenWith(ts) {
   };
 }
 
-// The directory shared by every module path (`web/tests` and `web/fixtures` → `web`).
+// The directory shared by every module path (`web/tests` and `web/fixtures` → `web`; `e2e` → `e2e`).
 /**
  * @param {readonly string[]} paths
  * @returns {string}
  */
 function commonRoot(paths) {
-  let common = dirname((paths[0] ?? ".").replace(/\/+$/, ""));
-  for (const p of paths.slice(1)) {
-    while (common !== "." && p !== common && !p.startsWith(`${common}/`)) common = dirname(common);
+  if (!paths.length) return ".";
+  const norm = (/** @type {string} */ p) => posix.normalize((p || ".").replace(/\\/g, "/")).replace(/\/+$/, "") || ".";
+  let common = norm(paths[0]);
+  for (const raw of paths.slice(1)) {
+    const p = norm(raw);
+    while (common !== "." && !within(p, common)) common = posix.dirname(common);
   }
   return common === "" ? "." : common;
 }
@@ -664,7 +630,7 @@ function ancestors(dir) {
  * @param {readonly string[]} roots
  * @returns {boolean}
  */
-const inside = (path, roots) => roots.some((root) => path === root || path.startsWith(`${root.replace(/\/+$/, "")}/`));
+const inside = (path, roots) => roots.some((root) => root === "." ? path === "." : within(path, root));
 
 // The parts of a file a per-file cap keeps: its imports, the next class or describe header, its
 // hooks, and its first three tests. The sampler assembles those ranges and cuts them to the cap.
@@ -757,6 +723,17 @@ function literal(ts, node, sf) {
  */
 const isFunction = (ts, n) => ts.isArrowFunction(n) || ts.isFunctionExpression(n);
 
+/**
+ * The property name text of an identifier or string-literal key, or null.
+ * @param {TsApi} ts
+ * @param {TsNode} name
+ * @returns {string | null}
+ */
+function propertyKey(ts, name) {
+  if (ts.isIdentifier(name) || ts.isStringLiteral(name)) return name.text;
+  return null;
+}
+
 // `{classes, functions, header}` of one file (lib/stack.mjs `parse`):
 //   classes    [{name, line, path, carriers, skipped, call}]    one per titled describe
 //   functions  [{name, line, classPath, carriers, skipped, generated, template, call}]
@@ -779,6 +756,8 @@ function parseWith(ts, text, file = "x.ts") {
   const lineOf = (pos) => sf.getLineAndCharacterOfPosition(pos).line + 1;
   /** @type {TsClass[]} */
   const classes = [];
+  /** @type {Map<TsClass, TsClass | null>} */
+  const parentOf = new Map();
   /** @type {TsFunction[]} */
   const functions = [];
 
@@ -794,19 +773,24 @@ function parseWith(ts, text, file = "x.ts") {
     }
     const details = detailsOf(ts, call);
     for (const p of details?.properties ?? []) {
-      if (!ts.isPropertyAssignment(p) || !ts.isIdentifier(p.name)) continue;
+      if (!ts.isPropertyAssignment(p)) continue;
+      const key = propertyKey(ts, p.name);
+      if (key !== "tag" && key !== "annotation") continue;
       const items = ts.isArrayLiteralExpression(p.initializer) ? p.initializer.elements : [p.initializer];
-      if (p.name.text === "tag") {
+      if (key === "tag") {
         for (const e of items) {
           const s = literal(ts, e, sf);
           if (s) out.push({ name: "tag", line: lineOf(e.getStart(sf)), strings: [s.text.replace(/^@/, "")], span: { start: e.getStart(sf), end: e.end } });
         }
       }
-      if (p.name.text === "annotation") {
+      if (key === "annotation") {
         for (const e of items) {
           if (!ts.isObjectLiteralExpression(e)) continue;
           /** @type {(k: string) => TsExpression | undefined} */
-          const get = (k) => e.properties.find((q) => ts.isPropertyAssignment(q) && q.name.getText(sf) === k)?.initializer;
+          const get = (k) => {
+            const match = e.properties.find((q) => ts.isPropertyAssignment(q) && propertyKey(ts, q.name) === k);
+            return match && ts.isPropertyAssignment(match) ? match.initializer : undefined;
+          };
           const type = literal(ts, get("type"), sf)?.text;
           const desc = get("description");
           const d = literal(ts, desc, sf);
@@ -840,7 +824,9 @@ function parseWith(ts, text, file = "x.ts") {
       if (rest.includes("configure")) return;
       if (!title) {
         // An untitled describe groups nothing a key can name: its tests belong to the scope.
-        if (body) ts.forEachChild(body.body, (n) => visit(n, scope));
+        const untitledSkipped = Boolean(scope.skipped || rest.some((m) => DISABLING.has(m)));
+        const nextScope = untitledSkipped === Boolean(scope.skipped) ? scope : { ...scope, skipped: untitledSkipped };
+        if (body) ts.forEachChild(body.body, (n) => visit(n, nextScope));
         return;
       }
       const cls = {
@@ -848,11 +834,12 @@ function parseWith(ts, text, file = "x.ts") {
         line: lineOf(call.getStart(sf)),
         path: [...scope.path, title.text].join(SEP),
         carriers: carriers(call, titleNode),
-        skipped: scope.skipped || rest.some((m) => DISABLING.has(m)),
+        skipped: Boolean(scope.skipped || scope.cls?.skipped || rest.some((m) => DISABLING.has(m))),
         call: { start: call.getStart(sf) },
       };
+      parentOf.set(cls, scope.cls);
       classes.push(cls);
-      if (body) ts.forEachChild(body.body, (n) => visit(n, { ...scope, path: [...scope.path, title.text], cls }));
+      if (body) ts.forEachChild(body.body, (n) => visit(n, { ...scope, path: [...scope.path, title.text], cls, classes: [...scope.classes, cls], skipped: cls.skipped }));
       return;
     }
     if (DISABLING.has(first) && !(title && body)) {
@@ -881,9 +868,12 @@ function parseWith(ts, text, file = "x.ts") {
 
   /** @type {{ skipped: boolean }} */
   const whole = { skipped: false }; // the file, as a scope
-  ts.forEachChild(sf, (n) => visit(n, { path: [], cls: null, generated: false, whole }));
+  ts.forEachChild(sf, (n) => visit(n, { path: [], cls: null, classes: [], generated: false, whole }));
+  for (const cls of classes) {
+    if (parentOf.get(cls)?.skipped) cls.skipped = true;
+  }
   // A describe or file skipped by a bare `test.skip()` after its tests skips them too.
-  const fns = functions.map(({ scope, ...f }) => ({ ...f, skipped: f.skipped || whole.skipped || Boolean(scope.cls?.skipped) }));
+  const fns = functions.map(({ scope, ...f }) => ({ ...f, classes: scope.classes, skipped: f.skipped || whole.skipped || Boolean(scope.skipped || scope.cls?.skipped) }));
   return { classes, functions: fns, header: headerOf(ts, sf, text, lineOf) };
 }
 
@@ -956,17 +946,22 @@ function keys(carriers, names, pattern) {
 /** @type {RegExp} */
 const TOKEN = /[0-9A-Za-z_-]+/g;
 /**
+ * @param {string} s
+ * @returns {string}
+ */
+const escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+/**
  * @param {string} k
  * @returns {RegExp}
  */
-const token = (k) => new RegExp(`(?<![0-9A-Za-z_-])${k}(?![0-9A-Za-z_-])`);
+const token = (k) => new RegExp(`(?<![0-9A-Za-z_-])${escapeRegex(k)}(?![0-9A-Za-z_-])`);
 
 // --- write side --------------------------------------------------------------------------------
 
 // One file with its keys written (lib/stack.mjs `render`): a new key in the test's `carrier.name`
 // carrier, a copied key swapped in place, a Key prefix in its describe's `carrier.prefix.name`
 // carrier, and a file's Key prefix as its header comment (`header: [{prefix}]`). Each is a
-// byte-offset splice of the original text; the result is re-parsed, and each test, describe and
+// UTF-16 code-unit splice of the original text; the result is re-parsed, and each test, describe and
 // header is found again by its offset, moved by the edits before it.
 /**
  * @param {TsApi} ts
@@ -1110,98 +1105,18 @@ function carrierEdit(ts, sf, call, carrier, value) {
   const q = first === "\"" ? "\"" : "'";
   const prop = carrier === "tag" ? { key: "tag", value: `${q}@${value}${q}` } : { key: "annotation", value: `{ type: ${q}${carrier.slice("annotation.".length)}${q}, description: ${q}${value}${q} }` };
   if (!details) return { edits: [{ at: title.end, del: 0, ins: `, { ${prop.key}: ${prop.value} }` }] };
-  const existing = details.properties.find((p) => ts.isPropertyAssignment(p) && p.name.getText(sf) === prop.key);
+  const existing = details.properties.find((p) => (ts.isPropertyAssignment(p) || ts.isShorthandPropertyAssignment(p)) && propertyKey(ts, p.name) === prop.key);
   if (!existing) {
     if (!details.properties.length) return { edits: [{ at: details.getStart(sf), del: details.end - details.getStart(sf), ins: `{ ${prop.key}: ${prop.value} }` }] };
     return { edits: [{ at: details.getStart(sf) + 1, del: 0, ins: ` ${prop.key}: ${prop.value},` }] };
   }
-  const init = existing.initializer;
+  if (ts.isShorthandPropertyAssignment(existing)) {
+    return { edits: [{ at: existing.end, del: 0, ins: `: [${existing.name.getText(sf)}, ${prop.value}]` }] };
+  }
+  const init = /** @type {TsPropertyAssignment} */ (existing).initializer;
   if (ts.isArrayLiteralExpression(init)) {
     const last = init.elements[init.elements.length - 1];
     return { edits: [last ? { at: last.end, del: 0, ins: `, ${prop.value}` } : { at: init.getStart(sf) + 1, del: 0, ins: prop.value }] };
   }
   return { edits: [{ at: init.getStart(sf), del: init.end - init.getStart(sf), ins: `[${init.getText(sf)}, ${prop.value}]` }] };
-}
-
-// Only complete expect(...).matcher(...) calls are outcome contracts; AST walking ignores comments
-// and handles multiline expressions. The matcher chain includes negation and soft/poll modes.
-/** @param {TsApi} ts @param {string} text @returns {import("../fix-assertions.mjs").AssertionContract[]} */
-function assertionContracts(ts, text) {
-  const sf = sourceFile(ts, text, "assertions.ts");
-  /** @type {import("../fix-assertions.mjs").AssertionContract[]} */
-  const checks = [];
-  /** @param {TsNode} node @returns {void} */
-  function visit(node) {
-    if (ts.isCallExpression(node)) {
-      /** @type {string[]} */
-      const literals = [];
-      const expected = (/** @type {TsExpression[]} */ args) => args.map(arg => {
-        if (ts.isStringLiteral(arg) || ts.isNoSubstitutionTemplateLiteral(arg)) { literals.push(arg.text); return '$literal'; }
-        if (/^(?:[+-]?\d+(?:\.\d+)?|true|false|null)$/.test(arg.getText(sf))) { literals.push(arg.getText(sf)); return '$literal'; }
-        return arg.getText(sf).replace(/\s+/g, '');
-      }).join(',');
-      const direct = callee(ts, node.expression);
-      // The actual operand is the expected one: the check compares a value with itself.
-      // Whitespace is dropped outside string literals only, so `f("a b")` and `f("ab")` stay apart.
-      const text = (/** @type {TsExpression} */ arg) => arg.getText(sf).replace(/("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)|\s+/g, (_, literal) => literal ?? '');
-      if (direct?.root === 'assert') checks.push({ matcher: ['assert', ...direct.chain].join('.'), expected: expected(node.arguments), literals, constant: false, same: node.arguments.length >= 2 && text(node.arguments[0]) === text(node.arguments[1]) });
-      if (ts.isPropertyAccessExpression(node.expression)) {
-        let root = node.expression.expression;
-        const chain = [node.expression.name.text];
-        while (ts.isPropertyAccessExpression(root)) { chain.unshift(root.name.text); root = root.expression; }
-        if (ts.isCallExpression(root) && /^expect(?:\.(?:soft|poll))?$/.test(root.expression.getText(sf))) {
-          checks.push({ matcher: root.expression.getText(sf) + '.' + chain.join('.'), expected: expected(node.arguments), literals, constant: /^(?:true|false|null|[+-]?\d+|["'`])/.test(root.arguments[0]?.getText(sf) ?? ''), same: root.arguments.length > 0 && node.arguments.length > 0 && text(root.arguments[0]) === text(node.arguments[0]) });
-        }
-      }
-    }
-    ts.forEachChild(node, visit);
-  }
-  visit(sf);
-  return checks;
-}
-
-/**
- * Whether `line` (1-based) falls inside an assertion call or its fluent matcher chain.
- * @param {TsApi} ts
- * @param {string} text
- * @param {number} line
- * @returns {boolean}
- */
-function assertionAt(ts, text, line) {
-  if (!Number.isInteger(line) || line < 1) return false;
-  const sf = sourceFile(ts, text, "assertions.ts");
-  /** @type {Map<TsNode, TsNode>} */
-  const parents = new Map();
-  /** @type {TsCallExpression[]} */
-  const roots = [];
-  /** @param {TsNode} node @param {TsNode | null} parent @returns {void} */
-  const walk = (node, parent) => {
-    if (parent) parents.set(node, parent);
-    if (ts.isCallExpression(node)) {
-      const direct = callee(ts, node.expression);
-      if (direct) {
-        const head = `${[direct.root, ...direct.chain].join(".")}(`;
-        if (ASSERTION_PATTERNS.some((p) => p.exec(head)?.index === 0)) roots.push(node);
-      }
-    }
-    ts.forEachChild(node, (child) => walk(child, node));
-  };
-  walk(sf, null);
-  /** @param {number} pos */
-  const lineOf = (pos) => sf.getLineAndCharacterOfPosition(pos).line + 1;
-  for (const root of roots) {
-    /** @type {TsNode} */
-    let outer = root;
-    for (;;) {
-      const parent = parents.get(outer);
-      if (!parent) break;
-      if ((ts.isPropertyAccessExpression(parent) || ts.isCallExpression(parent)) && parent.expression === outer) outer = parent;
-      else if (ts.isAwaitExpression(parent) || ts.isParenthesizedExpression(parent)) outer = parent;
-      else break;
-    }
-    const start = lineOf(outer.getStart(sf));
-    const end = lineOf(Math.max(outer.getStart(sf), outer.end - 1));
-    if (line >= start && line <= end) return true;
-  }
-  return false;
 }

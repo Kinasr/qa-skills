@@ -14,8 +14,11 @@ import {
   BATCH_EXTENSIONS,
   EXE_EXTENSION,
   findWin32CommandHit,
+  isRegularFile,
+  isRootedWin32,
   mergePlatformFs,
   readEnv,
+  systemRoot,
 } from "./platform-path.mjs";
 /** @import { BatchArgToken, BatchWrapperRequest, PlatformContext, PlatformRefusal, PlatformRunnerOptions, PlatformSpawnResult } from "./platform.mjs" */
 
@@ -27,21 +30,24 @@ import {
  */
 export const BATCH_ARGUMENT = /^[A-Za-z0-9_.,:=+#$/\\@[\] '-]+$/;
 
-/** The interpreter Windows names in `%ComSpec%`. */
-const DEFAULT_COMSPEC = "C:\\Windows\\System32\\cmd.exe";
-
 /**
  * A filesystem reader and a child's environment, as resolution needs them.
  * @typedef {{
  *   cwd: string,
  *   env: NodeJS.ProcessEnv,
- *   exists: (path: string) => boolean,
+ *   fs: import("./platform.mjs").PlatformFs,
  * }} LauncherResolution
  */
 
 /**
  * Either a resolved launcher or the refusal that stops the invocation.
  * @typedef {{ file: string } | { refusal: PlatformRefusal }} LauncherResult
+ */
+
+/**
+ * The first character of a token or path that `cmd.exe` cannot receive: the character, its UTF-16
+ * offset in the checked text, and whether it is non-ASCII (above U+007F) rather than a metacharacter.
+ * @typedef {{ index: number, char: string, nonAscii: boolean }} DisallowedChar
  */
 
 /**
@@ -55,17 +61,45 @@ function hasDirectory(file) {
 }
 
 /**
- * The first character `cmd.exe` would re-parse (plus its string index), or null when every
- * character is allowed. An empty token has no offending character; the caller refuses it separately.
+ * The first character `cmd.exe` would re-parse, or null when every character is allowed. The walk is
+ * by code point, so an astral letter is one character; `index` is its UTF-16 offset (what
+ * `resolveTokenSource` needs) and `nonAscii` is true above U+007F. An empty token has no offending
+ * character; the caller refuses it separately.
  * @param {string} value
- * @returns {{ index: number, char: string } | null}
+ * @returns {DisallowedChar | null}
  */
 function disallowedChar(value) {
-  for (let index = 0; index < value.length; index += 1) {
-    const char = value[index];
-    if (!BATCH_ARGUMENT.test(char)) return { index, char };
+  let index = 0;
+  for (const char of value) {
+    if (!BATCH_ARGUMENT.test(char)) return { index, char, nonAscii: /** @type {number} */ (char.codePointAt(0)) > 0x7f };
+    index += char.length;
   }
   return null;
+}
+
+/**
+ * How a refusal message names the offending character: the character and its position in the
+ * refused text, so every branch states the position the same way.
+ * @param {DisallowedChar} bad
+ * @returns {string}
+ */
+function describeDisallowed({ char, index, nonAscii }) {
+  const named = nonAscii ? `the non-ASCII character ${JSON.stringify(char)}` : JSON.stringify(char);
+  return `${named} at position ${index}`;
+}
+
+/**
+ * Whether `path` is a folder: `statSync(path).isDirectory()`; any throw is `false`.
+ * @param {import("./platform.mjs").PlatformFs} fs
+ * @param {string} path
+ * @returns {boolean}
+ */
+function isDirectoryPath(fs, path) {
+  try {
+    return fs.statSync(path).isDirectory?.() === true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -137,21 +171,26 @@ function launcherNotBatch(file, found, source) {
 }
 
 /**
- * A launcher path `cmd.exe` would re-parse, so it never reaches the command line.
+ * A launcher path `cmd.exe` would re-parse or cannot carry, so it never reaches the command line.
  * @param {string} file the resolved launcher path
- * @param {string} char the character that stops it
+ * @param {DisallowedChar} bad the character that stops it
  * @param {string | undefined} source `test_runner.launcher` when configured, or undefined when default
  * @returns {PlatformRefusal}
  */
-function launcherMetachar(file, char, source) {
+function launcherMetachar(file, bad, source) {
+  const { index, char, nonAscii } = bad;
+  const subject = source === undefined
+    ? `Default batch launcher path ${JSON.stringify(file)}`
+    : `Batch launcher path ${JSON.stringify(file)} from ${source}`;
   return {
     outcome: "refused",
-    code: "disallowed_metachar",
-    message: source === undefined
-      ? `Default batch launcher path ${JSON.stringify(file)} contains ${JSON.stringify(char)}: cmd.exe would re-parse it`
-      : `Batch launcher path ${JSON.stringify(file)} from ${source} contains ${JSON.stringify(char)}: cmd.exe would re-parse it`,
+    code: nonAscii ? "non_ascii_argument" : "disallowed_metachar",
+    message: nonAscii
+      ? `${subject} contains ${describeDisallowed(bad)}: cmd.exe cannot pass it on, so move the project to a path with only ASCII characters`
+      : `${subject} contains ${describeDisallowed(bad)}: cmd.exe would re-parse it`,
     file,
     char,
+    index,
     ...(source === undefined ? {} : { source }),
   };
 }
@@ -162,46 +201,97 @@ function launcherMetachar(file, char, source) {
  * @param {string} value the refused token
  * @param {string | undefined} source the `project.md` key, when the token came from one
  * @param {string | undefined} automation the Automation the token was selected for
- * @param {string | null} char the offending character, or null for an empty token
+ * @param {DisallowedChar | null} bad the offending character, or null for an empty token
  * @returns {PlatformRefusal}
  */
-function tokenRefusal(value, source, automation, char) {
+function tokenRefusal(value, source, automation, bad) {
   const origin = source === undefined ? `for Automation ${automation ?? "an unnamed Automation"}` : `from ${source}`;
   const label = source ?? (automation === undefined ? undefined : `Automation ${automation}`);
+  const subject = `Batch argument ${JSON.stringify(value)} ${origin}`;
+  if (bad === null) {
+    return {
+      outcome: "refused",
+      code: "disallowed_metachar",
+      message: `${subject} is empty: cmd.exe would drop it`,
+      ...(label === undefined ? {} : { source: label }),
+    };
+  }
+  const { char, index, nonAscii } = bad;
+  const found = `${subject} contains ${describeDisallowed(bad)}`;
+  // A token not taken from project.md is a test selector built for the Automation.
+  const nonAsciiMessage = source === undefined
+    ? `${found}: non-ASCII test names cannot pass through cmd.exe and the JVM on Windows, so use an ASCII method name with @DisplayName`
+    : `${found}: cmd.exe cannot pass it on`;
   return {
     outcome: "refused",
-    code: "disallowed_metachar",
-    message:
-      char === null
-        ? `Batch argument ${JSON.stringify(value)} ${origin} is empty: cmd.exe would drop it`
-        : `Batch argument ${JSON.stringify(value)} ${origin} contains ${JSON.stringify(char)}: cmd.exe would re-parse it`,
+    code: nonAscii ? "non_ascii_argument" : "disallowed_metachar",
+    message: nonAscii ? nonAsciiMessage : `${found}: cmd.exe would re-parse it`,
     ...(label === undefined ? {} : { source: label }),
-    ...(char === null ? {} : { char }),
+    char,
+    index,
   };
 }
 
 /**
  * Resolve a launcher that names a path against the run's working directory: an admitted extension
  * is used as it is, an extensionless `./gradlew`/`./mvnw` maps to its sibling `.bat`/`.cmd`, and
- * anything else is refused.
+ * anything else is refused. A folder named like a launcher is missing, not found.
  * @param {string} file
- * @param {{ cwd: string, exists: (path: string) => boolean, source?: string }} resolution
+ * @param {{ cwd: string, fs: import("./platform.mjs").PlatformFs, source?: string }} resolution
  * @returns {LauncherResult}
  */
-function resolveLauncherPath(file, { cwd, exists, source }) {
+function resolveLauncherPath(file, { cwd, fs, source }) {
   const absolute = win32.resolve(cwd, file);
   const extension = win32.extname(absolute).toLowerCase();
   if (extension === EXE_EXTENSION || BATCH_EXTENSIONS.has(extension)) {
-    return exists(absolute) ? { file: absolute } : { refusal: launcherMissing(file, "the file does not exist", source) };
+    if (isRegularFile(fs, absolute)) return { file: absolute };
+    return {
+      refusal: launcherMissing(file, isDirectoryPath(fs, absolute) ? `${absolute} is a directory, not a file` : "the file does not exist", source),
+    };
   }
   if (extension === "") {
     const siblings = [...BATCH_EXTENSIONS].map((candidate) => `${absolute}${candidate}`);
-    const found = siblings.find((candidate) => exists(candidate));
-    return found === undefined
-      ? { refusal: launcherMissing(file, `expected ${file}.bat or ${file}.cmd`, source) }
-      : { file: found };
+    const found = siblings.find((candidate) => isRegularFile(fs, candidate));
+    if (found !== undefined) return { file: found };
+    const folder = siblings.find((candidate) => isDirectoryPath(fs, candidate));
+    return {
+      refusal: launcherMissing(file, folder === undefined ? `expected ${file}.bat or ${file}.cmd` : `${folder} is a directory, not a file`, source),
+    };
   }
   return { refusal: launcherNotBatch(file, absolute, source) };
+}
+
+/**
+ * The interpreter `cmd.exe` runs: `%ComSpec%` when it is a rooted path, `<SystemRoot>\System32\cmd.exe`
+ * when it is unset or blank, and a refusal when either is not an absolute path.
+ * @param {NodeJS.ProcessEnv} env
+ * @returns {{ file: string } | { refusal: PlatformRefusal }}
+ */
+function resolveComSpec(env) {
+  const configured = readEnv(env, "ComSpec")?.trim() ?? "";
+  if (configured === "") {
+    const root = systemRoot(env);
+    return root === null
+      ? {
+          refusal: {
+            outcome: "refused",
+            code: "comspec_not_absolute",
+            message: "SystemRoot is not an absolute path, so cmd.exe cannot be located",
+            cause: "system_root",
+          },
+        }
+      : { file: win32.join(root, "System32", "cmd.exe") };
+  }
+  if (isRootedWin32(configured)) return { file: configured };
+  return {
+    refusal: {
+      outcome: "refused",
+      code: "comspec_not_absolute",
+      message: "ComSpec must be an absolute path such as C:\\Windows\\System32\\cmd.exe",
+      file: configured,
+      cause: "comspec",
+    },
+  };
 }
 
 /**
@@ -232,12 +322,12 @@ function resolveLauncherOnPath(name, { env, fs, probe, source }) {
  * @returns {string}
  */
 export function defaultBatchLauncher(tool, cwd, { platform = process.platform, fs } = {}) {
-  const exists = fs?.existsSync ?? fsExistsSync;
   const wrapper = tool === "gradle" ? "gradlew" : "mvnw";
   const command = tool === "gradle" ? "gradle" : "mvn";
-  if (platform !== "win32") return exists(join(cwd, wrapper)) ? `./${wrapper}` : command;
+  if (platform !== "win32") return (fs?.existsSync ?? fsExistsSync)(join(cwd, wrapper)) ? `./${wrapper}` : command;
+  const winFs = mergePlatformFs(fs);
   const candidates = tool === "gradle" ? ["gradlew.bat", "gradlew.cmd"] : ["mvnw.cmd", "mvnw.bat"];
-  const found = candidates.find((candidate) => exists(win32.join(cwd, candidate)));
+  const found = candidates.find((candidate) => isRegularFile(winFs, win32.join(cwd, candidate)));
   return found === undefined ? command : `./${found}`;
 }
 
@@ -253,7 +343,7 @@ export function spawnBatchWin32(request, { env = process.env, fs: injectedFs } =
   const mergedFs = mergePlatformFs(injectedFs);
   const cwd = request.cwd ?? process.cwd();
   const launcher = hasDirectory(request.file)
-    ? resolveLauncherPath(request.file, { cwd, exists: mergedFs.existsSync, source: request.source })
+    ? resolveLauncherPath(request.file, { cwd, fs: mergedFs, source: request.source })
     : resolveLauncherOnPath(request.file, { env, fs: mergedFs, probe: injectedFs?.statSync ? "stat" : "exists", source: request.source });
   if ("refusal" in launcher) return { refusal: launcher.refusal };
 
@@ -262,7 +352,7 @@ export function spawnBatchWin32(request, { env = process.env, fs: injectedFs } =
     return { file: launcher.file, args: request.args, options: request.options };
   }
   const launcherBad = disallowedChar(launcher.file);
-  if (launcherBad !== null) return { refusal: launcherMetachar(launcher.file, launcherBad.char, request.source) };
+  if (launcherBad !== null) return { refusal: launcherMetachar(launcher.file, launcherBad, request.source) };
 
   const tokens = request.tokens ?? [];
   for (const [index, value] of request.args.entries()) {
@@ -275,7 +365,7 @@ export function spawnBatchWin32(request, { env = process.env, fs: injectedFs } =
     const bad = disallowedChar(value);
     if (bad !== null) {
       const source = resolveTokenSource(token, value, bad.index);
-      return { refusal: tokenRefusal(value, source, request.automation, bad.char) };
+      return { refusal: tokenRefusal(value, source, request.automation, bad) };
     }
   }
 
@@ -284,8 +374,10 @@ export function spawnBatchWin32(request, { env = process.env, fs: injectedFs } =
   const commandLine = `"${[launcher.file, ...request.args].map(quoteBatchToken).join(" ")}"`;
   /** @type {TOptions} */
   const options = /** @type {TOptions} */ ({ ...request.options, shell: false, windowsVerbatimArguments: true });
+  const comSpec = resolveComSpec(env);
+  if ("refusal" in comSpec) return { refusal: comSpec.refusal };
   return {
-    file: readEnv(env, "ComSpec") ?? DEFAULT_COMSPEC,
+    file: comSpec.file,
     args: ["/d", "/s", "/c", commandLine],
     options,
   };

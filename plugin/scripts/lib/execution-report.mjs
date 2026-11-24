@@ -32,7 +32,7 @@ import { caseSteps, casePreconditions } from "./case-fields.mjs";
 import { isMap, parseYaml } from "./dialect.mjs";
 import { parse } from "./knowledge-file.mjs";
 
-/** @import { ExecuteExecution } from "./execute.mjs" */
+/** @import { ExecuteExecution } from "./execute-plan.mjs" */
 /** @import { CaseFieldEntry } from "./case-fields.mjs" */
 /** @import { ExecutionGuardStop } from "./execution-guard.mjs" */
 

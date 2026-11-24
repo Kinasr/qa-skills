@@ -8,10 +8,13 @@ never claimed done.
 ## Support matrix
 
 Each row names its exact tested configuration, the capability exercised, the evidence, and the
-limits, with one of three statuses:
+limits, with one of four statuses:
 
 - **Supported** — exercised by the automated suite in CI or by a recorded live entry.
 - **Expected to work** — not exercised in this release; issue reports are welcome.
+- **Simulated** — the code paths for this platform exist and the automated suite exercises
+  them by simulating the platform on another operating system. Nothing has run on the
+  platform itself. Expect failures, and report them.
 - **Unsupported** — does not work and is not targeted.
 
 An installed version alone is not evidence. Rows whose evidence depends on the pending live runs
@@ -27,7 +30,9 @@ below say so under their limits; their status changes only when a recorded live 
   browser-artifact placement passed on 0.13.2 on both surfaces; `agentId` binding passed on 0.13.1
   in the terminal CLI and on 0.13.2 in the desktop app. Every one of these passed again on 0.14.0,
   on both surfaces. Guard denial passed again on 0.14.1 on both surfaces, after the Tester guard
-  changed. Linux end-to-end is Pending.
+  changed. Host-version detection, guard denial, `agentId` binding, browser-artifact placement and
+  a macOS end-to-end Run passed again on 0.15.0 in the terminal CLI at Claude Code 2.1.308. Linux
+  end-to-end is Pending.
 - **Tested configuration:** Claude Code 2.1.308 or newer (the floor). The desktop app bundles its
   own Claude Code and cannot be pinned, so its entries ran on the bundled 2.1.321 (2.1.325 for
   0.14.0), at or above the floor. Before any login or browser
@@ -102,11 +107,12 @@ below say so under their limits; their status changes only when a recorded live 
 ### Node
 
 - **Status:** Supported.
-- **Tested configuration:** Node >= 22, as `package.json` states in `engines.node`. CI pins
-  Node 22 on Ubuntu.
+- **Tested configuration:** Node >= 22, as `package.json` states in `engines.node`. CI is
+  configured to pin Node 22 on Ubuntu.
 - **Capability exercised:** the whole CLI — every command the automated suite touches, in-process
   and through the real `plugin/scripts/scan.mjs` entry point.
-- **Evidence:** the automated suite runs in CI on ubuntu-latest with Node 22.
+- **Evidence:** the automated suite is configured for CI on ubuntu-latest with Node 22; GitHub
+  Actions has not run on `main` since 2026-11-14 (billing).
 - **Limits:** the suite drives a fake `playwright-cli` and no real browser or host. Newer Node
   releases are expected to work and unexercised.
 
@@ -178,18 +184,29 @@ below say so under their limits; their status changes only when a recorded live 
 
 - **macOS** — Expected to work. Live Executions during development ran on macOS; recorded
   release-gate evidence on the floor version is pending.
-- **Linux** — Supported for the automated suite: CI runs it on ubuntu-latest, Node 22 (with a
-  fake `playwright-cli`, no browser). A live Execution on Linux is expected to work, with no
+- **Linux** — Supported for the automated suite, configured for CI on ubuntu-latest, Node 22
+  (with a fake `playwright-cli`, no browser); Actions has not run on `main` since 2026-11-14. A live Execution on Linux is expected to work, with no
   recorded evidence yet.
 - **WSL2** — Unsupported. The ladder: **Expected to work** once the drvfs refusal and the PATH
   fixes land and the suite has passed inside WSL2; **Supported** on its own PASS rows at the floor
   or above, with the repo on ext4. A Linux end-to-end row does not move it, and it does not move
   Linux: the two tracks finish separately.
-- **Windows** — Unsupported. The ladder: **Expected to work** once the guard amendment, the
-  Windows spawn module, the privacy contract and the CRLF work have landed and `windows-latest` is
-  green and required; **Supported** on its own PASS rows, including guard-denial with Developer-Mode
-  symlinks. Until then nothing here claims a Windows capability, and no row recorded on another OS
-  is read as one.
+- **Windows** — Simulated. No test has run on a Windows machine; the automated suite simulates
+  win32 on macOS. If you run qa-skills on Windows, open an issue with the command, the JSON
+  refusal or output, and your Windows version. A maintainer-verified run on a Windows machine is
+  what moves this row to Expected to work. The ladder: **Expected to work** once the guard
+  amendment, the Windows spawn module, the privacy contract and the CRLF work have landed and
+  `windows-latest` is green and required; **Supported** on its own PASS rows, including
+  guard-denial with Developer-Mode symlinks. No row recorded on another OS is read as a Windows
+  claim. Simulation cannot prove:
+  - the ACL privacy check against real `icacls /save` output and localized hosts;
+  - NTFS case folding beyond Node's, 8.3 short names, junctions and Developer-Mode symlinks;
+  - how `cmd.exe` parses `/d /s /c`;
+  - the JVM's decoding of arguments (non-ASCII test names and paths cannot be used on Windows at
+    all, because qa-skills refuses them by design);
+  - the snapshot owner check, which is POSIX only, where a process running as root can still
+    chmod a foreign file;
+  - the publisher on Windows, where CRLF checkouts can change digests.
 
 ### Trackers
 
@@ -269,7 +286,7 @@ processes; only live runs prove what a real host does.
 
 ### Automated suite
 
-The `node --test` suite (CI: ubuntu-latest, Node 22; `npm test`, `npm run lint:skills`,
+The `node --test` suite (CI configured: ubuntu-latest, Node 22; not run since 2026-11-14; `npm test`, `npm run lint:skills`,
 `npm ci`, `npm run typecheck`) proves script behaviour through public CLI commands and module
 interfaces:
 
@@ -287,8 +304,9 @@ It never runs a live Claude Code host, never drives a real browser, and never ca
 ### Live evidence
 
 Only a recorded live entry moves a support status. A demo, a GIF, an informal observation or a
-simulated-host test changes no status: none of them is kept where a reader can check it, and a
-simulated-host test proves what a script does with synthetic events, not what a host enforces.
+simulated-host test changes no support status above Simulated: none of them is kept where a
+reader can check it, and a simulated-host test proves what a script does with synthetic events,
+not what a host enforces. A simulated-host test can move a row to Simulated and to nothing higher.
 
 A recorded entry is one row of a Markdown table under *Live evidence*, with exactly these columns
 in this order:
@@ -404,6 +422,16 @@ configuration and the detection route recorded. The condition, in these items' w
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | 0.14.0 @ 0a68a48 | 2.1.308 | terminal CLI (local marketplace, distinct name) | macOS 27.2.1 | host-version detection working on the floor version | PASS | 2026-11-16 | [probe run](https://github.com/Kinasr/qa-skills-live-evidence/tree/eeefb4ef/evidence/0.14.0-terminal/detection) |
 | 0.14.0 @ 0a68a48 | 2.1.325 | desktop app (local marketplace, distinct name) | macOS 27.2.1 | host-version detection working on the floor version | PASS | 2026-11-16 | [probe run](https://github.com/Kinasr/qa-skills-live-evidence/tree/eeefb4ef/evidence/0.14.0-desktop/detection) |
+
+- **0.15.0 detection**, 2026-11-24, qa-skills 0.15.0 installed as `qa-skills@qa-skills-local`,
+  macOS 27.2.1, terminal CLI on Claude Code 2.1.308 (`--installed` profile), with
+  `scripts/probe-trust-core.mjs`. `CLAUDE_CODE_EXECPATH` was absolute, `--version` answered
+  `2.1.308 (Claude Code)` and `AI_AGENT` was `claude-code_2-1-308_agent`; `execute plan` took the
+  guarded admission.
+
+| qa-skills revision | Claude Code | Surface | OS | Condition | Outcome | Date | Evidence |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 0.15.0 @ f1a25ff | 2.1.308 | terminal CLI (local marketplace, distinct name) | macOS 27.2.1 | host-version detection working on the floor version | PASS | 2026-11-24 | [probe run](https://github.com/Kinasr/qa-skills-live-evidence/tree/ee9095e5/evidence/0.15.0-terminal/detection) |
 
 #### Live enforcement evidence
 
@@ -614,6 +642,22 @@ Each run adds a row here:
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | 0.14.1 @ 4c3d81f | 2.1.308 | terminal CLI (local marketplace, distinct name) | macOS 27.2.1 | the Tester guard denying a call outside its allow-lists | PASS | 2026-11-16 | [probe run](https://github.com/Kinasr/qa-skills-live-evidence/tree/0fdb5ff9/evidence/0.14.1-terminal/guard-denial) |
 | 0.14.1 @ 4c3d81f | 2.1.325 | desktop app (local marketplace, distinct name) | macOS 27.2.1 | the Tester guard denying a call outside its allow-lists | PASS | 2026-11-16 | [probe run](https://github.com/Kinasr/qa-skills-live-evidence/tree/dc73f90d/evidence/0.14.1-desktop/guard-denial) |
+
+- **0.15.0 terminal re-check**, 2026-11-24, qa-skills 0.15.0 installed as `qa-skills@qa-skills-local`,
+  macOS 27.2.1, against the self-hosted Toolshop fallback on the terminal CLI (Claude Code 2.1.308,
+  `--installed` profile). `agentId` binding was graded by `scripts/probe-trust-core.mjs` at `f1a25ff`;
+  guard denial and browser-artifact placement were re-run and graded at `4d03453` after fixing two
+  probe-harness defects (earlier inconclusive runs are kept beside the passing ones and not
+  counted). The end-to-end row is an ordinary `/qa-skills:qa-execute tc_d68h3nc7 level:ui` Run
+  (`dpdj22g3`). The 0.14.0 hook-crash, hook-timeout and desktop entries stand (no hook registration
+  changes in 0.15.0), and 0.15.1 changes only the probe harness.
+
+| qa-skills revision | Claude Code | Surface | OS | Condition | Outcome | Date | Evidence |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 0.15.0 @ f1a25ff | 2.1.308 | terminal CLI (local marketplace, distinct name) | macOS 27.2.1 | the Tester guard denying a call outside its allow-lists | PASS | 2026-11-24 | [probe run](https://github.com/Kinasr/qa-skills-live-evidence/tree/ee9095e5/evidence/0.15.0-terminal/guard-denial) |
+| 0.15.0 @ f1a25ff | 2.1.308 | terminal CLI (local marketplace, distinct name) | macOS 27.2.1 | a background-launched Tester binding to its Execution (`agentId`) | PASS | 2026-11-24 | [probe run](https://github.com/Kinasr/qa-skills-live-evidence/tree/ee9095e5/evidence/0.15.0-terminal/agentid-binding) |
+| 0.15.0 @ f1a25ff | 2.1.308 | terminal CLI (local marketplace, distinct name) | macOS 27.2.1 | real browser-artifact placement under the Execution directory, confirmed with the real CLI | PASS | 2026-11-24 | [probe run](https://github.com/Kinasr/qa-skills-live-evidence/tree/ee9095e5/evidence/0.15.0-terminal/artifact-placement) |
+| 0.15.0 @ f1a25ff | 2.1.308 | terminal CLI (local marketplace, distinct name) | macOS 27.2.1 | a live Execution end-to-end against a real application | PASS | 2026-11-24 | [Execution record](https://github.com/Kinasr/qa-skills-live-evidence/blob/ee9095e5/evidence/0.15.0-terminal/e2e-run/execution-record.md) |
 
 Recorded:
 

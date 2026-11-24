@@ -2,11 +2,13 @@
 // `fill-password` (ADR-0066): the one secret the wrapper types for the Tester, a Role's password, and
 // what keeps its value out of everything the Tester can read. Nothing here returns the password to a
 // caller that prints it: `spellings` feeds the wrapper's scrub, `readPassword` the one `fill`.
-import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, lstatSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { extname, join } from "node:path";
 import { cliLoginUser } from "./access-note.mjs";
 import { PROBE_TIMEOUT_MS, playwright, sectionsOf } from "./execution-guard.mjs";
 import { readSecret } from "./scout.mjs";
+
+const BINARY_SNAPSHOT_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".zip", ".pdf"]);
 
 /** What the wrapper asks of the element a `fill-password` names; the Tester cannot choose or change it. */
 export const PASSWORD_FIELD_PROBE = "el => el instanceof HTMLInputElement && el.type === 'password'";
@@ -36,15 +38,19 @@ export const hasPasswordSource = (note) => Boolean(note && !note.withheld && cli
 
 /**
  * The password a note's CLI login uses: `{password}`, `{none: true}` when the note has no password
- * source, or `{error}` when the source cannot be read.
+ * source, or `{error, facts}` when the source cannot be read.
  * @param {string} root
  * @param {import("./access.mjs").ShownAccessNote | null | undefined} note
- * @returns {{ password: string, none?: never, error?: never } | { none: true, password?: never, error?: never } | { error: string, password?: never, none?: never }}
+ * @returns {{ password: string, none?: never, error?: never, facts?: never } | { none: true, password?: never, error?: never, facts?: never } | { error: string, facts: Record<string, unknown>, password?: never, none?: never }}
  */
 export function readPassword(root, note) {
   if (!hasPasswordSource(note)) return { none: true };
   const secret = readSecret(root, /** @type {never} */ (note));
-  if (secret.refusal) return { error: String(/** @type {{ error?: unknown }} */ (secret.refusal.json).error ?? "the password could not be read") };
+  if (secret.refusal) {
+    const { ok: _ok, error, ...rest } = /** @type {Record<string, unknown>} */ (secret.refusal.json);
+    const { code: _code, message: _message, ...facts } = rest;
+    return { error: String(error ?? "the password could not be read"), facts };
+  }
   return { password: secret.password };
 }
 
@@ -69,9 +75,12 @@ export function scrubSnapshots(execDir, values) {
   const walk = (at) => {
     for (const name of readdirSync(at)) {
       const file = join(at, name);
-      if (statSync(file).isDirectory()) { walk(file); continue; }
+      const st = lstatSync(file);
+      if (st.isSymbolicLink()) continue;
+      if (st.isDirectory()) { walk(file); continue; }
+      if (!st.isFile() || BINARY_SNAPSHOT_EXTENSIONS.has(extname(file).toLowerCase())) continue;
       const bytes = readFileSync(file);
-      if (!values.some((v) => bytes.includes(v))) continue;
+      if (bytes.includes(0) || !values.some((v) => bytes.includes(v))) continue;
       let text = bytes.toString("utf8");
       for (const v of [...values].sort((a, b) => b.length - a.length)) text = text.split(v).join("<credential>");
       writeFileSync(file, text);

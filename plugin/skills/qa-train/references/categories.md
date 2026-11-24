@@ -31,7 +31,7 @@ the system under test. "Accessibility", "performance" and "localisation" pass; "
 it and ask for the kind of behaviour behind it. The same idea as the Statability Test, read on the
 key, name and meaning.
 
-At the gate, show each proposal and each removal with the effect the check reports. A `statability`
+At the gate, show each proposal and each removal with the effect the check reports. A Statability
 hit on an added or edited entry is a refusal; on an unchanged entry it is a coherence finding to
 put to the engineer.
 
@@ -65,13 +65,13 @@ after: permissions
 
 Pass it to `train check categories --input <file>`:
 
-- **`ok: false`**: fix every `errors` entry and check again. A changed meaning says to retire the
+- **A failed check**: fix every reported error and check again. A changed meaning says to retire the
   key and add a new one; a removal without its key in `retired:` says to add it.
-- **`statability`**: settle each as the gate above says.
-- **`ok: true`** and nothing left unsettled: write the draft, byte for byte, to `path`.
+- **Statability hits**: settle each as the gate above says.
+- **A passing check** and nothing left unsettled: write the draft, byte for byte, to `path`.
 
-The check's `categories` lists the keys added, edited and removed and its `effective` list is the
-walk order the change produces. Close with the added keys, the retired keys, the `changeset` and
+The Categories section lists the keys added, edited and removed, and the Effective Categories
+section is the walk order the change produces. Close with the added keys, the retired keys, the `changeset` and
 the suggested `commit`.
 
 This file is shared information: it is never a command in Training status, and its absence is

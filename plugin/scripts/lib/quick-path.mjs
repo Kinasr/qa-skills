@@ -18,7 +18,7 @@
 import { join, resolve } from "node:path";
 import { clearHandoff, readHandoff, uncommittedKnowledge, writeHandoff } from "./change-handoff.mjs";
 import { commitLine } from "./changeset.mjs";
-import { refuse } from "./impact-json.mjs";
+import { buildQuickCheckJson, refuse } from "./impact-json.mjs";
 import { loadQaAt, repositoryOf, resolveRef } from "./git-tree.mjs";
 import { buildIndex, loadWorkingTree } from "./qa-index.mjs";
 import { parseForecast, reconcile, snapshotOf } from "./rule-edit.mjs";
@@ -121,7 +121,7 @@ function changedRules(root, files) {
   return rulesChangedAcross(then, now).map(({ feature, rule }) => ({ feature, rule }));
 }
 
-// `impact quick-check <feature> --dir <run-dir> --stdin`: the Rule-edit transition (deep-dive's
+// `impact quick-check <feature> --dir <run-dir> --input <path>`: the Rule-edit transition (deep-dive's
 // `reconcile`, called as it is), then the threshold over everything the working tree changed. Over
 // the limit, the handoff payload is written to the run dir.
 /**
@@ -133,7 +133,7 @@ export function checkQuick({ root, dir: named, feature, stdin }) {
   if (open.error) return refuse("run_dir", { reason: open.error });
   const dir = /** @type {string} */ (open.dir);
   const input = parseInput(stdin);
-  if (typeof input === "string") return refuse("quick_input", { reason: input });
+  if (typeof input === "string") return refuse("quick_input", { reason: input, input: "{\"forecast\", \"references\", \"open_questions\"?}" });
   const guard = refuseSuiteSchema(root);
   if (guard) return guard;
 
@@ -173,16 +173,41 @@ export function checkQuick({ root, dir: named, feature, stdin }) {
   const paths = over ? [] : uncommittedKnowledge(root);
   const changeset = { paths, commit: paths.length ? commitLine(paths, `qa(${feature}): /qa-impact checkpoint 1`) : null };
   const plan = `impact plan${features.size === 1 ? ` ${feature}` : ""} --persist --dir ${dir}`;
+  const reconcileData = /** @type {{
+    edited: readonly unknown[],
+    outside_band: readonly unknown[],
+    unedited_changes: readonly unknown[],
+    added: readonly unknown[],
+    retired: readonly unknown[],
+    boundary_check: readonly unknown[],
+    downstream: readonly unknown[],
+    downstream_features: readonly unknown[],
+    next_feature: { command: string } | null,
+    widened: readonly unknown[],
+    forecast: readonly unknown[],
+    change_file: string | null,
+  }} */ (edit.json);
   return {
     exit: 0,
-    json: {
-      ...edit.json,
-      action: "quick-check",
+    json: buildQuickCheckJson({
+      feature,
       dir,
+      edited: reconcileData.edited,
+      outside_band: reconcileData.outside_band,
+      unedited_changes: reconcileData.unedited_changes,
+      added: reconcileData.added,
+      retired: reconcileData.retired,
+      boundary_check: reconcileData.boundary_check,
+      downstream: reconcileData.downstream,
+      downstream_features: reconcileData.downstream_features,
+      next_feature: reconcileData.next_feature,
+      widened: reconcileData.widened,
+      forecast: reconcileData.forecast,
+      change_file: reconcileData.change_file,
       threshold,
       handoff,
       changeset,
       next_step: over ? `/qa-deep-dive ${feature} --dir ${dir}` : `commit the Rule edits (checkpoint 1), then \`${plan}\``,
-    },
+    }),
   };
 }

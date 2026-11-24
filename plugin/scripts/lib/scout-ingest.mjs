@@ -32,14 +32,15 @@
 // A signed-out scout's record (ADR-0065) has no login state and no note: its Observation carries
 // `signed_out: true`, and a `state-load` step is refused as outside its brief. A sign-in page is
 // what it was sent to see, so its `FAILED: login:` line is a plain scout failure, never `login_expired`.
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { credentialIn, stripUrls } from "./credentials.mjs";
-import { checkFile, parse } from "./knowledge-file.mjs";
-import { qaRel, rootConfig } from "./qa-index.mjs";
+import { qaRel } from "./qa-index.mjs";
+import { writeQa } from "./qa-write.mjs";
 import { quote } from "./render.mjs";
 import { openRunDir, readRunFile } from "./run-dir.mjs";
 import { localDate } from "./scan.mjs";
+import { ANY_SCHEMA_VERSION } from "./schema.mjs";
 import { UI_ACTION_CAP, UI_ALLOWED, UI_NARROW, UI_SCROLL_KEYS, loginSteps } from "./scout-prompt.mjs";
 /** @import { RunFileResult } from "./run-dir.mjs" */
 
@@ -161,12 +162,20 @@ export function ingestUi(dir, root) {
     notSeen: report.notSeen,
     signedOut,
   });
-  const checked = checkFile(parse(qaRel(qa, path), body), rootConfig(qa));
-  if (!checked.ok) {
-    return refuse("observation_invalid", `the Observation made from the scout's report fails check-file, so ${AGAIN}`, { errors: checked.errors });
+  const tx = writeQa({
+    root: qa,
+    minSchema: ANY_SCHEMA_VERSION,
+    writes: [{ path: qaRel(qa, path), text: body, absent: true }],
+  });
+  if (!tx.ok) {
+    if (tx.kind === "schema") return tx.refusal;
+    if (tx.kind === "check") {
+      return refuse("observation_invalid", `the Observation made from the scout's report fails check-file, so ${AGAIN}`, {
+        errors: tx.errors.map(({ path: _p, rel: _r, ...rest }) => rest),
+      });
+    }
+    throw new Error(`scout ingest: ${tx.error ?? "failed"}`);
   }
-  mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, body, { flag: "wx" });
   return { exit: 0, json: { ok: true, path, uri: `file:${relative(repo, path).split(sep).join("/")}` } };
 }
 

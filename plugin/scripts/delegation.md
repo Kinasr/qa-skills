@@ -19,8 +19,8 @@ node scan.mjs delegate resolve --cmd <impact|design>
 ```
 
 It names the model each Delegate runs on: a model label, such as `sonnet`, `haiku` or `inherit` (the
-session's own model), which the CLI takes from the Tier the command is bound to. A usage error: show its `error` and stop,
-before anything is dispatched.
+session's own model), which the CLI takes from the Tier the command is bound to. On `ok: false`,
+word each `refusals` entry from `code` and facts and stop, before anything is dispatched.
 
 ## 2. Start the Run
 
@@ -38,7 +38,18 @@ Loop:
 node scan.mjs delegate next --dir <dir>
 ```
 
-- `done: true`: dispatch is over. Go on to the skill's report step.
+- `done: true` and `in_flight` is empty: dispatch is over. Go on to the skill's report step.
+- `dispatch` is empty while `done: false`:
+  - When `in_flight` is non-empty: end the turn without polling and wait for running subagents to
+    return.
+  - When `in_flight` is empty and `wait_ms` is present (cooldown until `next_ready_at`): run one
+    standalone pause command (one plain `node` line with no chaining or variable expansion), then
+    call `delegate next` again; if a residual `wait_ms` returns, pause again until units dispatch
+    or `done: true`:
+
+    ```
+    node -e "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, <wait_ms> + 25)"
+    ```
 - Otherwise, for each item of `dispatch`, spawn one subagent, all of this `next`'s items at once:
   - agent: the item's `agent`, exactly as given, as the subagent type: `qa-skills:qa-judge` or
     `qa-skills:qa-filler`. Spawn each item fresh and non-forked. Never spawn a generic agent, and

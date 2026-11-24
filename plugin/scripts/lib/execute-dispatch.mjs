@@ -10,8 +10,8 @@
 //       a setup-only Role's note shared (shared holders may overlap, never an exclusive one); an
 //       Execution whose notes are held is skipped, not a stop, and an unauthenticated one holds
 //       nothing. Each Execution it starts is opened (`execute open`) and its brief is written to
-//       `executions/<id>/brief.md`. When nothing is in flight and the only thing left is a retry
-//       waiting out its cooldown, it sleeps until the cooldown ends. If opening one Execution finds
+//       `executions/<id>/brief.md`. When nothing is in flight and no paused note holds the queue,
+//       any remaining retry cooldown returns `{ wait_ms, next_ready_at }` without sleeping. If opening one Execution finds
 //       the target `unreachable`, the ones this call already opened in the batch are closed and
 //       Blocked `unreachable` with it (ingest reads that from `dispatch.json`), and the rest of the
 //       queue is tried again. An open refusal that names an Access note (`login_failed`, a missing
@@ -65,40 +65,44 @@
 // (`{<acc>: {mode: "exclusive" | "shared", holders: [id]}}`), `paused`, `retried` (resumed notes)
 // and `skipped`. Cooldowns are real time;
 // QA_SKILLS_DISPATCH_SCALE scales them, which only a test sets.
-import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { UsageError, noArguments, orThrow, requireOption } from "./cli.mjs";
-import { activeDelegate, finished, inFlight, launch, nextReadyAt, POLICY, ready, settle } from "./dispatch.mjs";
+import { UsageError, noArguments, requireOption } from "./cli.mjs";
+import { activeDelegate, cooldownBackoff, finished, inFlight, launch, ready, scaledCooldown, settle } from "./dispatch.mjs";
 import { applySkips, dropAuth, isHelper, pauseNote, skipNote, sweepAuth } from "./execute-auth.mjs";
 import { executionBrief } from "./execute-brief.mjs";
 import { readAutomation } from "./execute-automation.mjs";
 import { executionDecision } from "./execute-chain.mjs";
-import { openActions, execution, plannedRun } from "./execute-open.mjs";
+import { isLocalRefusalCode, openActions } from "./execute-open.mjs";
+/** @import { PlatformContext } from "./platform.mjs" */
+import { execution, plannedRun } from "./execute-plan.mjs";
+import { loadState, saveState } from "./execute-state.mjs";
 import { checkedReport } from "./execution-report.mjs";
 import { executionDir, readGuard } from "./execution-guard.mjs";
-import { refusalsFor } from "./refusal.mjs";
+import { refusalsWithoutLines } from "./refusal.mjs";
 import { admitRun } from "./host-admission.mjs";
-import { readRunFile } from "./run-dir.mjs";
-import { subagentModel } from "./tiers.mjs";
+import { subagentModel } from "./delegates.mjs";
+import { buildSections } from "./report-sections.mjs";
 
 /**
  * @import { CommandAction, CommandContext, CommandResult } from "./cli.mjs"
- * @import { RefusalResult } from "./refusal.mjs"
- * @import { RunFileResult } from "./run-dir.mjs"
- * @import { ExecuteBlocked, ExecuteDispatchState, ExecuteExecution, ExecuteLock, ExecutePausedNote, ExecutePlan, ExecuteSession, ExecuteUnit } from "./execute.mjs"
+ * @import { ExecuteExecution, ExecuteSession } from "./execute-plan.mjs"
+ * @import { ExecuteLock, ExecuteUnit } from "./execute-state.mjs"
  * @import { DispatchedUnit, SettlementOutcome, UnitStatus } from "./dispatch.mjs"
  * @import { ExecutionGuard } from "./execution-guard.mjs"
+ * @import { ReportSection, SectionSpec } from "./report-sections.mjs"
  */
 
 /**
- * What ingest needs of a dispatched unit.
- * @typedef {{
- *   blocked?: ExecuteBlocked,
- *   spent?: boolean,
- *   returned?: boolean,
- *   reply?: string,
- * }} DispatchMark
+ * Ordered section registry for `execute next`.
+ * @type {readonly SectionSpec[]}
  */
+export const NEXT_SECTION_ORDER = [
+  { id: "blocked", label: "Blocked before starting" },
+  { id: "paused", label: "Paused Access notes" },
+];
+
+const STATUSES = ["ok", "failed", "timeout", "refused", "quota"];
 
 /**
  * Result of executionBrief from unadopted execute-brief.mjs.
@@ -137,94 +141,7 @@ import { subagentModel } from "./tiers.mjs";
  * }} CheckedReportResult
  */
 
-const { stop } = refusalsFor({
-  not_confirmed: "The Run is not confirmed; confirm the plan before starting Executions.",
-  not_in_flight: "The Execution is not in flight; record each attempt `execute next` started, once.",
-  not_paused: "That Access note is not paused; resume only a note `execute next` listed under `paused`.",
-});
-
-const STATE = "dispatch.json";
-const STATUSES = ["ok", "failed", "timeout", "refused", "quota"];
-
-/**
- * @param {string} runDir
- * @returns {ExecuteDispatchState}
- */
-function load(runDir) {
-  /** @type {RunFileResult<ExecuteDispatchState>} */
-  const read = readRunFile(runDir, STATE, { by: "execute confirm", restart: "execute plan", missing: `no ${STATE} in ${runDir}: run \`execute confirm\` first` });
-  if (read.error) throw new UsageError(read.error);
-  const state = /** @type {ExecuteDispatchState} */ (read.value);
-  for (const field of ["paused", "retried", "skipped"]) (/** @type {Record<string, unknown>} */ (state))[field] ??= [];
-  return state;
-}
-
-// Written whole through a rename, so a call that dies never leaves half a state behind.
-/**
- * @param {string} runDir
- * @param {ExecuteDispatchState} state
- * @returns {void}
- */
-function save(runDir, state) {
-  const tmp = join(runDir, `${STATE}.tmp`);
-  writeFileSync(tmp, `${JSON.stringify(state, null, 2)}\n`);
-  renameSync(tmp, join(runDir, STATE));
-}
-
-// What ingest needs of the Run's dispatch: `Map<execution id, {blocked?, spent?, returned?, reply?}>`. `blocked` is
-// the `{reason, why}` a unit was Blocked with here (`unreachable`); `spent` marks an Execution whose
-// retries ran out without it ever acting or reporting (not stopped by a tripped breaker), which is
-// Blocked "no report" rather than not run; `returned` marks one whose last Tester was dispatched and
-// came back, whatever its reply, so a missing report is Blocked rather than not run even with no
-// guarded call (a failed guard hook looks like that); `reply` is the Tester's recorded text for a
-// no-report Execution, alongside `spent` when its retries were spent. Empty when the Run never reached `dispatch.json`.
-/**
- * @param {string} runDir
- * @returns {Map<string, DispatchMark>}
- */
-export function dispatchMarks(runDir) {
-  /** @type {Map<string, DispatchMark>} */
-  const marks = new Map();
-  if (!existsSync(join(runDir, STATE))) return marks;
-  /** @type {RunFileResult<ExecuteDispatchState>} */
-  const read = readRunFile(runDir, STATE, { by: "execute confirm", restart: "execute plan" });
-  if (read.error || !Array.isArray(read.value?.units)) return marks;
-  const { units, stopped } = /** @type {ExecuteDispatchState} */ (read.value);
-  for (const u of units) {
-    if (u.blocked) marks.set(u.id, { blocked: u.blocked });
-    else {
-      /** @type {DispatchMark} */
-      const mark = {};
-      if (u.status === "failed" && !u.final && !stopped) mark.spent = true;
-      if (u.status !== "queued" && u.status !== "in_flight" && u.attempts?.some((a) => a.settled !== undefined)) mark.returned = true;
-      if (u.reply) mark.reply = u.reply;
-      if (Object.keys(mark).length) marks.set(u.id, mark);
-    }
-  }
-  return marks;
-}
-
-// Removes every reply a record kept in `dispatch.json`, so the raw text does not outlive the Run.
-// Absent or unreadable state, or no unit holding a reply, writes nothing.
-/**
- * @param {string} runDir
- * @returns {void}
- */
-export function clearReplies(runDir) {
-  if (!existsSync(join(runDir, STATE))) return;
-  /** @type {RunFileResult<ExecuteDispatchState>} */
-  const read = readRunFile(runDir, STATE, { by: "execute confirm", restart: "execute plan" });
-  if (read.error || !Array.isArray(read.value?.units)) return;
-  const state = /** @type {ExecuteDispatchState} */ (read.value);
-  let cleared = false;
-  for (const u of state.units) {
-    if (u.reply !== undefined) {
-      delete u.reply;
-      cleared = true;
-    }
-  }
-  if (cleared) save(runDir, state);
-}
+const { stop } = refusalsWithoutLines();
 
 // The Access notes an Execution holds and how: `Map<acc, "exclusive" | "shared">`. A case Role's note is
 // exclusive; a setup-only Role's note is shared unless the case also acts as that note's Role. A helper
@@ -284,25 +201,19 @@ function release(locks, id) {
  */
 const reset = (runDir, id) => rmSync(executionDir(runDir, id), { recursive: true, force: true });
 
-/**
- * @param {number} ms
- * @returns {Promise<void>}
- */
-const sleep = (ms) => new Promise((r) => setTimeout(r, Math.max(0, ms)));
-
 // Opens each unit of `batch` in order and writes its brief; stops at the first refusal. Returns
 // `{opened}` or `{opened, refusal}`, `opened` the units that are now open.
 /**
  * @param {Array<DispatchedUnit<ExecuteUnit>>} batch
- * @param {{ runDir: string, root?: string, env: Record<string, string | undefined> }} context
+ * @param {{ runDir: string, root?: string, env: Record<string, string | undefined>, platformContext?: PlatformContext }} context
  * @returns {{ opened: Array<DispatchedUnit<ExecuteUnit>>, refusal?: CommandResult }}
  */
-function openBatch(batch, { runDir, root, env }) {
+function openBatch(batch, { runDir, root, env, platformContext }) {
   /** @type {Array<DispatchedUnit<ExecuteUnit>>} */
   const opened = [];
   for (const unit of batch) {
     if (unit.attempts.length) reset(runDir, unit.id);
-    const result = /** @type {CommandResult} */ (openActions.open.run([], { dir: runDir, root, execution: unit.id, env }));
+    const result = /** @type {CommandResult} */ (openActions.open.run([], { dir: runDir, root, execution: unit.id, env, ...(platformContext && { platformContext }) }));
     if (result.exit !== 0) return { opened, refusal: result };
     const brief = /** @type {ExecutionBriefResult} */ (executionBrief(runDir, unit.id, { root }));
     if (brief.refusal) return { opened, refusal: brief.refusal };
@@ -314,12 +225,12 @@ function openBatch(batch, { runDir, root, env }) {
 
 /**
  * @param {Array<DispatchedUnit<ExecuteUnit>>} units
- * @param {{ runDir: string, env: Record<string, string | undefined> }} context
+ * @param {{ runDir: string, env: Record<string, string | undefined>, platformContext?: PlatformContext }} context
  * @returns {void}
  */
-const closeAll = (units, { runDir, env }) => {
+const closeAll = (units, { runDir, env, platformContext }) => {
   for (const u of units) {
-    openActions.close.run([], { dir: runDir, execution: u.id, env });
+    openActions.close.run([], { dir: runDir, execution: u.id, env, ...(platformContext && { platformContext }) });
     reset(runDir, u.id);
   }
 };
@@ -327,15 +238,16 @@ const closeAll = (units, { runDir, env }) => {
 /**
  * @param {string[]} args
  * @param {CommandContext} context
- * @returns {Promise<CommandResult>}
+ * @returns {CommandResult}
  */
-async function next(args, { dir, root, env }) {
+function next(args, { dir, root, env, platformContext: rawPlatformContext }) {
+  const platformContext = /** @type {PlatformContext | undefined} */ (rawPlatformContext);
   noArguments("execute next", args, "--dir <run-dir> and --root <qa-dir>");
   const { pinned, runDir } = plannedRun(dir, "next");
   if (!pinned.confirmed) return stop("not_confirmed", { run: pinned.run });
-  const host = admitRun(pinned, { env });
+  const host = admitRun(pinned, { env: platformContext?.env ?? env });
   if (host.refusal) return host.refusal;
-  const state = load(runDir);
+  const state = loadState(runDir);
   const byId = new Map(pinned.executions.map((e) => [e.id, e]));
   // The Automation decides the Execution: a Passed, Flaky or Blocked case, a case marked
   // `execution_skipped` at plan time, and a case whose due Automation has no result all finish
@@ -349,7 +261,7 @@ async function next(args, { dir, root, env }) {
       unit.final = true;
     }
   }
-  save(runDir, state);
+  saveState(runDir, state);
   /** @type {Array<{ id: string, reason: string }>} */
   const blocked = [];
 
@@ -373,29 +285,26 @@ async function next(args, { dir, root, env }) {
       return true;
     };
     const batch = ready(state, now, admit);
-    if (!batch.length && !inFlight(state).length) {
-      const at = nextReadyAt(state);
-      if (at !== null && at > now) {
-        await sleep(at - now);
-        continue;
-      }
-    }
 
-    const { opened, refusal } = openBatch(batch, { runDir, root, env });
+    const { opened, refusal } = openBatch(batch, { runDir, root, env, platformContext });
     if (refusal) {
-      closeAll(/** @type {Array<DispatchedUnit<ExecuteUnit>>} */ ([...opened, batch[opened.length]].filter(Boolean)), { runDir, env });
+      closeAll(/** @type {Array<DispatchedUnit<ExecuteUnit>>} */ ([...opened, batch[opened.length]].filter(Boolean)), { runDir, env, platformContext });
       const first = (/** @type {Array<{ access?: unknown, code?: unknown }> | undefined} */ (refusal.json.refusals))?.[0];
-      if (typeof first?.access === "string" && first.code !== "unreachable") {
+      if (typeof first?.access === "string" && typeof first.code === "string" && !isLocalRefusalCode(first.code)) {
         if (state.retried.includes(first.access)) {
           for (const id of (/** @type {ApplySkipsResult} */ (skipNote(state, byId, first.access))).blocked) {
             blocked.push({ id, reason: "no-access" });
             reset(runDir, id);
           }
         } else pauseNote(state, byId, first.access, first);
-        save(runDir, state);
+        sweepAuth(runDir, state, byId);
+        saveState(runDir, state);
         continue;
       }
-      if (first?.code !== "unreachable") return refusal;
+      if (first?.code !== "unreachable") {
+        sweepAuth(runDir, state, byId);
+        return refusal;
+      }
       const why = `The target ${pinned.target.origin} could not be reached.`;
       for (const u of /** @type {Array<DispatchedUnit<ExecuteUnit>>} */ ([...opened, batch[opened.length]])) {
         u.status = "failed";
@@ -404,7 +313,7 @@ async function next(args, { dir, root, env }) {
         reset(runDir, u.id);
         blocked.push({ id: u.id, reason: "unreachable" });
       }
-      save(runDir, state);
+      saveState(runDir, state);
       continue;
     }
 
@@ -414,9 +323,31 @@ async function next(args, { dir, root, env }) {
       hold(state.locks, unit.id, needs(/** @type {ExecuteExecution} */ (byId.get(unit.id)), state.skipped));
       return { id: unit.id, brief: join(executionDir(runDir, unit.id), "brief.md"), model };
     });
-    save(runDir, state);
+    saveState(runDir, state);
     sweepAuth(runDir, state, byId);
-    return { exit: 0, json: { action: "next", ok: true, start, paused: state.paused, done: finished(state), in_flight: inFlight(state).length, ...(blocked.length && { blocked }), ...(host.unguarded && { unguarded: true }) } };
+    /** @type {ReportSection[]} */
+    const sections = buildSections(NEXT_SECTION_ORDER, [
+      { id: "blocked", items: blocked },
+      { id: "paused", items: state.paused },
+    ]);
+    const done = finished(state);
+    const inFlightCount = inFlight(state).length;
+    const backoff = start.length === 0 && inFlightCount === 0 && !done && state.paused.length === 0
+      ? cooldownBackoff(state, now)
+      : null;
+    return {
+      exit: 0,
+      json: {
+        action: "next",
+        ok: true,
+        start,
+        done,
+        in_flight: inFlightCount,
+        ...(backoff ?? {}),
+        sections,
+        ...(host.unguarded && { unguarded: true }),
+      },
+    };
   }
 }
 
@@ -425,7 +356,8 @@ async function next(args, { dir, root, env }) {
  * @param {CommandContext} context
  * @returns {CommandResult}
  */
-function recordAttempt(args, { dir, execution: id, status, "reason-file": reasonFile, env }) {
+function recordAttempt(args, { dir, execution: id, status, "reason-file": reasonFile, env, platformContext: rawPlatformContext }) {
+  const platformContext = /** @type {PlatformContext | undefined} */ (rawPlatformContext);
   noArguments("execute record", args, "--dir <run-dir>, --execution <id>, --status <status> and [--reason-file <path>]");
   requireOption("execute record", id, "--execution <id>", "an id `execute next` started");
   if (status === undefined || !STATUSES.includes(/** @type {string} */ (status))) throw new UsageError(`execute record needs --status, one of ${STATUSES.join(", ")}`);
@@ -433,9 +365,9 @@ function recordAttempt(args, { dir, execution: id, status, "reason-file": reason
   if (found.refusal) return found.refusal;
   const { pinned, ex, runDir } = found;
   if (!pinned.confirmed) return stop("not_confirmed", { run: pinned.run });
-  const state = load(runDir);
+  const state = loadState(runDir);
   const unit = state.units.find((u) => u.id === id);
-  if (unit?.status !== "in_flight") return stop("not_in_flight", { execution: id });
+  if (unit?.status !== "in_flight") return stop("not_in_flight", { execution: id, next: "execute next" });
 
   // The reply is the Tester's; a refused record above leaves its file in place to answer again.
   /** @type {string | undefined} */
@@ -449,7 +381,7 @@ function recordAttempt(args, { dir, execution: id, status, "reason-file": reason
     rmSync(reasonFile, { force: true });
   }
 
-  openActions.close.run([], { dir: runDir, execution: /** @type {string} */ (id), env });
+  openActions.close.run([], { dir: runDir, execution: /** @type {string} */ (id), env, ...(platformContext && { platformContext }) });
   const execDir = executionDir(runDir, /** @type {string} */ (id));
   const guard = readGuard(execDir);
   const used = Number.isSafeInteger(guard?.used) && /** @type {ExecutionGuard} */ (guard).used > 0 ? /** @type {ExecutionGuard} */ (guard).used : 0;
@@ -462,14 +394,13 @@ function recordAttempt(args, { dir, execution: id, status, "reason-file": reason
     status: /** @type {string} */ (status), error_kind: status === "ok" ? null : status === "failed" ? "other" : /** @type {string} */ (status), usable,
     ...(!usable && { retryable: used === 0 && !stopped }),
   };
-  const scale = Number(env.QA_SKILLS_DISPATCH_SCALE);
-  const announcements = settle(state, unit, outcome, Date.now(), POLICY.cooldown_ms * (Number.isFinite(scale) && scale > 0 ? scale : 1));
+  const announcements = settle(state, unit, outcome, Date.now(), scaledCooldown(env));
   release(state.locks, /** @type {string} */ (id));
   const retry = (/** @type {UnitStatus} */ (unit.status)) === "queued";
   if (!retry && typeof reason === "string" && reason.trim()) unit.reply = reason;
   else delete unit.reply;
   if (retry) reset(runDir, /** @type {string} */ (id));
-  save(runDir, state);
+  saveState(runDir, state);
   sweepAuth(runDir, state, new Map(pinned.executions.map((e) => [e.id, e])));
   return {
     exit: 0,
@@ -492,8 +423,8 @@ function resumeNote(args, { dir, note: acc, skip }) {
   requireOption("execute resume", acc, "--note <acc>", "a note `execute next` listed under `paused`");
   const { pinned, runDir } = plannedRun(dir, "resume");
   if (!pinned.confirmed) return stop("not_confirmed", { run: pinned.run });
-  const state = load(runDir);
-  if (!state.paused.some((p) => p.acc === acc)) return stop("not_paused", { note: acc, paused: state.paused.map((p) => p.acc) });
+  const state = loadState(runDir);
+  if (!state.paused.some((p) => p.acc === acc)) return stop("not_paused", { note: acc, paused: state.paused.map((p) => p.acc), next: "execute next" });
   const byId = new Map(pinned.executions.map((e) => [e.id, e]));
   /** @type {string[]} */
   let blocked = [];
@@ -507,7 +438,7 @@ function resumeNote(args, { dir, note: acc, skip }) {
     state.retried.push(/** @type {string} */ (acc));
     dropAuth(runDir, /** @type {string} */ (acc));
   }
-  save(runDir, state);
+  saveState(runDir, state);
   sweepAuth(runDir, state, byId);
   return { exit: 0, json: { action: "resume", ok: true, note: acc, skipped: skip === true, blocked: blocked.map((id) => ({ id, reason: "no-access" })), omitted, paused: state.paused } };
 }

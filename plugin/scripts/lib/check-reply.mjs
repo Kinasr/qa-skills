@@ -562,11 +562,12 @@ export function lastJsonBlock(reply) {
   return { text: last.text };
 }
 
-// The command line's `check-reply <judge|design> <reply-path | --stdin> --brief <brief-json>`
+// The command line's `check-reply <judge|design> <reply-path | --input <path>> --brief <brief-json>`
 // (scripts/scan.mjs). Exit 0 if the reply is usable, 1 if not.
 /**
  * The options the command line resolves for one call: `brief`, the `--brief <brief-json>` path
- * when given, and `stdin`, the reply's reader when `--stdin` was given, else null.
+ * when given, and `stdin`, the reply's reader when `--input <path>` or `--stdin` was given, else
+ * null.
  * @typedef {object} CheckReplyContext
  * @property {string} [brief]
  * @property {(() => string) | null} stdin
@@ -584,7 +585,7 @@ export function lastJsonBlock(reply) {
  */
 export const command = {
   options: { brief: "value", stdin: "flag" },
-  usage: "<judge|design> <reply-path | --stdin> --brief <brief-json>",
+  usage: "<judge|design> <reply-path | --input <path>> --brief <brief-json>",
   run([contract, ...rest], { brief, stdin }) {
     if (stdin ? rest.length !== 0 : rest.length !== 1) throw new UsageError("check-reply takes a contract and exactly one <reply-path>, or --input <file> or --stdin");
     if (brief === undefined) throw new UsageError("check-reply needs --brief <brief-json>, the JSON `brief` printed for this unit");

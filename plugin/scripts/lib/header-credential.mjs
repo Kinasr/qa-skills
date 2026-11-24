@@ -3,23 +3,54 @@
 import { credentialSource, headerCredential, isHeaderCredentialSource } from "./access-note.mjs";
 import { accessNotes } from "./access.mjs";
 import { authKeyOf } from "./auth-template.mjs";
-import { authHome, resolveAuthKey, resolveCredential } from "./credential-source.mjs";
+import { authFiles, resolveAuthKey, resolveCredential } from "./credential-source.mjs";
 import { ACCESS_TRAIN_KEY } from "./schema.mjs";
 import { trainFile } from "./training.mjs";
 
-/** @type {Record<string, string>} */
-export const HEADER_CREDENTIAL_REFUSALS = {
-  header_credential_invalid: "The Access note needs a valid Header credential and an env:NAME or auth:KEY source.",
-  header_credential_missing: "The Access note's Header credential source is missing or empty.",
-  header_credential_required: "This Credential variant requires a Header credential on the session's Access note.",
-  expired_credential_missing: "The expired variant requires an expired_via source with a nonempty value.",
-  expired_credential_invalid: "The expired source requires a Header credential and an env:NAME or auth:KEY source.",
-};
-
 /** @import { AccessNote } from "./access-note.mjs" */
+/** @import { CredentialSourceRefusal } from "./credential-source.mjs" */
 /** @typedef {{ header: string, scheme?: string, value: string }} ResolvedHeaderCredential */
-/** @typedef {{ code: string, message: string, gitignore_line?: string }} HeaderRefusal */
+/**
+ * @typedef {{
+ *   code: string,
+ *   field?: string,
+ *   key?: string,
+ *   file?: string,
+ *   checkout?: string,
+ *   env?: string,
+ *   gitignore_line?: string,
+ *   header_via?: unknown,
+ *   expired_via?: unknown,
+ *   reason?: string,
+ *   errno?: string,
+ *   next?: string,
+ *   access?: string,
+ * }} HeaderRefusal
+ */
 /** @typedef {{ credential: ResolvedHeaderCredential | null, refusal?: never } | { credential?: never, refusal: HeaderRefusal }} HeaderResolution */
+
+/**
+ * Strip prose from a header or credential-source refusal, leaving structured fact fields only.
+ * @param {HeaderRefusal | CredentialSourceRefusal} refusal
+ * @param {Record<string, unknown>} [extra]
+ * @returns {Record<string, unknown>}
+ */
+export function headerRefusalFacts(refusal, extra = {}) {
+  const { code: _code, message: _message, ...facts } = /** @type {Record<string, unknown>} */ (/** @type {unknown} */ (refusal));
+  return { ...facts, ...extra };
+}
+
+/**
+ * @param {CredentialSourceRefusal} refusal
+ * @returns {HeaderRefusal}
+ */
+const fromCredentialRefusal = (refusal) => ({
+  code: refusal.code,
+  ...(refusal.file && { file: refusal.file }),
+  ...(refusal.checkout && { checkout: refusal.checkout }),
+  ...(refusal.key && { key: refusal.key }),
+  ...(refusal.gitignore_line && { gitignore_line: refusal.gitignore_line }),
+});
 
 // `env:NAME` through the environment and `.env`, `auth:KEY` through the Auth file (ADR-0060).
 /**
@@ -38,12 +69,16 @@ const resolveSource = (root, { name, source }) => (source === "auth" ? resolveAu
 export function readHeaderCredential(root, note) {
   if (note?.header_via === undefined) return { credential: null };
   const metadata = headerCredential(note);
-  if (!metadata) return { refusal: { code: "header_credential_invalid", message: HEADER_CREDENTIAL_REFUSALS.header_credential_invalid } };
+  if (!metadata) return { refusal: { code: "header_credential_invalid", field: "header_via", header_via: note.header_via } };
   const resolved = resolveSource(root, metadata);
-  if (resolved.refusal) return { refusal: resolved.refusal };
+  if (resolved.refusal) return { refusal: fromCredentialRefusal(resolved.refusal) };
   if (resolved.value === null) {
-    const where = metadata.source === "auth" ? ` Add \`${metadata.name}=\` to ${authHome(root)}.` : "";
-    return { refusal: { code: "header_credential_missing", message: `${HEADER_CREDENTIAL_REFUSALS.header_credential_missing}${where}` } };
+    if (metadata.source === "auth") {
+      const files = authFiles(root);
+      const home = files[files.length - 1];
+      return { refusal: { code: "header_credential_missing", key: metadata.name, file: home.rel, checkout: home.checkout } };
+    }
+    return { refusal: { code: "header_credential_missing", env: metadata.name } };
   }
   return { credential: { header: metadata.header, ...(metadata.scheme && { scheme: metadata.scheme }), value: resolved.value } };
 }
@@ -58,9 +93,11 @@ export function readHeaderCredential(root, note) {
 export function readExpiredHeaderCredential(root, note) {
   if (note?.expired_via === undefined) return { credential: null };
   const metadata = headerCredential(note);
-  if (!metadata || !isHeaderCredentialSource(note.expired_via)) return { refusal: { code: "expired_credential_invalid", message: HEADER_CREDENTIAL_REFUSALS.expired_credential_invalid } };
+  if (!metadata || !isHeaderCredentialSource(note.expired_via)) {
+    return { refusal: { code: "expired_credential_invalid", field: metadata ? "expired_via" : "header_via", ...(metadata ? { expired_via: note.expired_via } : { header_via: note.header_via }) } };
+  }
   const resolved = resolveSource(root, credentialSource(note.expired_via));
-  if (resolved.refusal) return { refusal: resolved.refusal };
+  if (resolved.refusal) return { refusal: fromCredentialRefusal(resolved.refusal) };
   return { credential: resolved.value === null ? null : { header: metadata.header, ...(metadata.scheme && { scheme: metadata.scheme }), value: resolved.value } };
 }
 
@@ -112,16 +149,14 @@ export function injectHeader(headers, credential) {
 
 /**
  * The environment an Automation runs in: `env`, plus each Header credential the target's Access notes
- * name as `auth:KEY` (`header_via`, `expired_via`), resolved from the Auth file, so a test that reads
- * the variable the codegen brief names finds it. A name `env` already holds wins (a CI secret), and a
- * key that does not resolve stays unset, as an unset `env:` variable does. The CLI masks no `env:`
- * Header value in the runner output it records, so this adds none.
- * @param {string} root The .qa directory.
+ * name as `auth:KEY` (`header_via`, `expired_via`), resolved from the Auth file without overwriting
+ * existing CI secrets, alongside any `.qa/auth` refusal encountered so callers fail closed.
+ * @param {string} root The `.qa` directory.
  * @param {string} origin The Run's target origin.
  * @param {Record<string, string | undefined>} env
- * @returns {Record<string, string | undefined>}
+ * @returns {{ env: Record<string, string | undefined>, refusal: CredentialSourceRefusal | null }}
  */
-export function withAuthHeaderEnv(root, origin, env) {
+export function resolveAuthHeaderEnv(root, origin, env) {
   const file = trainFile(root, ACCESS_TRAIN_KEY);
   const sameOrigin = (/** @type {unknown} */ m) => {
     if (typeof m !== "string" || !m.startsWith("url:")) return false;
@@ -132,9 +167,21 @@ export function withAuthHeaderEnv(root, origin, env) {
   /** @type {Record<string, string | undefined>} */
   const out = { ...env };
   for (const key of new Set(keys)) {
-    if (key === null || out[key] !== undefined) continue;
-    const { value } = resolveAuthKey(root, key);
-    if (value) out[key] = value;
+    if (key === null) continue;
+    const { value, refusal } = resolveAuthKey(root, key);
+    if (refusal) return { env: { ...env }, refusal };
+    if (out[key] === undefined && value) out[key] = value;
   }
-  return out;
+  return { env: out, refusal: null };
+}
+
+/**
+ * Env with any same-origin `auth:` Header credential entries added (preserving existing keys).
+ * @param {string} root
+ * @param {string} origin
+ * @param {Record<string, string | undefined>} env
+ * @returns {Record<string, string | undefined>}
+ */
+export function withAuthHeaderEnv(root, origin, env) {
+  return resolveAuthHeaderEnv(root, origin, env).env;
 }

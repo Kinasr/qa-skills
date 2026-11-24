@@ -102,7 +102,7 @@ export const isMechanicalFinding = (finding) => findingOrigin(finding) === "mech
  * A stored finding on a case, with its dismissal status.
  * @typedef {{
  *   kind: string,
- *   status: "dismissed" | "open",
+ *   status: "dismissed" | "holds" | "open",
  *   evidence?: unknown,
  *   rests_on?: unknown,
  *   subject?: unknown,
@@ -153,6 +153,19 @@ export const isMechanicalFinding = (finding) => findingOrigin(finding) === "mech
  */
 
 /**
+ * Resolve stored finding lifecycle status aligned with `isOpenFinding` and Scan's dismissal evaluation.
+ * @param {Record<string, unknown>} finding
+ * @param {readonly DismissalFact[]} dismissals
+ * @returns {"dismissed" | "holds" | "open"}
+ */
+function findingStatus(finding, dismissals) {
+  const dismissal = isMap(finding.dismissed) ? /** @type {DismissalFact[]} */ (dismissals).shift() : null;
+  if (dismissal?.status === "holds") return "dismissed";
+  if (isMap(finding.holds)) return "holds";
+  return "open";
+}
+
+/**
  * @param {HistoryDismissalsSource} history
  * @param {StoredFindingFile} file
  * @param {StoredFindingEntry} entry
@@ -163,8 +176,7 @@ export function storedCaseFindings(history, file, entry) {
   return (Array.isArray(entry.data.finding) ? entry.data.finding : []).filter(isMap).map((finding) => {
     // History emits Dismissals in stored order, including findings of other kinds.
     // Pair by occurrence: a kind and pin may match while the supporting Rules differ.
-    const dismissal = isMap(finding.dismissed) ? dismissals.shift() : null;
-    return { kind: /** @type {string} */ (finding.kind), status: dismissal?.status === "holds" ? "dismissed" : "open",
+    return { kind: /** @type {string} */ (finding.kind), status: findingStatus(finding, dismissals),
       evidence: finding.evidence, rests_on: finding.rests_on, file: file.rel, line: entry.keyLines.finding ?? entry.blockLine ?? entry.line };
   });
 }
@@ -180,8 +192,7 @@ export function storedFeatureFindings(history, file) {
   const dismissals = history.dismissals.filter((d) => d.file === file.rel);
   return (Array.isArray(file.data.finding) ? file.data.finding : []).filter(isMap).map((finding) => {
     // History emits the Dismissals of a Feature's findings in stored order.
-    const dismissal = isMap(finding.dismissed) ? dismissals.shift() : null;
-    return { kind: /** @type {string} */ (finding.kind), status: dismissal?.status === "holds" ? "dismissed" : "open",
+    return { kind: /** @type {string} */ (finding.kind), status: findingStatus(finding, dismissals),
       evidence: finding.evidence, rests_on: finding.rests_on, subject: finding.subject_key ?? finding.rule,
       file: file.rel, line: file.keyLines.finding ?? file.frontmatterLine };
   });

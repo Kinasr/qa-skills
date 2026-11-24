@@ -402,7 +402,7 @@ export const unlanded = {
     return (ctx.unlandedItems = [...suites, ...cases]);
   },
   apply(ctx, item, plan) {
-    if (!item.resolution) return { code: "needs_edit" };
+    if (!item.resolution) return { code: "needs_edit", field: "resolution" };
     if (item.resolution === "retired_by_hand") {
       (plan.unlandedNotes ??= []).push({ code: "unlanded_retired_by_hand", key: item.key });
       return null;
@@ -411,7 +411,7 @@ export const unlanded = {
     // An Unlanded Suite's items come first on the Card, so its Attach is planned before its cases.
     if (!suite && item.unlanded_suite && item.feature == null) item = { ...item, feature: plan.suiteAttached?.get(item.unlanded_suite) ?? null };
     if (item.resolution === "dismiss") {
-      if (!/^human:[^\s"\\]+$/.test(item.by ?? "")) return { code: "not_human" };
+      if (!/^human:[^\s"\\]+$/.test(item.by ?? "")) return { code: "not_human", format: "human:<name>" };
       const file = featureFile(/** @type {Parameters<typeof featureFile>[0]} */ (ctx.index), /** @type {string} */ (item.feature));
       if (!file) return { code: "needs_edit", field: "feature" };
       const head = resolveRef(ctx.repo, "HEAD");
@@ -428,15 +428,15 @@ export const unlanded = {
       return null;
     }
     if (suite) {
-      if (item.resolution !== "attach") return { code: "bad_resolution" };
+      if (item.resolution !== "attach") return { code: "bad_resolution", allowed: ["attach", "retired_by_hand", "dismiss"] };
       if (!item.feature) return { code: "needs_edit", field: "feature" };
       const problem = attachUnlandedSuite(/** @type {Parameters<typeof attachUnlandedSuite>[0]} */ (/** @type {unknown} */ (ctx)), item.feature, item.key, /** @type {Parameters<typeof attachUnlandedSuite>[3]} */ (/** @type {unknown} */ (plan)), item.n);
       if (problem) return problem;
       (plan.suiteAttached ??= new Map()).set(item.key, item.feature);
       return null;
     }
-    if (item.resolution !== "intake") return { code: "bad_resolution" };
-    if (!item.summary) return { code: "intake_summary_missing", key: item.key };
+    if (item.resolution !== "intake") return { code: "bad_resolution", allowed: ["intake", "retired_by_hand", "dismiss"] };
+    if (!item.summary) return { code: "intake_summary_missing", key: item.key, next: "fetch again after a person supplies a summary" };
     const decl = scenarioDecl(ctx, item.scenario);
     if (!decl && !plan.placed.has(/** @type {string} */ (item.scenario))) {
       if (ctx.index.tracker.resolve(/** @type {string} */ (item.scenario)).status === "retired") return { code: "retired_intake_scenario", key: item.scenario };

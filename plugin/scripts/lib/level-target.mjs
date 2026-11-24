@@ -144,33 +144,6 @@ export function hasUnmappedSplit(resolution, targets) {
 }
 
 /**
- * Default refusal lines shared by commands that enforce Level target resolution.
- * @type {{ unmapped_levels: string, spanning_targets: string }}
- */
-export const LEVEL_TARGET_REFUSALS = {
-  unmapped_levels: "Add `level_targets` to `.qa/project.md` so every planned Test level names its Target.",
-  spanning_targets: "The selection spans multiple Level targets; run one command per target.",
-};
-
-/**
- * Formats the refusal `line` for `unmapped_levels` or `spanning_targets` from its structured
- * fields, or returns `null` when `code` or its fields do not match.
- * @param {string} code
- * @param {Record<string, unknown>} data
- * @returns {string | null}
- */
-export function levelTargetRefusalLine(code, data) {
-  if (code === "unmapped_levels" && Array.isArray(data.levels) && Array.isArray(data.targets) && typeof data.suggested_line === "string") {
-    return `Planned levels (${data.levels.join(", ")}) have no \`level_targets\` entry among targets (${data.targets.join(", ")}). Add to \`.qa/project.md\`: ${data.suggested_line} (or pass \`target:<slug>\`).`;
-  }
-  if (code === "spanning_targets" && Array.isArray(data.targets) && Array.isArray(data.commands)) {
-    const cmds = /** @type {Array<{ command: string }>} */ (data.commands);
-    return `Selection spans multiple Level targets (${data.targets.join(", ")}). Run one command per target:\n${cmds.map((c) => `  ${c.command}`).join("\n")}`;
-  }
-  return null;
-}
-
-/**
  * Builds the structured fields and suggested `level_targets` line for `unmapped_levels`.
  * @param {LevelTargetResolution} resolution
  * @param {Record<string, string>} targets

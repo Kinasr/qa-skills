@@ -63,22 +63,23 @@
 // `scout-ui.report.md` in the run dir, which `scout ingest` reads back. Every refusal prints
 // `{ok: false, reason, error}` and exits 1; a usage error is a thrown `UsageError` (lib/cli.mjs).
 import { existsSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { accessFor, noteReaches, rolesCoveringIn } from "./access.mjs";
-import { cliLoginUser, credentialSource, HEADER_VIA, PASSWORD_VIA } from "./access-note.mjs";
+import { cliLoginUser, credentialSource, HEADER_VIA, isRepoRelativePath, PASSWORD_VIA } from "./access-note.mjs";
+import { runGit } from "./git.mjs";
+import { isContained, resolvesInside } from "./paths.mjs";
 import { authHome, checkoutRoots, resolveAuthKey, resolveCredential } from "./credential-source.mjs";
 import { orThrow, SCAN_CLI, UsageError, usageOf } from "./cli.mjs";
 import { rootConfig } from "./qa-index.mjs";
 import { newRunDir } from "./run-dir.mjs";
-import { subagentModel, tierOf } from "./tiers.mjs";
+import { subagentModel, tierOf } from "./delegates.mjs";
 import { refuseUnreadSchema } from "./schema-guard.mjs";
 import { ANY_SCHEMA_VERSION, DEEP_DIVE_TRAIN_KEY, PUBLISH_TRAIN_KEY, SYNC_TRAIN_KEY } from "./schema.mjs";
 import { ingestUi, refuse } from "./scout-ingest.mjs";
 /** @import { PlatformContext } from "./platform.mjs" */
 import { logIn } from "./scout-login.mjs";
 import { checkDirPrivacy } from "./platform-privacy.mjs";
-import { headerSteps, loginSteps, passwordSteps, trackerBrief, uiBrief } from "./scout-prompt.mjs";
+import { headerSteps, loginSteps, passwordSteps, shellWord, trackerBrief, uiBrief } from "./scout-prompt.mjs";
 import { isSyncRunDir, command as sync } from "./sync.mjs";
 import { practicesText } from "./training.mjs";
 import { publisherBrief, isPublishRunDir, command as publish } from "./publish.mjs";
@@ -160,7 +161,7 @@ import { publisherBrief, isPublishRunDir, command as publish } from "./publish.m
 
 /**
  * Where a password `via` keeps it.
- * @typedef {{ name?: string, key?: string, file?: string }} PasswordPlace
+ * @typedef {{ name?: string, key?: string, file?: string, outside?: true }} PasswordPlace
  */
 
 /**
@@ -246,11 +247,13 @@ export const command = {
         if (args.length !== 2) throw new UsageError(`scout login-steps takes exactly a <url> and a <login_state>; ${usage()}`);
         const [url, named] = args;
         if (!isWebUrl(url)) throw new UsageError(`\`${url}\` is not an http or https URL`);
-        if (!named.trim()) throw new UsageError("scout login-steps needs a <login_state>: the repo-relative path of the login-state file");
+        if (!isRepoRelativePath(named)) throw new UsageError("scout login-steps needs a <login_state>: the repo-relative path of the login-state file");
         const target = Object.values(rootConfig(root).targets ?? {}).includes(new URL(url).origin);
         const barred = target ? null : hostRefusal(root, url);
         if (barred) return { exit: barred.exit, json: { action: "login-steps", ...barred.json } };
-        const login_state = loginStatePlaces(root, named).save;
+        const place = loginStatePlaces(root, named);
+        if ("outside" in place) throw new UsageError("scout login-steps needs a <login_state> inside the repository");
+        const login_state = place.save;
         return { exit: 0, json: { action: "login-steps", ok: true, login_state, steps: loginSteps({ url, loginState: login_state }) } };
       },
     },
@@ -265,7 +268,11 @@ export const command = {
         noSignedOut(ctx);
         const { root } = ctx;
         if (args.length !== 1 || !PASSWORD_VIA.test(args[0])) throw new UsageError(`scout password-steps takes exactly a <via>, \`auth:KEY\`, \`env:NAME\` or \`file:<path>\`; ${usage()}`);
+        if (args[0].startsWith("file:") && !isRepoRelativePath(args[0].slice("file:".length))) {
+          throw new UsageError("scout password-steps needs a repo-relative path after `file:`");
+        }
         const place = passwordPlace(root, args[0]);
+        if (place.outside) throw new UsageError("scout password-steps needs a password file inside the repository");
         return { exit: 0, json: { action: "password-steps", ok: true, ...(place.file && { password_file: place.file }), steps: passwordSteps(place) } };
       },
     },
@@ -282,8 +289,6 @@ export const command = {
       },
     },
   },
-  // An unknown action's usage error lists every action's synopsis.
-  refuse: (e) => ({ exit: 2, json: { ok: false, error: e.detail.code === "unknown_action" ? `${e.message}; ${usage()}` : e.message } }),
 };
 
 /**
@@ -349,7 +354,7 @@ const BRIEFS = {
     }
 
     const made = (/** @type {{ make: () => string }} */ (run)).make();
-    const madePrivacy = checkDirPrivacy(made, { env });
+    const madePrivacy = checkDirPrivacy(made, { ...platformContext, env });
     if (!madePrivacy.ok) {
       if (!run.exists) rmSync(made, { recursive: true, force: true });
       return refuse(madePrivacy.refusal.code, madePrivacy.refusal.message, { ...(madePrivacy.refusal.command && { command: madePrivacy.refusal.command }) });
@@ -398,14 +403,14 @@ const BRIEFS = {
       return refuse("not_a_sync_run", `${runDir} is not a /qa-sync run dir: run \`sync scope\` first and pass the \`dir\` it prints`);
     }
     // `sync scope` and `publish scope` print the same tracker-scope fields; this names the ones read here.
-    const scoped = /** @type {{ exit: number, json: { ok?: boolean, refusals?: { reason?: string, line?: string }[], text: string, payload_file: string, access: ScoutAccessNote | null, [field: string]: unknown } }} */ (
+    const scoped = /** @type {{ exit: number, json: { ok?: boolean, payload_file: string, access: ScoutAccessNote | null, [field: string]: unknown } }} */ (
       (publishing ? publish : sync).actions.scope.run([], { root, dir: runDir }));
-    if (scoped.json.ok === false) throw new UsageError(scoped.json.refusals?.[0]?.reason ?? scoped.json.refusals?.[0]?.line ?? scoped.json.text);
+    if (scoped.json.ok === false) return scoped;
     const { payload_file, tracker, fields, label_destinations, level_destinations, mark_field, mark_search, scenarios, suites, cases, suite_items, suite_search, marked_cases, marked_scenarios, marked_suites, stories, bug_metadata, bug_statuses, access } = scoped.json;
     if (!tracker) return refuse("no_tracker", "`project.md` configures no tracker, so there is nothing for a tracker scout to fetch");
 
     const brief_file = join(runDir, "scout-tracker.brief.md");
-    const prose = `node ${SCAN_CLI} ${publishing ? "publish" : "sync"} scope --dir ${runDir} --root ${resolve(root)}`;
+    const prose = `node ${shellWord(SCAN_CLI)} ${publishing ? "publish" : "sync"} scope --dir ${shellWord(runDir)} --root ${shellWord(resolve(root))}`;
     const practices = practicesText(root, publishing ? PUBLISH_TRAIN_KEY : SYNC_TRAIN_KEY);
     writeFileSync(brief_file, trackerBrief({ output: payload_file, scope: /** @type {import("./scout-prompt.mjs").TrackerScope} */ ({ fields, label_destinations, level_destinations, mark_field, mark_search, scenarios, suites, cases, suite_items, suite_search, marked_cases, marked_scenarios, marked_suites, stories, bug_metadata, bug_statuses }), prose, note: access, practices, publishing }));
     /** @type {ScoutTrackerRecord} */
@@ -432,7 +437,7 @@ function hostRefusal(root, url) {
   return refuse("host_not_allowed", `${host} is not in \`scout.allowed_hosts\` in \`project.md\` (${allowed.join(", ")}), so it is not observed: add it there if it is safe to observe`, { host, allowed_hosts: allowed });
 }
 
-// The Tier a Scout is bound to (lib/tiers.mjs) and the model it is spawned with: that Tier's label
+// The Tier a Scout is bound to (lib/delegates.mjs) and the model it is spawned with: that Tier's label
 // (`tier`, `label`), or none (`model: null`) for `inherit`, the session's own model (ADR-0021).
 /**
  * @param {string} root
@@ -461,7 +466,7 @@ function modelOf(root, agent) {
 export function loginFor(root, note, url, platformContext) {
   const user = cliLoginUser(note);
   if (user) {
-    const secret = readSecret(root, note);
+    const secret = readSecret(root, note, platformContext?.env);
     if (secret.refusal) return /** @type {ScoutLogin} */ (secret);
     /**
      * @param {string} dir
@@ -469,9 +474,9 @@ export function loginFor(root, note, url, platformContext) {
      * @returns {ScoutReach}
      */
     const reach = (dir, session) => {
-      /** @type {{ state: string, reason?: undefined, error?: undefined, check?: undefined, unreachable?: undefined } | { reason: string, error: string, check?: string, unreachable?: boolean, state?: undefined }} */
+      /** @type {{ state: string, reason?: undefined, error?: undefined, check?: undefined, facts?: undefined, unreachable?: undefined } | { reason: string, error: string, check?: string, facts?: Record<string, unknown>, unreachable?: boolean, state?: undefined }} */
       const login = logIn({ dir, session, url, password: secret.password, identifiers: note.identifiers, platformContext });
-      return login.reason ? { refusal: refuse(login.reason, `Access note \`${note.key}\`: ${login.error}`, { access: note.key, ...(login.check && { check: login.check }) }), ...(login.unreachable && { unreachable: true }) } : { state: /** @type {string} */ (login.state) };
+      return login.reason ? { refusal: refuse(login.reason, `Access note \`${note.key}\`: ${login.error}`, { access: note.key, ...(login.check && { check: login.check }), ...login.facts }), ...(login.unreachable && { unreachable: true }) } : { state: /** @type {string} */ (login.state) };
     };
     return { reach, record: { login: "cli", user } };
   }
@@ -482,7 +487,11 @@ export function loginFor(root, note, url, platformContext) {
   if (typeof named !== "string" || !named) {
     return { refusal: refuse("no_login_state", `Access note \`${note.key}\` names no login-state file: add \`${LOGIN_STATE}\` to its \`identifiers\`, a git-ignored path such as \`.qa/.auth/app.json\`, with \`/qa-train access\``) };
   }
-  const { found, save } = loginStatePlaces(root, named);
+  const places = loginStatePlaces(root, named);
+  if ("outside" in places) {
+    return { refusal: refuse("login_state_outside_repo", `Access note \`${note.key}\` names a login-state path outside the repository`, { access: note.key }) };
+  }
+  const { found, save } = places;
   const loginState = found ?? save;
   if (!found) {
     return { refusal: refuse("login_state_missing", `the login-state file \`${named}\` that Access note \`${note.key}\` names does not exist: ${loginSteps({ url, loginState })}`) };
@@ -496,22 +505,28 @@ export function loginFor(root, note, url, platformContext) {
 // or empty, or the file is missing, empty or one git would track. A file's one trailing line break,
 // which an editor adds, is not part of the password.
 /**
+ * Password resolved from an `auth:KEY` or `env:NAME` Access note source.
  * @param {string} root
  * @param {ScoutAccessNote} note
+ * @param {Record<string, string | undefined>} [env]
  * @returns {ScoutSecret}
  */
-export function readSecret(root, note) {
+export function readSecret(root, note, env) {
   /** @param {string} where @param {string} steps @returns {ScoutSecret} */
   const missing = (where, steps) => ({ refusal: refuse("login_secret_missing", `Access note \`${note.key}\` logs in with the password in ${where}: ${steps}${from(note)}`, { access: note.key }) });
-  const { name, key, file } = passwordPlace(root, /** @type {string} */ (note.via));
+  const { name, key, file, outside } = passwordPlace(root, /** @type {string} */ (note.via));
+  if (outside) {
+    return { refusal: refuse("login_secret_outside_repo", `Access note \`${note.key}\` names a password file outside the repository`, { access: note.key }) };
+  }
   if (key) {
     const { value: password, refusal } = resolveAuthKey(root, key);
-    if (refusal) return { refusal: refuse(refusal.code, refusal.message, { gitignore_line: refusal.gitignore_line }) };
+    if (refusal) return { refusal: refuse(refusal.code, refusal.message, { ...(refusal.file && { file: refusal.file }), ...(refusal.checkout && { checkout: refusal.checkout }), ...(refusal.key && { key: refusal.key }), gitignore_line: refusal.gitignore_line }) };
     return password ? { password } : missing(`the key \`${key}\` of ${authHome(root)}, where no password is set`, passwordSteps({ key }));
   }
   if (name) {
+    if (env && env[name] !== undefined) return env[name] ? { password: env[name] } : missing(`the environment variable \`${name}\` or the repo root's \`.env\`, where no password is set`, passwordSteps({ name }));
     const { value: password, refusal } = resolveCredential(root, name);
-    if (refusal) return { refusal: refuse(refusal.code, refusal.message, { gitignore_line: refusal.gitignore_line }) };
+    if (refusal) return { refusal: refuse(refusal.code, refusal.message, { ...(refusal.file && { file: refusal.file }), ...(refusal.checkout && { checkout: refusal.checkout }), ...(refusal.key && { key: refusal.key }), gitignore_line: refusal.gitignore_line }) };
     return password ? { password } : missing(`the environment variable \`${name}\` or the repo root's \`.env\`, where no password is set`, passwordSteps({ name }));
   }
   const named = /** @type {string} */ (note.via).slice("file:".length);
@@ -523,7 +538,7 @@ export function readSecret(root, note) {
 }
 
 // Where a password `via` (`PASSWORD_VIA`) keeps it: `{name}`, an environment variable's, `{key}`, an
-// Auth-file key's (ADR-0060), or `{file}`, the absolute path of a repo-relative file.
+// Auth-file key's (ADR-0060), or `{file}`, the absolute path of a confined repo-relative file.
 /**
  * @param {string} root
  * @param {string} via
@@ -531,7 +546,9 @@ export function readSecret(root, note) {
  */
 function passwordPlace(root, via) {
   if (via.startsWith("auth:")) return { key: via.slice("auth:".length) };
-  return via.startsWith("env:") ? { name: via.slice("env:".length) } : { file: repoPath(root, via.slice("file:".length)) };
+  if (via.startsWith("env:")) return { name: via.slice("env:".length) };
+  const confined = confinedPath(dirname(resolve(root)), via.slice("file:".length));
+  return "outside" in confined ? { outside: true } : { file: confined.path };
 }
 
 // The refusal for a file at `abs` that git would track or tracks (`<reason>_not_ignored`,
@@ -544,6 +561,9 @@ function passwordPlace(root, via) {
 function trackedRefusal(abs, { reason, what, holding }) {
   const tracking = gitTracking(abs);
   if (!tracking) return null;
+  if ("error" in tracking) {
+    return refuse(`${reason}_git_check_failed`, `git could not check whether ${what} is ignored (${tracking.error}); refusing rather than risking committing ${holding}`);
+  }
   const line = gitignoreLine(tracking);
   const fix = tracking.tracked
     ? `git tracks ${what} \`${tracking.rel}\`, so it would be committed with ${holding}: run \`git rm --cached -- ${tracking.rel}\` and add this line to \`.gitignore\`: ${line}`
@@ -558,16 +578,31 @@ function trackedRefusal(abs, { reason, what, holding }) {
  */
 const from = (note) => (typeof note.credential_from === "string" && note.credential_from ? ` (the password: ${note.credential_from})` : "");
 
+/**
+ * Resolve `named` under `baseDir`, rejecting invalid repo-relative paths and any symlink (existing
+ * or dangling) whose resolved target escapes `baseDir`'s realpath.
+ * @param {string} baseDir
+ * @param {string} named
+ * @returns {{ path: string } | { outside: true }}
+ */
+function confinedPath(baseDir, named) {
+  if (!isRepoRelativePath(named)) return { outside: true };
+  const resolvedBase = resolve(baseDir);
+  return resolvesInside(resolvedBase, named) ? { path: resolve(resolvedBase, named) } : { outside: true };
+}
+
 // Where a note's repo-relative `login_state` is (ADR-0060): `found`, the first existing file, the
 // current checkout's before the main checkout's, or null; and `save`, where a saved login goes, the
 // main checkout's when there is one, so a single save serves every worktree.
 /**
  * @param {string} root
  * @param {string} named
- * @returns {{ found: string | null, save: string }}
+ * @returns {{ found: string | null, save: string } | { outside: true }}
  */
 function loginStatePlaces(root, named) {
-  const places = checkoutRoots(root).map((c) => resolve(dirname(c.root), named));
+  const confined = checkoutRoots(root).map((c) => confinedPath(dirname(c.root), named));
+  if (confined.some((r) => "outside" in r)) return { outside: true };
+  const places = confined.map((r) => /** @type {{ path: string }} */ (r).path);
   return { found: places.find((p) => existsSync(p)) ?? null, save: places[places.length - 1] };
 }
 
@@ -583,22 +618,45 @@ export function repoPath(root, named) {
 }
 
 // Whether git would track the file at `abs`: null when it would not (it is ignored, or it lies
-// outside any repository), else `{tracked, rel, top}`: its path from the repository's top, and the top.
+// outside any repository), `{ error }` when git failed, else `{tracked, rel, top}`: its path from
+// the repository's top, and the top.
 /**
  * @param {string} abs
- * @returns {GitTracking | null}
+ * @returns {GitTracking | { error: string } | null}
  */
 function gitTracking(abs) {
-  const real = realpathSync(abs);
-  const found = spawnSync("git", ["-C", dirname(real), "rev-parse", "--show-toplevel"], { encoding: "utf8" });
-  if (found.status !== 0) return null;
+  let real;
+  try {
+    real = realpathSync(abs);
+  } catch (e) {
+    return { error: /** @type {Error} */ (e).message };
+  }
+  const found = runGit(dirname(real), ["rev-parse", "--show-toplevel"]);
+  if (found.error) return { error: found.error.message };
+  if (found.status !== 0) {
+    if (found.status === 128 && /not a git repository/i.test(found.stderr ?? "")) return null;
+    return { error: (found.stderr || `git exited ${found.status}`).trim() };
+  }
   const top = found.stdout.trim();
-  const rel = relative(realpathSync(top), real).split(sep).join("/");
-  if (rel.startsWith("../") || isAbsolute(rel)) return null;
-  /** @param {...string} a @returns {number | null} */
-  const git = (...a) => spawnSync("git", ["-C", top, ...a, "--", rel], { encoding: "utf8" }).status;
-  if (git("ls-files", "--error-unmatch") === 0) return { tracked: true, rel, top };
-  return git("check-ignore", "-q") === 0 ? null : { tracked: false, rel, top };
+  let topReal;
+  try {
+    topReal = realpathSync(top);
+  } catch (e) {
+    return { error: /** @type {Error} */ (e).message };
+  }
+  if (!isContained(topReal, real)) return null;
+  const rel = relative(topReal, real).split(sep).join("/");
+  /** @param {...string} a */
+  const git = (...a) => runGit(top, [...a, "--", rel]);
+  const ls = git("ls-files", "--error-unmatch");
+  if (ls.error) return { error: ls.error.message };
+  if (ls.status === 0) return { tracked: true, rel, top };
+  if (ls.status !== 1) return { error: (ls.stderr || `git ls-files exited ${ls.status}`).trim() };
+  const ig = git("check-ignore", "-q");
+  if (ig.error) return { error: ig.error.message };
+  if (ig.status === 0) return null;
+  if (ig.status !== 1) return { error: (ig.stderr || `git check-ignore exited ${ig.status}`).trim() };
+  return { tracked: false, rel, top };
 }
 
 // The `.gitignore` line for the login-state file at `rel` (from the repository's top `top`): its
@@ -612,7 +670,7 @@ function gitTracking(abs) {
 function gitignoreLine({ rel, top }) {
   const dir = dirname(rel);
   if (dir === ".") return `/${rel}`;
-  const tracked = spawnSync("git", ["-C", top, "ls-files", "-z", "--", dir], { encoding: "utf8" });
+  const tracked = runGit(top, ["ls-files", "-z", "--", dir]);
   const others = tracked.status === 0 ? tracked.stdout.split("\0").filter((p) => p && p !== rel) : [];
   return others.length ? `/${rel}` : `/${dir}/`;
 }

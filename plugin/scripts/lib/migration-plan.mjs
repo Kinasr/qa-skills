@@ -273,7 +273,9 @@ export function planLevelMigration(files, mappings) {
   /** @type {LevelMigrationPlan["errors"]} */
   const errors = [];
   for (const [from, mapping] of Object.entries(mappings)) {
-    if (config.levels.has(from) || !config.levels.has(mapping.level) || !mapping.tag || !isKey(mapping.tag)) errors.push({ code: "bad_level_mapping", message: `map the legacy level ${from} to a project level plus a Tag name` });
+    if (config.levels.has(from) || !config.levels.has(mapping.level) || !mapping.tag || !isKey(mapping.tag) || config.labels.retiredTags.includes(mapping.tag)) {
+      errors.push({ code: "bad_level_mapping", message: `map the legacy level ${from} to a project level plus a Tag name` });
+    }
   }
   for (const f of files.filter((f) => f.type === "scenario")) for (const c of f.cases) {
     if (typeof (c.data.level ?? f.data.level) !== "string" || !(c.data.level ?? f.data.level)) errors.push({ code: "case_level_required", file: f.rel, key: c.key, message: "set the case's level before migrating" });

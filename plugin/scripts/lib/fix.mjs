@@ -1,39 +1,44 @@
 // @ts-check
 // Repairs live in follow-ups.json. The CLI owns the tree snapshots, verify evidence and
 // terminal transitions; the agent supplies the edit, its hypothesis and the semantic review.
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { noArguments, requireOption, UsageError } from './cli.mjs';
-import { plannedRun } from './execute-open.mjs';
+import { writeJsonAtomic } from './run-dir.mjs';
+import { plannedRun } from './execute-plan.mjs';
 import { handOff } from './follow-ups.mjs';
-import { diffTrees, fileText, snapshotPrTree, writeTreeFile, commitFile, headCommit, prGit, gitOutput } from './pr-git.mjs';
+import { diffTrees, fileText, restoreTree, snapshotPrTree, commitFile, headCommit, prGit, gitOutput } from './pr-git.mjs';
 import { checkEdits } from './edit-guard.mjs';
-import { checkFixAssertions } from './fix-assertions.mjs';
+import { addedCredential } from './secret-scan.mjs';
+import { refusalsWithoutLines } from './refusal.mjs';
 import { parse, checkFile } from './knowledge-file.mjs';
 import { keyPatterns } from './code-index.mjs';
 import { resolveAdapter } from './stack.mjs';
 import { loadQaAt, repositoryOf } from './git-tree.mjs';
 import { projectConfig } from './knowledge-file.mjs';
-import { practicesText, trainFile } from './training.mjs';
+import { resolvesUnderAny } from './paths.mjs';
+import { cleanConventions, fixTraining, practicesText, trainFile } from './training.mjs';
 import { proveSelection } from './test-proof.mjs';
 import { scrubPageText } from './credentials.mjs';
 /** @import { CommandDefinition, CommandContext, CommandResult } from './cli.mjs' */
 /** @import { FollowUps, FixItem } from './follow-ups.mjs' */
 /** @import { PrTree } from './pr-git.mjs' */
-/** @import { RefusalResult } from './refusal.mjs' */
 import { planPr, commitPrItem, prActions, prResult } from './pr.mjs';
-import { fixConventions } from './fix-conventions.mjs';
 import { regressionDependents } from './stacks/regress-refs.mjs';
 import { baselineFix } from './fix-baseline.mjs';
 import { fixSelections, regressFix } from './fix-regress.mjs';
-import { fixTraining } from './fix-training.mjs';
+import { doneSections, failSections, handoffSections, planSections, prepareSections, recordSections, regressSections, startSections, verifySections } from './codefix-json.mjs';
 import { CODEFIX_TRAIN_KEY } from './schema.mjs';
-/** @typedef {{ before: PrTree, last: PrTree, verified?: PrTree, attempts: number, passed: boolean, brief: string, sources: string[], handoffSources: string[], index: string, error?: string, evidence?: string, fixedBy?: string }} FixWork */
+/** @typedef {{ before: PrTree, last: PrTree, verified?: PrTree, attempts: number, passed: boolean, brief: string, handoffSources: string[], index: string, error?: string, evidence?: string, fixedBy?: string }} FixWork */
 /** @typedef {{ items: Record<string, FixWork>, done?: string[], standalone?: boolean, regression?: import('./test-runner.mjs').AutomationSelection[], regressPassed?: boolean }} FixSession */
 
 
 /** The closed reasons a repair can fail. @type {readonly string[]} */
 export const FIX_FAILURES = ['cap-reached', 'out-of-scope', 'not-reproduced', 'blocked', 'dirty', 'regressed', 'case-wrong', 'unclaimed'];
+
+// The one line this command words itself. `secret` comes from the same scan the code gen command
+// runs, so both modes say the same thing about an edited credential.
+const { fact } = refusalsWithoutLines();
 
 /** @param {unknown} value @returns {string} */
 function scrub(value) {
@@ -43,13 +48,12 @@ function scrub(value) {
 function refuse(code) { return { exit: 1, json: { ok: false, refusals: [{ code }] } }; }
 /** @param {string} dir @param {FollowUps} state @returns {void} */
 function save(dir, state) {
-  writeFileSync(join(dir, 'follow-ups.json.tmp'), `${JSON.stringify(state, null, 2)}\n`);
-  renameSync(join(dir, 'follow-ups.json.tmp'), join(dir, 'follow-ups.json'));
+  writeJsonAtomic(join(dir, 'follow-ups.json'), state);
 }
 /** @param {PrTree} before @param {PrTree} after @returns {boolean} */
 const equal = (before, after) => Object.keys(diffTrees(before, after)).length === 0;
 
-/** @param {CommandContext} ctx @returns {{ state: FollowUps, dir: string, pinned: import('./execute.mjs').ExecutePlan, repo: string, root: string }} */
+/** @param {CommandContext} ctx @returns {{ state: FollowUps, dir: string, pinned: import('./execute-plan.mjs').ExecutePlan, repo: string, root: string }} */
 function open(ctx) {
   const { pinned, runDir: dir } = plannedRun(ctx.dir, 'fix');
   let state;
@@ -64,7 +68,7 @@ function open(ctx) {
 function brief(run, item) {
   const files = loadQaAt(repositoryOf(run.root), run.state.commit);
   const config = projectConfig(/** @type {import('./knowledge-file.mjs').ParsedFile} */ (files.find(file => file.type === 'project')));
-  const conventions = fixConventions(trainFile(run.root, 'codegen'), run.repo, config.modulePaths);
+  const conventions = cleanConventions(trainFile(run.root, 'codegen'), (ref) => resolvesUnderAny(run.repo, ref, config.modulePaths)) ?? '(none)';
   const cases = run.pinned.executions.filter(ex => item.cases.includes(ex.key));
   const features = files.filter(f => f.type === 'feature' && cases.some(ex => ex.feature === f.data?.key));
   const recordFile = run.state.record ? parse('executions/record.md', readFileSync(join(run.repo, run.state.record), 'utf8')) : null;
@@ -125,14 +129,18 @@ function earlierFix(state, id) {
 /** @param {ReturnType<typeof open>} run @param {FixItem} item @param {FixWork | undefined} work @returns {void} */
 function restore(run, item, work) {
   if (work) {
-    const after = snapshotPrTree(run.repo);
-    const paths = Object.keys(diffTrees(work.before, after));
-    // Remove changed symlinks first: otherwise restoring a child would follow the new link.
-    for (const path of paths.filter(path => after[path]?.mode === '120000')) writeTreeFile(run.repo, path, null);
-    for (const path of paths.filter(path => !work.before[path]).sort((a, b) => b.length - a.length)) writeTreeFile(run.repo, path, null);
-    for (const path of paths.filter(path => work.before[path])) writeTreeFile(run.repo, path, work.before[path]);
+    restoreTree(run.repo, work.before);
+    work.passed = false;
+    delete work.verified;
   }
-  if (work) { work.passed = false; delete work.verified; }
+}
+/**
+ * The PR mode the skill branches on, without the line it relays from the mode section.
+ * @param {import('./pr.mjs').PrMode} mode
+ * @returns {Record<string, unknown>}
+ */
+function prModeOf({ confirm, ...mode }) {
+  return mode;
 }
 /** @param {ReturnType<typeof open>} run @param {FixItem} item @param {FixWork | undefined} work @param {string} reason @returns {CommandResult} */
 function fail(run, item, work, reason) {
@@ -140,7 +148,7 @@ function fail(run, item, work, reason) {
   item.state = 'failed'; item.reason = reason;
   item.next = reason === 'case-wrong' ? '/qa-design' : reason === 'unclaimed' ? '/qa-sync' : `Review ${item.file} and run /qa-execute again.`;
   save(run.dir, run.state);
-  return { exit: 0, json: { ok: true, item, text: `${item.id}: failed (${reason}). ${item.next}` } };
+  return { exit: 0, json: { ok: true, sections: failSections(item) } };
 }
 /** @param {string} action @param {string[]} args @param {CommandContext} ctx @returns {CommandResult} */
 function act(action, args, ctx) {
@@ -149,7 +157,9 @@ function act(action, args, ctx) {
     // A standalone plan spends runner time on its baseline, so refuse broken Training first.
     const early = trainFile(/** @type {string} */ (ctx.root), CODEFIX_TRAIN_KEY);
     if (early && checkFile(/** @type {import('./knowledge-file.mjs').ParsedFile} */ (early), {}).errors.length) return refuse('invalid_training');
-    baseline = baselineFix(args, ctx);
+    const result = baselineFix(args, ctx);
+    if (!result.ok) return result.refusal;
+    baseline = result;
     save(baseline.dir, baseline.state);
     ctx = { ...ctx, dir: baseline.dir };
   } else noArguments(`codefix ${action}`, args, '--dir <run-dir>');
@@ -163,10 +173,9 @@ function act(action, args, ctx) {
     state.pr ??= planPr({ skill: 'fix', repo, run: state.run, commit: state.commit, modulePaths: config.modulePaths, requested: Boolean(ctx.pr) || training.pr === 'always', codeHost: config.code_host, target: state.target });
     if (ctx.flaky) for (const item of state.items) if (item.kind === 'fix' && item.state === 'pending') item.route = 'flaky';
     save(dir, state);
-    return { exit: 0, json: { ok: true, dir, passes_now: baseline?.passes_now ?? [], items: state.items.filter(item => item.kind === 'fix'), next: state.items.find(item => item.kind === 'fix' && ['pending', 'in-progress'].includes(item.state))?.id ?? null, training, pr_mode: state.pr.mode } };
+    return { exit: 0, json: { ok: true, dir, next: state.items.find(item => item.kind === 'fix' && ['pending', 'in-progress'].includes(item.state))?.id ?? null, training, pr_mode: prModeOf(state.pr.mode), sections: planSections({ confirm: state.pr.mode.confirm, items: state.items.filter(item => item.kind === 'fix'), passes_now: baseline?.passes_now ?? [] }) } };
   }
   if (action === 'regress') {
-    if (state.items.some(item => item.kind === 'fix' && ['pending', 'in-progress'].includes(item.state))) return refuse('fix_items_pending');
     if (state.pr?.journal) return refuse('already_prepared');
     const config = projectConfig(/** @type {import('./knowledge-file.mjs').ParsedFile} */ (loadQaAt(repositoryOf(run.root), state.commit).find(f => f.type === 'project')));
     state.fix ??= { items: {} };
@@ -191,23 +200,22 @@ function act(action, args, ctx) {
     const result = regressFix({ state, pinned, root: run.root, repo, dir, selections: state.fix.regression, refresh: () => fixSelections(repo, config), env: ctx.env, save: () => save(dir, state) });
     state.fix.regressPassed = result.ok;
     save(dir, state);
-    return { exit: result.ok ? 0 : 1, json: result };
+    return { exit: result.ok ? 0 : 1, json: { ok: result.ok, sections: regressSections(result) } };
   }
   requireOption(`codefix ${action}`, ctx.item, '--item <id>', 'the fix item');
   const item = state.items.find(item => item.id === ctx.item && item.kind === 'fix');
   if (!item || item.kind !== 'fix') return refuse('unknown_item');
   if (action === 'start') {
     if (item.state !== 'pending' && item.state !== 'in-progress') return refuse('item_terminal');
-    if (state.items.some(other => other.kind === 'fix' && other.id !== item.id && other.state === 'in-progress')) return refuse('item_in_progress');
     if (state.dirty.includes(item.file)) return fail(run, item, undefined, 'dirty');
     state.fix ??= { items: {} };
     restore(run, item, state.fix.items[item.id]);
     const before = snapshotPrTree(repo);
     const context = brief(run, item);
-    state.fix.items[item.id] = { before, last: before, attempts: state.fix.items[item.id]?.attempts ?? 0, passed: false, brief: context.text, sources: context.sources, handoffSources: context.handoffSources, index: gitOutput(prGit(repo, ['ls-files', '--stage', '-z'])), ...(context.error && { error: context.error }), ...(context.evidence && { evidence: context.evidence }) };
+    state.fix.items[item.id] = { before, last: before, attempts: state.fix.items[item.id]?.attempts ?? 0, passed: false, brief: context.text, handoffSources: context.handoffSources, index: gitOutput(prGit(repo, ['ls-files', '--stage', '-z'])), ...(context.error && { error: context.error }), ...(context.evidence && { evidence: context.evidence }) };
     item.state = 'in-progress';
     save(dir, state);
-    return { exit: 0, json: { ok: true, item, text: context.text, literal_sources: context.sources, handoff_sources: context.handoffSources } };
+    return { exit: 0, json: { ok: true, sections: startSections({ item, brief: context.text, literal_sources: context.sources, handoff_sources: context.handoffSources }) } };
   }
   if (item.state !== 'in-progress') return refuse('not_started');
   const work = state.fix?.items[item.id];
@@ -222,8 +230,9 @@ function act(action, args, ctx) {
     if (!item.cases.length) return fail(run, item, work, 'unclaimed');
     if (!work.handoffSources.some(source => String(ctx.cause).includes(source))) return refuse('handoff_source');
     restore(run, item, work);
-    save(dir, handOff(state, item.id, scrub(ctx.cause)));
-    return { exit: 0, json: { ok: true, text: state.fix?.standalone ? `${item.id}: handed off; run /qa-execute ${item.cases.join(' ')} before /qa-bug. ${scrub(ctx.cause)}` : `${item.id}: handed off to /qa-bug --run ${dir}.` } };
+    const cause = scrub(ctx.cause);
+    save(dir, handOff(state, item.id, cause));
+    return { exit: 0, json: { ok: true, sections: handoffSections({ id: item.id, cases: item.cases, cause, next: state.fix?.standalone ? `/qa-execute ${item.cases.join(' ')}` : `/qa-bug --run ${dir}` }) } };
   }
   const now = snapshotPrTree(repo);
   if (action === 'verify') {
@@ -250,7 +259,7 @@ function act(action, args, ctx) {
     if (work.passed) work.verified = now;
     if (!work.passed && work.attempts >= training.fix_attempts) return fail(run, item, work, 'cap-reached');
     save(dir, state);
-    return { exit: 0, json: { ok: true, passed: work.passed, attempts: work.attempts, diagnostics: item.diagnostics, text: `${item.id}: verify ${work.passed ? 'passed' : 'failed'} (${work.attempts}/${training.fix_attempts}).` } };
+    return { exit: 0, json: { ok: true, passed: work.passed, sections: verifySections({ id: item.id, passed: work.passed, attempts: work.attempts, cap: training.fix_attempts, diagnostics: item.diagnostics }) } };
   }
   requireOption('codefix done', ctx.summary, '--summary <text>', 'what changed and any stale-literal source');
   if (!String(ctx.summary).trim()) return refuse('empty_summary');
@@ -260,10 +269,10 @@ function act(action, args, ctx) {
   const config = projectConfig(/** @type {import('./knowledge-file.mjs').ParsedFile} */ (loadQaAt(repositoryOf(run.root), state.commit).find(f => f.type === 'project')));
   const edits = Object.keys(diffTrees(work.before, now)).map(path => ({ path, before: commitFile(repo, state.commit, path), after: now[path] }));
   const decoded = edits.map(edit => ({ path: edit.path, before: fileText(repo, edit.before), after: fileText(repo, edit.after) }));
-  const checked = checkEdits({ repo, modulePaths: config.modulePaths, annotationMap: config.annotationMap, patterns: keyPatterns(config), adapter: resolveAdapter(config.stack, repo).adapter, edits: decoded, assertionsReduced: typeof ctx['assertions-reduced'] === 'string' && ctx['assertions-reduced'].trim() || false });
-  if (!checked.ok) return { exit: 1, json: { ...checked } };
-  const semantic = checkFixAssertions({ adapter: resolveAdapter(config.stack, repo).adapter, edits: decoded, sources: work.sources, summary: String(ctx.summary), reduced: Boolean(ctx['assertions-reduced']) });
-  if (semantic.length) return { exit: 1, json: { ok: false, refusals: semantic } };
+  const checked = checkEdits({ repo, modulePaths: config.modulePaths, annotationMap: config.annotationMap, patterns: keyPatterns(config), adapter: resolveAdapter(config.stack, repo).adapter, edits: decoded });
+  if (!checked.ok) return { exit: 1, json: { ok: false, refusals: checked.refusals } };
+  const secret = addedCredential(decoded);
+  if (secret) return { exit: 1, json: { ok: false, refusals: [fact('secret', secret)] } };
 
   if (edits.some(edit => state.dirty.includes(edit.path))) return refuse('dirty');
   // An item passing with no diff of its own closes as fixed by the earlier item, with no commit.
@@ -272,7 +281,6 @@ function act(action, args, ctx) {
       id: item.id, automation: item.automation, file: item.file, route: item.route, summary: scrub(ctx.summary),
       cases: pinned.executions.filter(ex => item.cases.includes(ex.key)).map(ex => ({ key: ex.key, summary: ex.summary })),
       ...(work.error && { error: work.error }), ...(work.evidence && { evidence: work.evidence }),
-      ...(ctx['assertions-reduced'] ? { assertions_reduced: scrub(ctx['assertions-reduced']) } : {}),
     }, work.before);
     if (committed.failure) return prResult(committed.failure);
   }
@@ -282,26 +290,21 @@ function act(action, args, ctx) {
   state.fix.done = [...(state.fix.done ?? []), item.id];
   item.state = 'done'; item.summary = scrub(ctx.summary);
   if (!edits.length) item.outcome = work.fixedBy ? `fixed-by ${work.fixedBy}` : 'already-passing';
-  if (ctx['assertions-reduced']) item.assertions_reduced = scrub(ctx['assertions-reduced']);
   save(dir, state);
-  return { exit: 0, json: { ok: true, item, text: `${item.id}: done — ${item.summary}` } };
+  return { exit: 0, json: { ok: true, sections: doneSections(item) } };
 }
 /** @type {Record<string, { options: import('./cli.mjs').OptionSpec, usage: string }>} */
 const FORMS = {
   plan: { options: { pr: 'flag', flaky: 'flag' }, usage: '[<Automation-or-Case key>…] [target:<slug>] [--pr] [--flaky] [--dir <run-dir>] [--root <qa-dir>]' },
   start: { options: { item: 'value' }, usage: '--item <id>' },
   verify: { options: { item: 'value', hypothesis: 'value' }, usage: '--item <id> --hypothesis <text>' },
-  done: { options: { item: 'value', summary: 'value', 'assertions-reduced': 'value' }, usage: '--item <id> --summary <text> [--assertions-reduced <reason>]' },
+  done: { options: { item: 'value', summary: 'value' }, usage: '--item <id> --summary <text>' },
   fail: { options: { item: 'value', reason: 'value' }, usage: '--item <id> --reason <reason>' },
   handoff: { options: { item: 'value', cause: 'value' }, usage: '--item <id> --cause <cause>' },
   regress: { options: {}, usage: '' },
 };
 /** @type {CommandDefinition} */
 export const command = {
-  refuse: (err) => {
-    const refusal = /** @type {{ detail?: { refusal?: RefusalResult } }} */ (err).detail?.refusal;
-    return refusal ?? { exit: 2, json: { ok: false, error: err.message } };
-  },
   actions: { ...Object.fromEntries(Object.entries(FORMS).map(([action, form]) => [action, {
   options: { dir: 'value', root: 'qa-dir', ...form.options },
   // `codefix plan` also starts a standalone Run from keys, so it states the whole form itself.
@@ -326,9 +329,22 @@ function fixPrActions() {
           state.items.some(item => item.kind === 'fix' && item.state === 'done') && !state.fix?.regressPassed) return refuse('regress_required');
       }
       const result = /** @type {CommandResult} */ (action.run(args, ctx));
+      if (name === 'pr-prepare' && result.exit === 0) {
+        const json = /** @type {Record<string, unknown>} */ (result.json);
+        return {
+          ...result,
+          json: {
+            ok: true,
+            ...(json.push !== undefined && { push: json.push }),
+            ...(json.create !== undefined && { create: json.create }),
+            sections: prepareSections(json),
+          },
+        };
+      }
       if (name === 'pr-record' && result.exit === 0) {
         const record = /** @type {import('./pr.mjs').PrRecord} */ (result.json.record);
-        result.json.text = scrub(`Fix PR: ${record.url ?? (record.pushed ? 'branch pushed; PR creation failed; an existing PR may need to be located manually' : 'push failed')}${record.error ? ` — ${record.error}` : ''}`).replace(/\s+/g, ' ');
+        const text = scrub(`Fix PR: ${record.url ?? (record.pushed ? 'branch pushed; PR creation failed; an existing PR may need to be located manually' : 'push failed')}${record.error ? ` — ${record.error}` : ''}`).replace(/\s+/g, ' ');
+        return { ...result, json: { ok: true, sections: recordSections(text) } };
       }
       return result;
     },

@@ -1,7 +1,9 @@
 // @ts-check
-import { lstatSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { lstatSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, sep } from "node:path";
+import { parseShellWords } from "./cli.mjs";
 import { REPORT_FILE } from "./execution-guard.mjs";
+import { writeJsonAtomic } from "./run-dir.mjs";
 import { tailOptions } from "./tester.mjs";
 
 /**
@@ -116,39 +118,11 @@ export function bindTester(event) {
   const execDir = guardedDir(join(named.run, "executions", named.execution));
   if (!execDir) return { error: `Execution ${named.execution} is not open` };
   try {
-    const file = join(execDir, BINDING_FILE);
-    writeFileSync(`${file}.tmp`, `${JSON.stringify(/** @type {TesterBinding} */ ({ agent_id: agentId }), null, 2)}\n`);
-    renameSync(`${file}.tmp`, file);
+    writeJsonAtomic(join(execDir, BINDING_FILE), /** @type {TesterBinding} */ ({ agent_id: agentId }));
   } catch {
     return { error: `Execution ${named.execution} could not be bound` };
   }
   return { execDir };
-}
-
-/**
- * Decode only literal shell words; concatenation permits the shell's 'it'\''s' spelling.
- * @param {string | undefined} command
- * @returns {string[] | null}
- */
-function literalWords(command) {
-  if (typeof command !== "string" || /[\r\n\0]/.test(command)) return null;
-  const word = /(?:[A-Za-z0-9_@%+=:,./-]+|'[^']*'|\\')+/y;
-  /** @type {string[]} */
-  const words = [];
-  let offset = 0;
-  while (offset < command.length) {
-    if (command[offset] === " " || command[offset] === "\t") {
-      offset++;
-      continue;
-    }
-    word.lastIndex = offset;
-    const match = word.exec(command);
-    if (!match) return null;
-    words.push(match[0].replace(/'([^']*)'|\\'/g, (_, quoted) => quoted ?? "'"));
-    offset = word.lastIndex;
-    if (offset < command.length && command[offset] !== " " && command[offset] !== "\t") return null;
-  }
-  return words;
 }
 
 /**
@@ -161,7 +135,7 @@ function literalWords(command) {
  */
 export function testerCommandAllowed(command, root, agentId) {
   if (typeof root !== "string" || !isAbsolute(root)) return false;
-  const words = literalWords(command);
+  const words = parseShellWords(command);
   if (!words || words[0] !== "node" || words[2] !== "tester" || !["do", "request"].includes(words[3])) return false;
   const { positional, options } = /** @type {{ positional: string[], options: Record<string, string | undefined> }} */ (tailOptions(words.slice(4)));
   const [id] = positional;

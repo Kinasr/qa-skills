@@ -17,8 +17,10 @@ import { dirname, join, resolve } from "node:path";
 import { orThrow, UsageError } from "./cli.mjs";
 import { automationKeysInCode } from "./code-index.mjs";
 import { parse } from "./knowledge-file.mjs";
-import { ALPHABET, MINTED, mintedToken, PATTERN, prefixFits, prefixRule, provisionalKeys, recipeKey, recipeToken } from "./keys.mjs";
+import { drawKey, MINTED, mintedToken, PATTERN, prefixFits, prefixRule, provisionalKeys, recipeKey, recipeToken } from "./keys.mjs";
 import { rootConfig } from "./qa-index.mjs";
+
+export { drawKey } from "./keys.mjs";
 
 const MAX_COLLISIONS = 1000;
 
@@ -119,18 +121,6 @@ export function mint(kind, { count = 1, root, feature, prefix, seed, reserved = 
   if (feature) out.feature = feature;
   if (recipe) out.prefix = prefix;
   return out;
-}
-
-// `length` lowercase Crockford characters from `draw` (the CSPRNG by default). 256 is a multiple of
-// 32, so `byte & 31` picks each character uniformly. The Run id (lib/run-dir.mjs) is drawn the same
-// way.
-/**
- * @param {number} length
- * @param {(size: number) => Buffer} [draw]
- * @returns {string}
- */
-export function drawKey(length, draw = randomBytes) {
-  return [...draw(length)].map((b) => ALPHABET[b & 31]).join("");
 }
 
 // Every `token` (a global RegExp) in any markdown file under `dir`. A textual sweep, so a key is

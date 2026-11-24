@@ -11,7 +11,7 @@
 //                                                 conversation, or the engineer dictates
 //   evidence codegen --from-code [<path>...]      the bounded test-code sample, corpus and gate
 //     [--relearn [--facet <facet>...]]
-//   check [<target>] --stdin                      a drafted train file, before the skill writes it
+//   check [<target>] --input <path>               a drafted train file, before the skill writes it
 //   auth-ignore <line>                            appends one ignore line `check access` offered to
 //                                                 the repository's `.gitignore` (lib/gitignore-line.mjs),
 //                                                 the one write here
@@ -33,7 +33,6 @@
 /** @import { KeyIndex } from "./qa-index.mjs" */
 /** @import { Stripped, StrippableFile } from "./stripped.mjs" */
 import { existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
-import { spawnSync } from "node:child_process";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { CATEGORIES_TRAIN_KEY, checkCategoriesDraft, effectiveCategories } from "./categories.mjs";
 import { commitLine } from "./changeset.mjs";
@@ -46,20 +45,22 @@ import { authKeysNeeded, authTemplate } from "./auth-template.mjs";
 import { isMap } from "./dialect.mjs";
 import { latestAutomationResults, latestExecutionResults } from "./execution-results.mjs";
 import { executeIntegrity, executeOutcomeClaims, executeTraining, fixtureExists } from "./execute-training.mjs";
+import { runGit } from "./git.mjs";
 import { loadQaAt, repositoryOf, resolveRef } from "./git-tree.mjs";
 import { PATTERN } from "./keys.mjs";
 import { checkFile, parse, projectConfig } from "./knowledge-file.mjs";
-import { resolvesUnderAny } from "./paths.mjs";
+import { isContained, resolvesUnderAny } from "./paths.mjs";
 import { buildIndex, loadWorkingTree, rootConfig } from "./qa-index.mjs";
 import { scan } from "./scan.mjs";
 import { escape, namesOfTheSystem, WHAT as SCAN_WHAT } from "./scan-train.mjs";
 import { repoPath as namedRepoPath } from "./scout.mjs";
+import { isRepoRelativePath } from "./access-note.mjs";
 import { appendIgnoreLine, GITIGNORE, ignoreLineProblem } from "./gitignore-line.mjs";
-import { fixTraining } from "./fix-training.mjs";
-import { trainFile } from "./training.mjs";
+import { fixTraining, trainFile } from "./training.mjs";
 import { ACCESS_TRAIN_KEY, BUG_TRAIN_KEY, CODEGEN_FACETS, CODEGEN_TRAIN_KEY, DESIGN_TRAIN_KEY, EXECUTE_TRAIN_KEY, CODEFIX_TRAIN_KEY, KNOWN, TRAIN_KEYS, canonicalTrainKey, isSharedTrainKey } from "./schema.mjs";
 import { resolveAdapter } from "./stack.mjs";
 import { claimProjection, strip, unifiedDiff } from "./stripped.mjs";
+import { buildCheckSections, buildEvidenceSections } from "./train-json.mjs";
 
 /**
  * The `.qa/` tree the train reads: its files (each parsed as far as it goes), its Key index and
@@ -195,40 +196,52 @@ export const command = {
         checkStack(target, /** @type {string | undefined} */ (stack), ctx);
         /** @type {Record<string, unknown>} */
         const common = { action: "evidence", target, train: trainState(ctx, target), roles: [...ctx.roles], levels: [...ctx.levels] };
+        /** @type {import("./train-json.mjs").EvidenceParts} */
+        let parts = {};
         // Code gen writes `stack:` from the project's one stack root, never from an unstated default.
         if (target === CODEGEN_TRAIN_KEY) {
           common.stack = ctx.stack ?? null;
-          common.upkeep = scan(ctx.root).results.filter((r) => r.kind === "train_warning" && ["ref_unresolved", "convention_drift", "citation_broken"].includes(r.code));
+          parts.upkeep = scan(ctx.root).results.filter((r) => r.kind === "train_warning" && ["ref_unresolved", "convention_drift", "citation_broken"].includes(r.code));
           if (!codeBranch) {
-            common.citation_context = relearnGate(ctx, CODEGEN_FACETS, { sample: {}, corpus: {}, gate: {} }, resolveRef(ctx.root, "HEAD"));
-            common.ref_candidates = refCandidates(ctx);
+            parts.citation_context = relearnGate(ctx, CODEGEN_FACETS, { sample: {}, corpus: {}, gate: {} }, resolveRef(ctx.root, "HEAD"));
+            parts.ref_candidates = refCandidates(ctx);
           }
         }
-        if (target === EXECUTE_TRAIN_KEY) Object.assign(common, executeEvidence(ctx));
-        // The origins an app test-account note is for, beside `project.roles` in `roles`.
+        if (target === EXECUTE_TRAIN_KEY) {
+          const { features, execution_results, automation_results, ...header } = executeEvidence(ctx);
+          Object.assign(common, header);
+          parts = {
+            ...parts,
+            features: /** @type {unknown[]} */ (features),
+            execution_results: /** @type {unknown[]} */ (execution_results),
+            automation_results: /** @type {unknown[]} */ (automation_results),
+          };
+        }
+        // The origins an app test-account note is for; `project.roles` is in `roles`.
         if (target === ACCESS_TRAIN_KEY) common.targets = ctx.targets ?? {};
-        if (codeBranch) return codegenEvidence(ctx, args, { relearn: relearn === true, facet: /** @type {readonly string[] | undefined} */ (facet), common });
+        if (codeBranch) return codegenEvidence(ctx, args, { relearn: relearn === true, facet: /** @type {readonly string[] | undefined} */ (facet), common, parts });
         const [key] = args;
         if (target !== DESIGN_TRAIN_KEY && (key !== undefined || diff !== undefined)) {
           const learned = !isSharedTrainKey(target) ? "Practices" : target === ACCESS_TRAIN_KEY ? "Access notes" : "Coverage categories";
           throw new UsageError(`a <scenario-key> or --diff teaches design's Conventions, so it takes the target \`${DESIGN_TRAIN_KEY}\` or none; \`${target}\` learns its ${learned} from the conversation: run \`train evidence ${target}\``);
         }
         // A named target alone is a conversation run: there is no scenario evidence to read.
-        if (named && key === undefined && diff === undefined) return { exit: 0, json: { ...common, ok: true, source: "target" } };
+        if (named && key === undefined && diff === undefined) return { exit: 0, json: { ...common, ok: true, source: "target", sections: buildEvidenceSections(parts) } };
         if (diff !== undefined || key === undefined) return changesSince(ctx, /** @type {string} */ (diff ?? "HEAD"), key ?? null, { ...common, source: diff === undefined ? "uncommitted" : "diff" });
         const decl = ctx.index.scenarios.get(key)?.[0];
         if (!decl) throw new UsageError(`no scenario \`${key}\` in ${root}`);
         const file = decl.file;
         const exemplar = { scenario: key, feature: decl.feature, file: repoPath(ctx, file.rel), cases: file.cases.length, text: strip(/** @type {StrippableFile} */ (file)).text };
+        parts.exemplar = [exemplar];
         if (file.cases.length === 0) {
-          return { exit: 1, json: { ...common, ok: false, source: "exemplar", reason: "no_cases", error: `scenario \`${key}\` has no Test Cases: an empty file has no form to learn from`, exemplar } };
+          return { exit: 1, json: { ...common, ok: false, source: "exemplar", reason: "no_cases", error: `scenario \`${key}\` has no Test Cases: an empty file has no form to learn from`, sections: buildEvidenceSections(parts) } };
         }
-        return { exit: 0, json: { ...common, ok: true, source: "exemplar", exemplar } };
+        return { exit: 0, json: { ...common, ok: true, source: "exemplar", sections: buildEvidenceSections(parts) } };
       },
     },
 
     check: {
-      usage: ["[<target>] --stdin [--root <qa-dir>]", "categories [--stdin] [--root <qa-dir>]"],
+      usage: ["[<target>] --input <path> [--root <qa-dir>]", "categories [--input <path>] [--root <qa-dir>]"],
       run(given, { root, stdin, stack }) {
         // Categories are shared training, not a command's file: their whole-file check validates a
         // draft against the floor, and with no draft checks the file on disk (absent is the floor).
@@ -256,13 +269,16 @@ export const command = {
             target: CATEGORIES_TRAIN_KEY,
             file,
             path,
-            ...checked,
             ok,
-            errors,
-            statability,
-            // A refused draft resolves no effective list, as the structural refusals do.
-            ...(!ok && { effective: undefined }),
             ...(ok ? { changeset: [file], commit: commitLine([file], "qa(train): /qa-train categories") } : {}),
+            // A refused draft resolves no effective list, as the structural refusals do.
+            sections: buildCheckSections({
+              errors,
+              warnings: checked.warnings,
+              statability,
+              categories: checked.categories,
+              effective: ok ? checked.effective : undefined,
+            }),
           };
           return { json, exit: ok ? 0 : 1 };
         }
@@ -275,14 +291,31 @@ export const command = {
         const checked = checkDraft(ctx, stdin(), target);
         const { draft, ...report } = checked;
         const ok = checked.ok === true;
+        /** @param {unknown} value @returns {import("./train-json.mjs").Listing | undefined} */
+        const listing = (value) => /** @type {import("./train-json.mjs").Listing | undefined} */ (value);
+        /** @type {import("./train-json.mjs").CheckParts} */
+        const parts = {
+          errors: /** @type {unknown[]} */ (report.errors),
+          warnings: /** @type {unknown[]} */ (report.warnings),
+          statability: /** @type {unknown[]} */ (report.statability),
+          conventions: listing(report.conventions),
+          practices: listing(report.practices),
+          recipes: listing(report.recipes),
+          actions: listing(report.actions),
+          uploads: listing(report.uploads),
+          access_notes: listing(report.access_notes),
+          ...(target === ACCESS_TRAIN_KEY && ok ? { access_files: accessFiles(ctx, /** @type {TrainEntry[]} */ (draft)) } : {}),
+        };
+        for (const kind of ["errors", "warnings", "statability", "conventions", "practices", "recipes", "actions", "uploads", "access_notes"]) delete report[kind];
         const json = {
           action: "check",
           target,
           ...report,
           ok,
-          // Only a draft `ok` carries the report: the gate offers its lines, and a draft that failed
-          // is rewritten before anything is offered.
-          ...(target === ACCESS_TRAIN_KEY && ok ? { access_files: accessFiles(ctx, /** @type {TrainEntry[]} */ (draft)), auth_template: authTemplateFile(ctx, /** @type {TrainEntry[]} */ (draft)) } : {}),
+          // Only a draft `ok` carries the Auth template: a draft that failed is rewritten before
+          // anything is written.
+          ...(target === ACCESS_TRAIN_KEY && ok ? { auth_template: authTemplateFile(ctx, /** @type {TrainEntry[]} */ (draft)) } : {}),
+          sections: buildCheckSections(parts),
         };
         return { json, exit: ok ? 0 : 1 };
       },
@@ -316,10 +349,10 @@ function checkStack(target, stack, ctx) {
 /**
  * @param {TrainContext} ctx
  * @param {string[]} args
- * @param {{ relearn: boolean, facet: readonly string[] | undefined, common: Record<string, unknown> }} options
+ * @param {{ relearn: boolean, facet: readonly string[] | undefined, common: Record<string, unknown>, parts: import("./train-json.mjs").EvidenceParts }} options
  * @returns {{ exit: number, json: Record<string, unknown> }}
  */
-function codegenEvidence(ctx, args, { relearn, facet, common }) {
+function codegenEvidence(ctx, args, { relearn, facet, common, parts }) {
   if (facet !== undefined && !relearn) throw new UsageError("`--facet` narrows a `--relearn` run; add `--relearn`");
   const facets = facet === undefined ? CODEGEN_FACETS : [...new Set(facet.flatMap((f) => f.split(",")).map((f) => f.trim()).filter(Boolean))];
   if (facets.length === 0) throw new UsageError("`--facet` needs at least one facet");
@@ -327,10 +360,10 @@ function codegenEvidence(ctx, args, { relearn, facet, common }) {
   if (unknown.length) throw new UsageError(`\`--facet\` names ${unknown.map((f) => `\`${f}\``).join(", ")}; facets are ${CODEGEN_FACETS.join(", ")}`);
   const resolved = resolveAdapter(ctx.stack, ctx.repo);
   if (resolved.unavailable) {
-    return { exit: 1, json: { ...common, ok: false, source: "code", reason: "adapter_unavailable", error: `${resolved.unavailable.message}; ${resolved.unavailable.fix}` } };
+    return { exit: 1, json: { ...common, ok: false, source: "code", reason: "adapter_unavailable", error: `${resolved.unavailable.message}; ${resolved.unavailable.fix}`, sections: buildEvidenceSections(parts) } };
   }
   if (!resolved.adapter?.codegen) {
-    return { exit: 1, json: { ...common, ok: false, source: "code", reason: "no_adapter", error: "no stack adapter reads this project's test code: train this stack from the conversation" } };
+    return { exit: 1, json: { ...common, ok: false, source: "code", reason: "no_adapter", error: "no stack adapter reads this project's test code: train this stack from the conversation", sections: buildEvidenceSections(parts) } };
   }
   const exemplars = args.map((path) => (isAbsolute(path) ? relative(ctx.repo, resolve(path)).split(sep).join("/") : path.replace(/^\.\//, "").replace(/\\/g, "/")));
   const evidence = codegenSample({
@@ -342,11 +375,14 @@ function codegenEvidence(ctx, args, { relearn, facet, common }) {
     exemplars,
     facets,
   });
-  if ("error" in evidence) return { exit: 1, json: { ...common, ok: false, source: "code", reason: evidence.error, error: evidence.message } };
+  if ("error" in evidence) return { exit: 1, json: { ...common, ok: false, source: "code", reason: evidence.error, error: evidence.message, sections: buildEvidenceSections(parts) } };
   const repo = repositoryOf(ctx.root);
   const commit = repo ? resolveRef(ctx.root, "HEAD") : null;
   if (relearn) evidence.gate.relearn = relearnGate(ctx, facets, evidence, commit);
-  return { exit: 0, json: { ...common, ok: true, source: "code", relearn, ...(commit && { commit: commit.slice(0, 7) }), ...evidence } };
+  parts.sample = [evidence.sample];
+  parts.corpus = [evidence.corpus];
+  parts.gate = [evidence.gate];
+  return { exit: 0, json: { ...common, ok: true, source: "code", relearn, ...(commit && { commit: commit.slice(0, 7) }), sections: buildEvidenceSections(parts) } };
 }
 
 // A current path/declaration listing lets the conversation repair a moved ref without sampling.
@@ -379,7 +415,7 @@ function relearnGate(ctx, facets, evidence, commit) {
   const baseline = baselineOf(ctx, CODEGEN_TRAIN_KEY);
   const entries = baseline ? entriesOf(baseline.rel, readFileSync(baseline.path, "utf8"), "conventions") : [];
   /** @param {string[]} args */
-  const git = (args) => spawnSync("git", ["-C", ctx.repo, ...args], { encoding: "utf8" });
+  const git = (/** @type {readonly string[]} */ args) => runGit(ctx.repo, args);
   const findings = scan(ctx.root).results.filter((r) => r.kind === "train_warning" && ["ref_unresolved", "convention_drift", "citation_broken"].includes(r.code));
   const groups = facets.map((facet, order) => {
     const conventions = entries.filter((entry) => entry.data.stack === ctx.stack?.root && entry.data.facet === facet).map((entry) => {
@@ -399,8 +435,7 @@ function relearnGate(ctx, facets, evidence, commit) {
         let current = "";
         try {
           const absolute = realpathSync(resolve(ctx.repo, path));
-          const rel = relative(realpathSync(ctx.repo), absolute);
-          if (isAbsolute(rel) || rel === ".." || rel.startsWith(`..${sep}`)) throw new Error("citation outside repository");
+          if (!isContained(realpathSync(ctx.repo), absolute)) throw new Error("citation outside repository");
           current = readFileSync(absolute, "utf8");
         } catch { /* missing or outside repository */ }
         if (old.status !== 0 || old.stdout !== current) flags.push("cited_file_changed");
@@ -569,13 +604,11 @@ function accessFiles(ctx, notes) {
   const repo = repositoryOf(ctx.root);
   if (!repo) return [];
   const root = realpathSync(ctx.root);
-  /** @param {string[]} args @param {string} [input] */
-  const git = (args, input) => spawnSync("git", ["-C", repo.top, ...args], { encoding: "utf8", input });
   /** @param {string} rel */
   const line = (rel) => {
     const dir = dirname(rel);
     if (dir === ".") return `/${rel}`;
-    const listed = git(["ls-files", "-z", "--", dir]);
+    const listed = runGit(repo.top, ["ls-files", "-z", "--", dir]);
     const others = listed.status === 0 ? listed.stdout.split("\0").filter((p) => p && p !== rel) : [];
     return others.length > 0 ? `/${rel}` : `/${dir}/`;
   };
@@ -589,12 +622,14 @@ function accessFiles(ctx, notes) {
       ...(typeof via === "string" && via.startsWith("file:") ? [via.slice("file:".length)] : []),
     ]);
     for (const name of named) {
-      if (typeof name !== "string" || name === "" || name.includes("\\")) continue;
+      if (typeof name !== "string" || !isRepoRelativePath(name)) continue;
       // A note names its file from the repository under test, the parent of `.qa/`, as scout resolves it.
-      const rel = relative(repo.top, namedRepoPath(root, name)).split(sep).join("/");
-      if (!rel || rel.startsWith("../") || isAbsolute(rel)) continue;
-      const tracked = git(["ls-files", "--error-unmatch", "--", rel]).status === 0;
-      if (!tracked && git(["check-ignore", "--quiet", "--stdin"], `${rel}\n`).status === 0) continue;
+      const repoTop = resolve(repo.top);
+      const namedPath = namedRepoPath(root, name);
+      if (repoTop === resolve(namedPath) || !isContained(repoTop, namedPath)) continue;
+      const rel = relative(repoTop, namedPath).split(sep).join("/");
+      const tracked = runGit(repo.top, ["ls-files", "--error-unmatch", "--", rel]).status === 0;
+      if (!tracked && runGit(repo.top, ["check-ignore", "--quiet", "--stdin"], { input: `${rel}\n` }).status === 0) continue;
       findings.set(rel, { path: rel, tracked, gitignore_line: line(rel) });
     }
   }
@@ -774,9 +809,9 @@ function changesSince(ctx, ref, only, json) {
   const base = { ref, commit };
   if (scoped.length === 0) {
     const since = json.source === "uncommitted" ? "uncommitted" : `since \`${ref}\``;
-    return { exit: 1, json: { ...json, ok: false, base, reason: "no_changes", error: `no ${since} scenario change${only ? ` to \`${only}\`` : ""}: nothing to learn from`, changes: [] } };
+    return { exit: 1, json: { ...json, ok: false, base, reason: "no_changes", error: `no ${since} scenario change${only ? ` to \`${only}\`` : ""}: nothing to learn from`, sections: buildEvidenceSections() } };
   }
-  return { exit: 0, json: { ...json, ok: true, base, changes: scoped } };
+  return { exit: 0, json: { ...json, ok: true, base, sections: buildEvidenceSections({ changes: scoped }) } };
 }
 
 // One scenario file's change between `was` and `now` (either may be null), or null when their

@@ -10,10 +10,12 @@
 /**
  * @import { ExecutionEvidence, ExecutionExcerpt, ExecutionExcerptNode } from "./execution-guard.mjs"
  */
-import { readFileSync, renameSync, writeFileSync } from "node:fs";
-import { join, resolve, sep } from "node:path";
+import { readFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { credentialNamed, redactPageText, redactQueryParams, scrubPageText } from "./credentials.mjs";
 import { maskTyped, sectionsOf } from "./execution-guard.mjs";
+import { isContained } from "./paths.mjs";
+import { writeJsonAtomic } from "./run-dir.mjs";
 
 /** @type {".element-snapshot.json"} */
 export const SNAPSHOT_CACHE_FILE = ".element-snapshot.json";
@@ -106,7 +108,7 @@ export function snapshotFromOutput(text, execDir) {
   if (relative.startsWith("/") || relative.includes("\0")) return null;
   const root = resolve(execDir);
   const file = resolve(root, relative);
-  if (file !== root && !file.startsWith(`${root}${sep}`)) return null;
+  if (!isContained(root, file)) return null;
   try {
     return readFileSync(file, "utf8");
   } catch {
@@ -539,7 +541,5 @@ function readCache(execDir) {
  * @returns {void}
  */
 function writeCache(execDir, cache) {
-  const file = cacheFile(execDir);
-  writeFileSync(`${file}.tmp`, `${JSON.stringify(cache)}\n`);
-  renameSync(`${file}.tmp`, file);
+  writeJsonAtomic(cacheFile(execDir), cache, { compact: true });
 }

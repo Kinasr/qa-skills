@@ -9,18 +9,32 @@
 //
 // A Run with no `test_runner` records every Automation Blocked `no-command`, so the summary can
 // point at `/qa-init`. A finished Automation is never run twice, so a resumed call costs nothing.
-import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { noArguments } from "./cli.mjs";
-import { plannedRun } from "./execute-open.mjs";
+import { plannedRun } from "./execute-plan.mjs";
 import { executeTraining } from "./execute-training.mjs";
+import { writeJsonAtomic } from "./run-dir.mjs";
 import { displaySelector, runSelection } from "./runners/index.mjs";
 import { automationResult } from "./test-runner.mjs";
 import { EXECUTE_TRAIN_KEY } from "./schema.mjs";
 import { trainFile } from "./training.mjs";
+import { buildSections } from "./report-sections.mjs";
 /** @import { AutomationSelection, AutomationResult, RunnerResult } from "./test-runner.mjs" */
 /** @import { CommandAction, CommandContext, CommandResult } from "./cli.mjs" */
-/** @import { AutoRun } from "./execute.mjs" */
+/** @import { AutoRun } from "./execute-plan.mjs" */
+/** @import { PlatformContext } from "./platform.mjs" */
+/** @import { ReportSection, SectionSpec } from "./report-sections.mjs" */
+
+/**
+ * Ordered section registry for `execute automation`.
+ * @type {readonly SectionSpec[]}
+ */
+export const AUTOMATION_SECTION_ORDER = [
+  { id: "summary", label: "Automations" },
+  { id: "results", label: "Automation results" },
+  { id: "setup", label: "Test runner setup" },
+];
 
 /**
  * @typedef {{ automation: AutomationResult[] }} AutomationState
@@ -63,18 +77,30 @@ function nextInvocation(runDir) {
 }
 
 /**
+ * Build the ordered, labelled sections for `execute automation`.
  * @param {AutomationResult[]} entries
- * @returns {string}
+ * @returns {ReportSection[]}
  */
-function automationText(entries) {
-  if (!entries.length) return "No Automations were due in this Run.";
+function automationSections(entries) {
+  if (!entries.length) {
+    return buildSections(AUTOMATION_SECTION_ORDER, [
+      { id: "summary", markdown: "No Automations were due in this Run." },
+    ]);
+  }
   const count = (/** @type {string} */ result) => entries.filter((entry) => entry.result === result).length;
   /** @type {Array<[string, number]>} */
   const tallies = [["passed", count("passed")], ["failed", count("failed")], ["flaky", count("flaky")], ["blocked", count("blocked")]];
   const buckets = tallies.filter(([, n]) => n > 0).map(([name, n]) => `${n} ${name}`).join(", ");
-  const lines = entries.map((entry) => `  ${entry.id}: ${entry.result}${entry.reason ? ` (${entry.reason})` : ""}`);
-  const hint = entries.some((entry) => entry.reason === "no-command") ? ["Set `test_runner` in `project.md` with `/qa-init` so Automations can run."] : [];
-  return [`Automations: ${entries.length} (${buckets})`, ...lines, ...hint].join("\n");
+  const noCommand = entries.some((entry) => entry.reason === "no-command");
+  return buildSections(AUTOMATION_SECTION_ORDER, [
+    { id: "summary", markdown: `Automations: ${entries.length} (${buckets})` },
+    { id: "results", items: entries },
+    {
+      id: "setup",
+      markdown: noCommand ? "Set `test_runner` in `project.md` with `/qa-init` so Automations can run." : null,
+      next: noCommand ? "/qa-init" : null,
+    },
+  ]);
 }
 
 /**
@@ -82,13 +108,15 @@ function automationText(entries) {
  * @param {CommandContext} context
  * @returns {CommandResult}
  */
-function run(args, { dir, root, env }) {
+function run(args, { dir, root, env, platformContext: rawPlatformContext }) {
+  const platformContext = /** @type {PlatformContext | undefined} */ (rawPlatformContext);
   noArguments("execute automation", args, "--dir <run-dir>");
   const { pinned, runDir } = plannedRun(dir, "automation");
   if (!pinned.confirmed) {
-    return { exit: 1, json: { ok: false, refusals: [{ code: "not_confirmed", line: "Confirm the Run before running Automations." }] } };
+    return { exit: 1, json: { ok: false, refusals: [{ code: "not_confirmed", run: pinned.run }] } };
   }
-  const retries = retriesOf(/** @type {string} */ (root));
+  const effectiveRoot = pinned.root ?? root;
+  const retries = typeof pinned.automation_retries === "number" ? pinned.automation_retries : retriesOf(/** @type {string} */ (effectiveRoot));
   const plan = /** @type {AutoRun | undefined} */ (pinned.automation);
   /** @type {AutomationState} */
   const state = { automation: readAutomation(runDir) };
@@ -105,12 +133,14 @@ function run(args, { dir, root, env }) {
     } else {
       const output = join(runDir, "automation", String(invocation++));
       mkdirSync(output, { recursive: true });
-      outcome = runSelection({ selection, runner: plan.runner, root: /** @type {string} */ (root), repo: plan.repo, dir: output, origin: pinned.target.origin, env, retries });
+      outcome = runSelection({ selection, runner: plan.runner, root: /** @type {string} */ (effectiveRoot), repo: plan.repo, dir: output, origin: pinned.target.origin, env, retries, ...(platformContext && { context: platformContext }) });
     }
     state.automation.push(automationResult(selection, outcome.parsed, outcome.selector, Boolean(plan?.runner && plan.runner.target_env.length === 0)));
-    writeFileSync(join(runDir, "automation.json"), `${JSON.stringify(state, null, 2)}\n`);
+    writeJsonAtomic(join(runDir, "automation.json"), state);
   }
-  return { exit: 0, json: { action: "automation", ok: true, automation: state.automation, text: automationText(state.automation) } };
+  /** @type {ReportSection[]} */
+  const sections = automationSections(state.automation);
+  return { exit: 0, json: { action: "automation", ok: true, sections } };
 }
 
 /** @type {Record<string, CommandAction>} */

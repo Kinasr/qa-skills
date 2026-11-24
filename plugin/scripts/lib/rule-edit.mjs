@@ -24,7 +24,7 @@ import { UsageError } from "./cli.mjs";
 import { loadQaAt, repositoryOf, resolveRef } from "./git-tree.mjs";
 import { buildIndex } from "./qa-index.mjs";
 import { ruleEdit, rulesChangedAcross, ruleTexts } from "./rule-diff.mjs";
-import { dependencyEnds, dependencyIndex } from "./rule-ref.mjs";
+import { dependencyEnds, dependencyIndex, refUnder } from "./rule-ref.mjs";
 import { newRunDir, readRunFile } from "./run-dir.mjs";
 import { scan } from "./scan.mjs";
 import { strip } from "./stripped.mjs";
@@ -174,7 +174,7 @@ function downstreamOf(ctx, key, thenFiles, head) {
     const facts = affectedRules({ then, now, feature: slug, baseline: head, target });
     for (const affected of facts.rules) {
       if (affected.changed) continue;
-      const rooted = affected.causes.filter((cause) => cause.ref.startsWith(`${key}/`));
+      const rooted = affected.causes.filter((cause) => refUnder(cause.ref, key));
       if (rooted.length === 0) continue;
       const [end] = dependencyEnds(now.index, now.files, [{ feature: slug, rule: affected.rule }]);
       if (!end) continue;
@@ -288,7 +288,7 @@ export function reconcile(ctx, key, forecast, dir) {
   if (made?.error) throw new UsageError(made.error);
 
   const after = ctx.index.features.get(key)?.[0]?.file ?? null;
-  if (!after) return { json: { action: "reconcile", ok: false, feature: key, errors: [{ code: "no_feature", message: `no Feature \`${key}\`: reconcile follows Rule edits to an existing Feature` }] }, exit: 1 };
+  if (!after) return { json: { action: "reconcile", ok: false, feature: key, errors: [{ code: "no_feature", feature: key }] }, exit: 1 };
 
   const repo = repositoryOf(ctx.root);
   const head = repo ? resolveRef(ctx.root, "HEAD") : null;
@@ -298,12 +298,12 @@ export function reconcile(ctx, key, forecast, dir) {
 
   const known = new Set([...(before?.rules ?? []).map((r) => r.key), ...after.rules.map((r) => r.key)]);
   const live = new Set(after.rules.map((r) => r.key));
-  /** @type {Array<{ code: string, rule: string, message: string }>} */
+  /** @type {Array<{ code: string, rule: string, band: string, feature: string }>} */
   const errors = [];
   for (const band of BANDS) {
-    for (const rule of forecast[band]) if (!known.has(rule)) errors.push({ code: "unknown_rule", rule, message: `\`${rule}\` in \`${band}\` is no Rule of ${key}` });
+    for (const rule of forecast[band]) if (!known.has(rule)) errors.push({ code: "unknown_rule", rule, band, feature: key });
   }
-  for (const rule of forecast.widened) if (!live.has(rule)) errors.push({ code: "unknown_rule", rule, message: `\`${rule}\` in \`widened\` is no live Rule of ${key}` });
+  for (const rule of forecast.widened) if (!live.has(rule)) errors.push({ code: "unknown_rule", rule, band: "widened", feature: key });
   if (errors.length > 0) return { json: { action: "reconcile", ok: false, feature: key, errors }, exit: 1 };
 
   /** @param {string} rule @returns {"changes" | "may_change" | "unaffected" | null} */

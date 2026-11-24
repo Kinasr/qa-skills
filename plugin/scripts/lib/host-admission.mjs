@@ -17,7 +17,7 @@
 import { spawnSync } from "node:child_process";
 import { posix, win32 } from "node:path";
 import { spawnNodeCli } from "./platform.mjs";
-import { refusalsFor } from "./refusal.mjs";
+import { refusalsWithoutLines } from "./refusal.mjs";
 import { supportLink } from "./support-link.mjs";
 
 /** @type {string} */
@@ -58,12 +58,26 @@ const CHECKS = {
  */
 function unverified(env, check, version) {
   const host = isClaudeCodeHost(env) ? "Claude Code, unverified" : "not Claude Code";
-  const agent = env.AI_AGENT === undefined ? "unset" : JSON.stringify(env.AI_AGENT);
-  return refusalsFor({ host_unverified: `Application access requires [Claude Code](${supportLink("claude-code")}) >= ${CLAUDE_CODE_FLOOR}. Host: ${host}. Version found: ${version ?? "none could be read"}. Failed check: ${check}: ${CHECKS[check]} AI_AGENT seen: ${agent}.` }).stop("host_unverified", { version, check });
+  const agent = env.AI_AGENT === undefined ? "unset" : env.AI_AGENT;
+  return refusalsWithoutLines().stop("host_unverified", {
+    version,
+    check,
+    check_reason: CHECKS[check],
+    host,
+    agent,
+    agent_seen: env.AI_AGENT === undefined ? "unset" : JSON.stringify(env.AI_AGENT),
+    support: `[Claude Code](${supportLink("claude-code")})`,
+    floor: CLAUDE_CODE_FLOOR,
+  });
 }
 
+// A host state as a stable reason: the failed check, the version and the host it saw, never a
+// sentence. It is what an Unguarded Run's acknowledgment is pinned to.
 /** @param {RefusalResult} refusal @returns {string} */
-const lineOf = (refusal) => String(refusal.json.refusals[0].line);
+const reasonOf = (refusal) => {
+  const { check, version, host, agent_seen } = refusal.json.refusals[0];
+  return `${check}:${typeof version === "string" ? version : "none"} (Host: ${host}; AI_AGENT seen: ${agent_seen})`;
+};
 /** @param {RefusalResult} refusal @returns {boolean} */
 const belowFloor = (refusal) => refusal.json.refusals[0].check === "below_floor";
 
@@ -132,7 +146,7 @@ export function isClaudeCodeHost(env) {
  */
 export function unguardedReason(options = {}) {
   const refusal = admitHost(options);
-  return refusal && !belowFloor(refusal) ? lineOf(refusal) : null;
+  return refusal && !belowFloor(refusal) ? reasonOf(refusal) : null;
 }
 
 /**
@@ -140,7 +154,7 @@ export function unguardedReason(options = {}) {
  * only an Unguarded Run (ADR-0057): one the engineer acknowledged on the pre-run Card, recorded by
  * `execute confirm`, and only for the reason it acknowledged. Below the floor never admits.
  * `unguarded` says so, so a Run never proceeds without a verified guard silently.
- * @param {Pick<import("./execute.mjs").ExecutePlan, "unguarded">} pinned
+ * @param {Pick<import("./execute-plan.mjs").ExecutePlan, "unguarded">} pinned
  * @param {{ env?: NodeJS.ProcessEnv, spawn?: HostSpawn, timeoutMs?: number, platform?: NodeJS.Platform }} [options]
  * @returns {{ refusal: RefusalResult | null, unguarded: boolean }}
  */
@@ -148,6 +162,6 @@ export function admitRun(pinned, options = {}) {
   const refusal = admitHost(options);
   if (!refusal) return { refusal: null, unguarded: false };
   // Only the failure the engineer acknowledged admits the Run; any other refuses as before.
-  const acknowledged = !belowFloor(refusal) && pinned.unguarded?.acknowledged === true && pinned.unguarded.reason === lineOf(refusal);
+  const acknowledged = !belowFloor(refusal) && pinned.unguarded?.acknowledged === true && pinned.unguarded.reason === reasonOf(refusal);
   return acknowledged ? { refusal: null, unguarded: true } : { refusal, unguarded: false };
 }

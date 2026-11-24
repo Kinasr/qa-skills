@@ -26,7 +26,7 @@ says so. Older drafts are discard-only lines, ignored by `take: "all"` and kept 
 recovered bug says "link and attachments not verified". Bugs that failed together with one
 Automation in one Run are grouped as that fact, never a cause. `fields` answers by item number or `all`; `attach` ticks offered screenshots by name;
 `discard` deletes a draft. A stale bug or an open linked bug needs `confirmed`. Apply checks the
-grammar first, then reports `needs_edit` and `confirm` together; submit its `decisions` only after
+grammar first, then reports required bug fields and confirmation items together; submit its `decisions` only after
 the engineer's explicit yes, and rebuild when the state changed. Relay incomplete-Card refusals and
 stop; they never authorize a create with guessed fields or an unresolved case link.
 Screenshot selection and field answers use the CLI's available Card data; never invent attachments.

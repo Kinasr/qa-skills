@@ -36,66 +36,27 @@ import { accessNoteNamed } from "./access.mjs";
 import { dropProfile, ensureProfileFlag } from "./browser-profile.mjs";
 import { cliLoginUser, isHeaderOnly } from "./access-note.mjs";
 import { redactionExemptName } from "./credentials.mjs";
-import { readHeaderCredential, readExpiredHeaderCredential, headerCredentialValues, maskCredentialValue } from "./header-credential.mjs";
-import { UsageError, noArguments, orThrow, requireOption } from "./cli.mjs";
+import { headerRefusalFacts, readHeaderCredential, readExpiredHeaderCredential, headerCredentialValues, maskCredentialValue } from "./header-credential.mjs";
+import { noArguments, requireOption } from "./cli.mjs";
 import { dropAuth, isHelper, isPrivacyRefusalError, keepAuth } from "./execute-auth.mjs";
 import { checkDirPrivacy } from "./platform-privacy.mjs";
 import { executeTraining, fixtureExists } from "./execute-training.mjs";
 import { GUARD_FILE, executionDir, loginUrlOf, namedSessions, observe, passwordShown, playwright, readGuard, verdict, writeGuard } from "./execution-guard.mjs";
+import { platformRefusalFacts } from "./platform.mjs";
 /** @import { PlatformContext } from "./platform.mjs" */
 import { MIN_PLAYWRIGHT_CLI, UPGRADE_PLAYWRIGHT_CLI, playwrightCliVersion } from "./playwright-version.mjs";
-import { refusalsFor } from "./refusal.mjs";
+import { refusalsWithoutLines } from "./refusal.mjs";
 import { admitRun } from "./host-admission.mjs";
 import { EXECUTE_TRAIN_KEY } from "./schema.mjs";
 import { loginFor } from "./scout.mjs";
 import { trainFile } from "./training.mjs";
-import { openRunDir, readRunFile } from "./run-dir.mjs";
+import { execution } from "./execute-plan.mjs";
+import { readState } from "./execute-state.mjs";
 
 /**
- * @import { ExecutePlan, ExecuteExecution, ExecuteDispatchState } from "./execute.mjs"
  * @import { ExecutionGuard, ExecutionGuardStop, ExecutionSession, PageClassification } from "./execution-guard.mjs"
  * @import { RefusalResult } from "./refusal.mjs"
  * @import { CommandResult, OptionSpec } from "./cli.mjs"
- * @import { RunFileResult } from "./run-dir.mjs"
- */
-
-/**
- * Result of looking up an execution in an execute plan.
- * @typedef {{
- *   pinned: ExecutePlan,
- *   ex: ExecuteExecution,
- *   runDir: string,
- *   refusal?: undefined,
- * } | {
- *   pinned?: undefined,
- *   ex?: undefined,
- *   runDir?: undefined,
- *   refusal: RefusalResult,
- * }} ExecutionLookupResult
- */
-
-/**
- * Shape checked by isPlan before narrowing to ExecutePlan.
- * @typedef {{
- *   confirmed?: boolean,
- *   run?: string,
- *   target?: { slug?: string, origin?: string },
- *   commit?: string,
- *   playwright_cli?: string,
- *   created_at: string,
- *   skipped?: unknown[],
- *   executions: Array<{
- *     id?: string,
- *     key?: string,
- *     summary?: string,
- *     feature?: string,
- *     digest?: string,
- *     review?: string,
- *     roles?: unknown[],
- *     access?: unknown[],
- *     cap: number,
- *   }>,
- * }} CandidatePlan
  */
 
 /** @typedef {import("./access.mjs").ShownAccessNote} AccessNote */
@@ -122,67 +83,7 @@ import { openRunDir, readRunFile } from "./run-dir.mjs";
  * }} ScoutLoginResult
  */
 
-const { stop } = refusalsFor({
-  not_confirmed: "The Run is not confirmed; confirm the plan before opening an Execution.",
-  unknown_execution: "The Run holds no Execution with that id.",
-  execution_blocked: "The Execution was Blocked before dispatch and has no sessions to open.",
-  already_open: "The Execution already has a guard; reset its dir before opening it again.",
-  no_playwright_cli: "`/qa-execute` drives the app through `playwright-cli`, which is not on the PATH; install it first.",
-  refused_playwright_cli: "`/qa-execute` refused the `playwright-cli` binary or shim resolved from PATH.",
-  old_playwright_cli: "`/qa-execute` needs a newer `playwright-cli`; upgrade it first.",
-  note_withheld: "The Access note holds what looks like a credential; fix `train/access.md` with `/qa-train access`.",
-  note_missing: "The Access note is gone from `train/access.md`; add it back with `/qa-train access`.",
-  unreachable: "The target could not be reached; check the app is up, then open the Execution again.",
-});
-
-// Whether `plan` (a parsed `execute.json`) is the shape `execute plan` writes: the one answer every
-// action that reads the plan gives.
-/**
- * @param {CandidatePlan} plan
- * @returns {plan is ExecutePlan}
- */
-export function isPlan(plan) {
-  const text = (/** @type {unknown} */ v) => typeof v === "string" && v !== "";
-  const list = (/** @type {unknown} */ v) => Array.isArray(v);
-  return Boolean(plan) && typeof plan.confirmed === "boolean" && text(plan.run) && text(plan.target?.slug) && text(plan.target?.origin) && text(plan.commit) && text(plan.playwright_cli) &&
-    Number.isFinite(Date.parse(plan.created_at)) && list(plan.skipped) && list(plan.executions) &&
-    plan.executions.every((e) => text(e?.id) && text(e.key) && text(e.summary) && text(e.feature) && text(e.digest) && text(e.review) && list(e.roles) && list(e.access) && Number.isSafeInteger(e.cap) && e.cap >= 1);
-}
-
-// The Run's plan file, `{value}` (null when `missing` is undefined and there is none) or `{error}`.
-/**
- * @param {string} runDir
- * @param {string} [missing]
- * @returns {RunFileResult<ExecutePlan>}
- */
-export const readPlanFile = (runDir, missing) => readRunFile(runDir, "execute.json", { by: "execute plan", restart: "execute plan", missing });
-
-// The Run's plan: `{pinned, runDir}`; a usage error when there is no run dir or plan, or it is not one.
-/**
- * @param {string | undefined} dir
- * @param {string} action
- * @returns {{ pinned: ExecutePlan, runDir: string }}
- */
-export function plannedRun(dir, action) {
-  const opened = orThrow(openRunDir(dir, { cmd: "execute", action, from: "execute plan" }));
-  const read = /** @type {{ error?: string, value?: ExecutePlan }} */ (readPlanFile(opened.dir, `no plan in ${opened.dir}: run \`execute plan\` first`));
-  if (read.error) throw new UsageError(read.error);
-  if (!isPlan(/** @type {CandidatePlan} */ (read.value))) throw new UsageError(`${join(opened.dir, "execute.json")} is not the plan \`execute plan\` wrote: start a new run with \`execute plan\``);
-  return { pinned: read.value, runDir: opened.dir };
-}
-
-// The Run's plan and the Execution `id` in it: `{pinned, ex, runDir}`, or `{refusal}`.
-/**
- * @param {string | undefined} dir
- * @param {string} id
- * @param {string} action
- * @returns {ExecutionLookupResult}
- */
-export function execution(dir, id, action) {
-  const { pinned, runDir } = plannedRun(dir, action);
-  const ex = pinned.executions.find((e) => e.id === id);
-  return ex ? { pinned, ex, runDir } : { refusal: stop("unknown_execution", { execution: id }) };
-}
+const { stop } = refusalsWithoutLines();
 
 // Small synthetic files for the formats a `upl_` recipe names: the format's magic bytes, padded to `bytes`.
 /** @type {Record<string, Buffer>} */
@@ -246,14 +147,32 @@ function loginStateFor(s, { root, runDir, origin, execDir, notes, env, platformC
   if (reached.refusal) return { refusal: reached.refusal, ...(reached.unreachable && { unreachable: true }) };
   if (login.record.login !== "cli") return { state: reached.state, saved: true };
   try {
-    return { state: keepAuth(runDir, s.acc, reached.state, { env }), fresh: true };
+    return { state: keepAuth(runDir, s.acc, reached.state, { ...platformContext, env }), fresh: true };
   } catch (error) {
     if (isPrivacyRefusalError(error)) {
-      return { refusal: stop(error.refusal.code, { error: error.refusal.message, ...(error.refusal.command && { command: error.refusal.command }) }) };
+      return { refusal: stop(error.refusal.code, platformRefusalFacts(error.refusal)) };
     }
     throw error;
   }
 }
+
+// Whether a login refusal is the scout's own words (`{ok, reason, error, …}`) rather than a refusal
+// this side already built (`{ok, refusals: [{code, …}]}`), such as the Run's auth/ privacy check.
+/**
+ * @param {RefusalResult} refusal
+ * @returns {boolean}
+ */
+const isScoutRefusal = (refusal) => typeof (/** @type {{ reason?: unknown }} */ (refusal.json)).reason === "string";
+
+const DATA_ONLY_LOGIN_CODES = new Set(["acl_unreadable", "acl_not_private", "secret_target_unwritable", "refused_playwright_cli"]);
+const LOCAL_REFUSAL_CODES = new Set(["acl_unreadable", "acl_not_private", "secret_target_unwritable", "refused_playwright_cli", "no_playwright_cli", "old_playwright_cli", "unreachable"]);
+
+/**
+ * Whether a refusal code identifies a local OS, ACL, CLI, or transport problem rather than an Access note.
+ * @param {string} code
+ * @returns {boolean}
+ */
+export const isLocalRefusalCode = (code) => LOCAL_REFUSAL_CODES.has(code);
 
 // The refusal a login refusal of the scout's words (`{ok, reason, error, …}`) becomes here.
 /**
@@ -262,8 +181,13 @@ function loginStateFor(s, { root, runDir, origin, execDir, notes, env, platformC
  * @returns {RefusalResult}
  */
 function asRefusal(scout, access) {
-  const { ok, reason, error, ...extra } = scout.json;
-  return stop(/** @type {string} */ (reason), { access, error, ...extra });
+  const { ok, reason, error, access: _scoutAccess, ...extra } = scout.json;
+  const code = /** @type {string} */ (reason);
+  return stop(code, {
+    ...(isLocalRefusalCode(code) ? {} : { access }),
+    ...(code.startsWith("credential_") || DATA_ONLY_LOGIN_CODES.has(code) ? {} : { error }),
+    ...extra,
+  });
 }
 
 // Opens session `s`, logs it in and lands it on the target: `{seen, url}` (what `verdict` made of the
@@ -272,35 +196,36 @@ function asRefusal(scout, access) {
 // better cannot get in and refuses `login_failed`.
 /**
  * @param {ExecutionSession} s
- * @param {{ root: string, runDir: string, origin: string, execDir: string, notes: Map<string | null, AccessNote>, env: Record<string, string | undefined>, attempted: string[], platformContext?: PlatformContext }} c
+ * @param {{ root: string, runDir: string, origin: string, execDir: string, notes: Map<string | null, AccessNote>, env: Record<string, string | undefined>, attempted: string[], keptAuths: Set<string>, platformContext?: PlatformContext }} c
  * @returns {{ seen: PageClassification, url?: string, refusal?: undefined } | { seen?: undefined, url?: undefined, refusal: RefusalResult }}
  */
 function openAndLand(s, c) {
-  const { origin, execDir, env, attempted, runDir, platformContext } = c;
+  const { origin, execDir, env, attempted, runDir, keptAuths, platformContext } = c;
   const reached = loginStateFor(s, c);
   if (reached.unreachable) return { refusal: stop("unreachable", { origin, error: reached.refusal.json.error }) };
-  if (reached.refusal) return { refusal: asRefusal(reached.refusal, s.acc) };
-  const prof = ensureProfileFlag(execDir, s.name, { env });
-  if (!prof.ok) return { refusal: stop(prof.refusal.code, { access: s.acc, error: prof.refusal.message, ...(prof.refusal.command && { command: prof.refusal.command }) }) };
+  if (reached.refusal) return { refusal: isScoutRefusal(reached.refusal) ? asRefusal(reached.refusal, s.acc) : reached.refusal };
+  if (reached.fresh && s.acc !== null) keptAuths.add(s.acc);
+  const prof = ensureProfileFlag(execDir, s.name, { ...platformContext, env });
+  if (!prof.ok) return { refusal: stop(prof.refusal.code, platformRefusalFacts(prof.refusal)) };
   attempted.push(s.name);
   const opened = playwright(execDir, s.name, ["open", prof.flag], env, undefined, platformContext);
   if (opened.missing) return { refusal: stop("no_playwright_cli", { upgrade: UPGRADE_PLAYWRIGHT_CLI }) };
-  if (opened.refused) return { refusal: stop("refused_playwright_cli", { check: opened.refusal.code, reason: opened.refusal.message }) };
+  if (opened.refused) return { refusal: stop("refused_playwright_cli", { check: opened.refusal.code, ...platformRefusalFacts(opened.refusal) }) };
   if (opened.error) return { refusal: stop("unreachable", { origin, error: opened.error }) };
   if (reached.state) {
     const loaded = playwright(execDir, s.name, ["state-load", reached.state], env, undefined, platformContext);
-    if (loaded.refused) return { refusal: stop("refused_playwright_cli", { check: loaded.refusal.code, reason: loaded.refusal.message }) };
+    if (loaded.refused) return { refusal: stop("refused_playwright_cli", { check: loaded.refusal.code, ...platformRefusalFacts(loaded.refusal) }) };
     if (loaded.error) {
       if (!reached.saved) dropAuth(runDir, s.acc);
       return { refusal: stop("login_failed", { access: s.acc, error: `could not load the login state: ${loaded.error}` }) };
     }
   }
   const landed = playwright(execDir, s.name, ["goto", `${origin}/`], env, undefined, platformContext);
-  if (landed.refused) return { refusal: stop("refused_playwright_cli", { check: landed.refusal.code, reason: landed.refusal.message }) };
+  if (landed.refused) return { refusal: stop("refused_playwright_cli", { check: landed.refusal.code, ...platformRefusalFacts(landed.refusal) }) };
   if (landed.error) return { refusal: stop("unreachable", { origin, error: landed.error }) };
   const { url } = observe(execDir, s.name, /** @type {string} */ (landed.text), env, platformContext);
-  const seen = url === undefined ? /** @type {PageClassification} */ ({ kind: "off" }) : verdict({ cwd: execDir, session: s.name, origin, loginUrl: s.login_url, url, tabs: [], env });
-  const stale = s.acc !== null && (seen.kind === "login" || seen.kind === "sso" || (seen.kind === "ok" && passwordShown(execDir, s.name, env)));
+  const seen = url === undefined ? /** @type {PageClassification} */ ({ kind: "off" }) : verdict({ cwd: execDir, session: s.name, origin, loginUrl: s.login_url, url, tabs: [], env, context: platformContext });
+  const stale = s.acc !== null && (seen.kind === "login" || seen.kind === "sso" || (seen.kind === "ok" && passwordShown(execDir, s.name, env, platformContext)));
   if (!stale) return { seen, url };
   if (reached.fresh) dropAuth(runDir, s.acc);
   return { refusal: stop("login_failed", { access: s.acc, error: reached.fresh ? "a fresh login still lands on the sign-in page: the password may be wrong, or the page asked for more" : "the saved login state lands on the sign-in page: log in again and save the state" }) };
@@ -312,9 +237,7 @@ function openAndLand(s, c) {
  * @returns {string[]}
  */
 function skippedNotes(runDir) {
-  /** @type {RunFileResult<ExecuteDispatchState>} */
-  const read = readRunFile(runDir, "dispatch.json", { by: "execute confirm", restart: "execute plan" });
-  return Array.isArray(read.value?.skipped) ? read.value.skipped : [];
+  return readState(runDir)?.skipped ?? [];
 }
 
 /**
@@ -338,11 +261,11 @@ function openExecution(args, { dir, root, execution: id, env, platformContext })
   if (ex.blocked) return stop("execution_blocked", { execution: id, reason: ex.blocked.reason });
   const execDir = executionDir(runDir, /** @type {string} */ (id));
   if (readGuard(execDir)) return stop("already_open", { execution: id });
-  const host = admitRun(pinned, { env });
+  const host = admitRun(pinned, { env: platformContext?.env ?? env });
   if (host.refusal) return host.refusal;
   const cli = playwrightCliVersion(env, platformContext);
   if (cli.status === "missing") return stop("no_playwright_cli", { upgrade: UPGRADE_PLAYWRIGHT_CLI });
-  if (cli.status === "refused") return stop("refused_playwright_cli", { check: cli.refusal.code, reason: cli.refusal.message });
+  if (cli.status === "refused") return stop("refused_playwright_cli", { check: cli.refusal.code, ...platformRefusalFacts(cli.refusal) });
   if (cli.status === "old") return stop("old_playwright_cli", { ...(cli.found && { found: cli.found }), ...(cli.failure && { failure: cli.failure }), minimum: MIN_PLAYWRIGHT_CLI, upgrade: UPGRADE_PLAYWRIGHT_CLI });
 
   root = pinned.root ?? root;
@@ -355,21 +278,21 @@ function openExecution(args, { dir, root, execution: id, env, platformContext })
   const safe = /** @template T @param {T} value @returns {T} */ (value) => maskCredentialValue(value, values);
   for (const key of ex.access) {
     const note = accessNoteNamed(/** @type {string} */ (root), key, { headerCredentials: true });
-    if (!note) return stop("note_missing", { access: key });
-    if (note.withheld) return stop("note_withheld", { access: key });
+    if (!note) return stop("note_missing", { access: key, next: "/qa-train access" });
+    if (note.withheld) return stop("note_withheld", { access: key, next: "/qa-train access" });
     const header = readHeaderCredential(/** @type {string} */ (root), note);
-    if (header.refusal) return stop(header.refusal.code, { access: key, error: header.refusal.message, ...(header.refusal.gitignore_line && { gitignore_line: header.refusal.gitignore_line }) });
+    if (header.refusal) return stop(header.refusal.code, headerRefusalFacts(header.refusal, { access: key }));
     const expired = readExpiredHeaderCredential(/** @type {string} */ (root), note);
     values.push(...headerCredentialValues(header.credential), ...headerCredentialValues(expired.credential ?? null));
-    if (expired.refusal) return safe(stop(expired.refusal.code, { access: key, error: expired.refusal.message, ...(expired.refusal.gitignore_line && { gitignore_line: expired.refusal.gitignore_line }) }));
+    if (expired.refusal) return safe(stop(expired.refusal.code, headerRefusalFacts(expired.refusal, { access: key })));
     notes.set(key, note);
   }
   const skipped = skippedNotes(runDir);
   const sessions = namedSessions(pinned.run, /** @type {string} */ (id), ex.sessions.filter((s) => !(skipped.includes(/** @type {string} */ (s.acc)) && isHelper(ex, s)))).map((s) => ({ ...s, ...(notes.get(s.acc)?.header_via !== undefined && { header: true }), ...(cliLoginUser(notes.get(s.acc)) && { user: /** @type {string} */ (cliLoginUser(notes.get(s.acc))) }), kind: /** @type {"header-only" | "browser"} */ (isHeaderOnly(notes.get(s.acc)) ? "header-only" : "browser"), login_url: loginUrlOf(notes.get(s.acc), origin) }));
   mkdirSync(join(runDir, ".playwright"), { recursive: true });
   mkdirSync(execDir, { recursive: true });
-  const execPrivacy = checkDirPrivacy(execDir, { env });
-  if (!execPrivacy.ok) return safe(stop(execPrivacy.refusal.code, { error: execPrivacy.refusal.message, ...(execPrivacy.refusal.command && { command: execPrivacy.refusal.command }) }));
+  const execPrivacy = checkDirPrivacy(execDir, { ...platformContext, env });
+  if (!execPrivacy.ok) return safe(stop(execPrivacy.refusal.code, platformRefusalFacts(execPrivacy.refusal)));
   /** @type {ExecutionGuard} */
   const guard = {
     id: /** @type {string} */ (id), run: pinned.run, origin, cap: ex.cap, used: 0, stopped: null, sessions, login_sessions: sessions.filter((s) => cliLoginUser(notes.get(s.acc))).map((s) => `${s.name}-login`),
@@ -383,6 +306,8 @@ function openExecution(args, { dir, root, execution: id, env, platformContext })
 
   /** @type {string[]} */
   const attempted = [];
+  /** @type {Set<string>} */
+  const keptAuths = new Set();
   /** @type {Array<{ role: string, name: string, page_url?: string, stopped?: string }>} */
   const landing = [];
   /** @param {RefusalResult} refusal */
@@ -391,12 +316,14 @@ function openExecution(args, { dir, root, execution: id, env, platformContext })
       playwright(execDir, name, ["close"], env, undefined, platformContext);
       dropProfile(execDir, name);
     }
+    for (const acc of keptAuths) dropAuth(runDir, acc);
     rmSync(join(execDir, GUARD_FILE), { force: true });
+    rmSync(join(execDir, "uploads"), { recursive: true, force: true });
     return safe(refusal);
   };
   for (const s of sessions) {
     if (s.kind === "header-only") continue;
-    const entered = openAndLand(s, { root: /** @type {string} */ (root), runDir, origin, execDir, notes, env, attempted, platformContext });
+    const entered = openAndLand(s, { root: /** @type {string} */ (root), runDir, origin, execDir, notes, env, attempted, keptAuths, platformContext });
     if (entered.refusal) return fail(entered.refusal);
     const { seen, url } = entered;
     if (seen.kind === "off") guard.stopped ??= "off-target";
@@ -421,12 +348,13 @@ function closeExecution(args, { dir, execution: id, env, platformContext }) {
   /** @type {string[]} */
   const closed = [];
   if (guard && !guard.closed) {
-    for (const name of [...guard.sessions.filter((s) => s.kind !== "header-only").map((s) => s.name), ...(guard.login_sessions ?? [])]) {
+    const targets = [...guard.sessions.filter((s) => s.kind !== "header-only").map((s) => s.name), ...(guard.login_sessions ?? [])];
+    for (const name of targets) {
       const closedRun = playwright(execDir, name, ["close"], env, undefined, platformContext);
-      if (!closedRun.missing && !closedRun.refused) closed.push(name);
+      if (!closedRun.missing && !closedRun.refused && !closedRun.error) closed.push(name);
       dropProfile(execDir, name);
     }
-    writeGuard(execDir, { ...guard, closed: true });
+    if (closed.length === targets.length) writeGuard(execDir, { ...guard, closed: true });
   }
   return { exit: 0, json: { action: "close", ok: true, execution: id, closed } };
 }

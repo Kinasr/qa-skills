@@ -34,6 +34,7 @@ import { createHash } from "node:crypto";
 import { join, relative, sep } from "node:path";
 import { isMap } from "./dialect.mjs";
 import { loadQaAt, repositoryOf } from "./git-tree.mjs";
+import { isContained } from "./paths.mjs";
 import { resolveCommits } from "./git.mjs";
 import { parseRuleRef, resolveRuleRef, ruleRefsIn } from "./rule-ref.mjs";
 import { edit, parse } from "./knowledge-file.mjs";
@@ -105,12 +106,13 @@ export const featureDismissalHolds = (dismissed, resolves) => resolves || writte
 // before/after check; every ordinary caller leaves it off.
 /**
  * @param {readonly (ParsedFile | UnreadableFile)[]} files
- * @param {{ legacy?: boolean }} [options]
+ * @param {{ legacy?: boolean, identity?: (scope: string, field: string, value: unknown) => unknown }} [options]
  * @returns {PinDigests}
  */
-export function digests(files, { legacy = false } = {}) {
+export function digests(files, { legacy = false, identity } = {}) {
   const index = buildIndex(files);
   const stripFn = legacy ? legacyStrip : strip;
+  const stripOptions = identity ? { identity } : {};
   /** @type {Map<ParsedFile, Stripped>} */
   const stripped = new Map();
   /**
@@ -118,7 +120,7 @@ export function digests(files, { legacy = false } = {}) {
    * @returns {Stripped}
    */
   const s = (f) => {
-    if (!stripped.has(f)) stripped.set(f, claimProjection(/** @type {StrippableFile} */ (f), {}, stripFn));
+    if (!stripped.has(f)) stripped.set(f, claimProjection(/** @type {StrippableFile} */ (f), stripOptions, stripFn));
     return /** @type {Stripped} */ (stripped.get(f));
   };
   // The Feature's impact projection is what a Watermark or Stale pin digests (ADR-0033 as
@@ -130,7 +132,7 @@ export function digests(files, { legacy = false } = {}) {
    * @returns {Stripped}
    */
   const projected = (f) => {
-    if (!impact.has(f)) impact.set(f, impactProjection(/** @type {StrippableFile} */ (f), {}, stripFn));
+    if (!impact.has(f)) impact.set(f, impactProjection(/** @type {StrippableFile} */ (f), stripOptions, stripFn));
     return /** @type {Stripped} */ (impact.get(f));
   };
   /**
@@ -285,7 +287,11 @@ export function pinsOf(file) {
  */
 function digestAt(d, file, p) {
   if (p.pin === "review") return d.review(/** @type {string} */ (p.caseKey));
-  if (p.pin === "dismissed") return d.dismissal(p.caseKey, /** @type {Record<string, unknown>} */ (p.finding), file.type === "feature" ? /** @type {string} */ (file.data.key) : null);
+  if (p.pin === "dismissed") {
+    const finding = /** @type {Record<string, unknown> | undefined} */ (p.finding);
+    const caseKey = typeof finding?.dismissed_case === "string" ? finding.dismissed_case : p.caseKey;
+    return d.dismissal(caseKey, /** @type {Record<string, unknown>} */ (p.finding), file.type === "feature" ? /** @type {string} */ (file.data.key) : null);
+  }
   const slug = file.type === "feature" ? file.data.key : d.index.cases.get(/** @type {string} */ (p.caseKey))?.[0]?.feature ?? d.index.scenarios.get(/** @type {string} */ (file.data.key))?.[0]?.feature ?? null;
   return typeof slug === "string" ? d.feature(slug) : null;
 }
@@ -371,7 +377,7 @@ export function backfill(root, rel, text) {
  * @param {unknown} value
  * @returns {Record<string, unknown>}
  */
-const besidePin = (m, pin, key, value) => Object.fromEntries(Object.entries(m).flatMap(([k, v]) => (k === pin ? [[k, v], [key, value]] : [[k, v]])));
+const besidePin = (m, pin, key, value) => Object.fromEntries(Object.entries(m).filter(([k]) => k !== key).flatMap(([k, v]) => (k === pin ? [[k, v], [key, value]] : [[k, v]])));
 
 // A Changeset (lib/changeset.mjs) whose paths are relative to `base`, with `backfill` made on each
 // write of a `.md` file under the `.qa/` dir `root`.
@@ -385,8 +391,8 @@ export function backfillChangeset(root, base, changeset) {
   if (!root) return changeset;
   const writes = changeset.writes.map((w) => {
     const rel = relative(root, join(base, w.path)).split(sep).join("/");
-    if (rel.startsWith("..") || !rel.endsWith(".md")) return w;
-    return { ...w, text: backfill(root, rel, /** @type {string} */ (w.text)) };
+    if (!isContained(root, join(base, w.path)) || !rel.endsWith(".md")) return w;
+    return { ...w, text: backfill(root, rel, w.text) };
   });
   return { ...changeset, writes };
 }

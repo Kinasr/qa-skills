@@ -20,12 +20,12 @@ import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative, resolve, sep } from "node:path";
-import { spawnNodeCli } from "../platform.mjs";
+import { defaultPlatformRunner, spawnNodeCli } from "../platform.mjs";
 import { PLAYWRIGHT_RUNNER_LAUNCHER } from "../platform-runner.mjs";
 /**
  * @import { AutomationAttempt, AutomationBlockedReason, AutomationSelection, RunnerResult } from "../test-runner.mjs"
  * @import { TestRunner } from "../knowledge-file.mjs"
- * @import { PlatformRefusal } from "../platform.mjs"
+ * @import { PlatformContext, PlatformRefusal, PlatformRunner } from "../platform.mjs"
  */
 
 /**
@@ -78,7 +78,7 @@ import { PLAYWRIGHT_RUNNER_LAUNCHER } from "../platform-runner.mjs";
  * One invocation's options: what to run, where, against which origin, and with how many retries.
  * @typedef {{
  *   selection: AutomationSelection,
- *   runner: TestRunner,
+ *   runner: Omit<TestRunner, "dir"> & { dir?: string },
  *   repo: string,
  *   dir: string,
  *   origin: string,
@@ -86,6 +86,7 @@ import { PLAYWRIGHT_RUNNER_LAUNCHER } from "../platform-runner.mjs";
  *   retries: number,
  *   repeats?: number,
  *   platform?: NodeJS.Platform,
+ *   context?: PlatformContext,
  * }} RunOptions
  */
 
@@ -128,14 +129,39 @@ const atLeast = (version, minor) => {
   return major > 1 || (major === 1 && part >= minor);
 };
 
-// The version probe is per launcher and working directory: one extra process per Run, not per Automation.
-/** @type {Map<string, string>} */
-const versions = new Map();
+/**
+ * Per-runner partitioned cache so `versions` / `roots` never share probe results across distinct
+ * `context.run` seams, platforms, or environments while avoiding duplicate probes in one Run.
+ * @template T
+ * @returns {{ get: (runner: PlatformRunner, key: string) => T | undefined, set: (runner: PlatformRunner, key: string, value: T) => void }}
+ */
+function partitionedCache() {
+  /** @type {WeakMap<PlatformRunner, Map<string, T>>} */
+  const byRunner = new WeakMap();
+  return {
+    get(runner, key) {
+      return byRunner.get(runner)?.get(key);
+    },
+    set(runner, key, value) {
+      let map = byRunner.get(runner);
+      if (!map) {
+        map = new Map();
+        byRunner.set(runner, map);
+      }
+      map.set(key, value);
+    },
+  };
+}
+
+/** @param {Record<string, string | undefined>} env @returns {string} */
+const envCacheKey = (env) => JSON.stringify(Object.entries(env).filter(([, value]) => value !== undefined).sort(([a], [b]) => a.localeCompare(b)));
+
+// The version probe is per runner, platform, env, launcher and working directory.
+const versions = /** @type {ReturnType<typeof partitionedCache<string>>} */ (partitionedCache());
 
 // Playwright writes its config only inside a JSON report, so the root is asked for with an empty
 // `--list` run: one extra process per Run, not per Automation, and only for a `--test-list` line.
-/** @type {Map<string, string | undefined>} */
-const roots = new Map();
+const roots = /** @type {ReturnType<typeof partitionedCache<string>>} */ (partitionedCache());
 
 // The probe's single list line names a file no project holds, so the list run only loads the config.
 const ROOT_PROBE_LINE = "qa-skills-root-probe.spec.ts";
@@ -147,12 +173,13 @@ const ROOT_PROBE_LINE = "qa-skills-root-probe.spec.ts";
  * @param {readonly string[]} launcher
  * @param {string} cwd
  * @param {NodeJS.Platform} platform
+ * @param {PlatformContext} [context]
  * @returns {Launch | LaunchRefusal}
  */
-function runnerLaunch(launcher, cwd, platform) {
+function runnerLaunch(launcher, cwd, platform, context = {}) {
   const resolved = spawnNodeCli(
     { kind: "playwright-runner", file: launcher[0], args: launcher.slice(1), options: {}, cwd },
-    { platform },
+    { ...context, platform: context.platform ?? platform },
   );
   return resolved.refusal ? { refusal: resolved.refusal } : { file: resolved.file, args: resolved.args };
 }
@@ -169,45 +196,59 @@ const selectorOf = (rendered, selection) => (rendered.kind === "grep" ? `@${sele
  * @param {Launch} launch
  * @param {string} cwd
  * @param {Record<string, string | undefined>} env
+ * @param {NodeJS.Platform} platform
+ * @param {PlatformContext} [context]
  * @returns {string}
  */
-function playwrightVersion(launch, cwd, env) {
-  const key = `${[launch.file, ...launch.args].join("\0")}\0${cwd}`;
-  const known = versions.get(key);
+function playwrightVersion(launch, cwd, env, platform, context = {}) {
+  const runner = context.run ?? defaultPlatformRunner;
+  const effectivePlatform = context.platform ?? platform;
+  const key = `${effectivePlatform}\0${envCacheKey(env)}\0${[launch.file, ...launch.args].join("\0")}\0${cwd}`;
+  const known = versions.get(runner, key);
   if (known) return known;
-  const probe = spawnSync(launch.file, [...launch.args, "--version"], { cwd, env, encoding: "utf8", shell: false });
+  const probe = runner(launch.file, [...launch.args, "--version"], { cwd, env, encoding: "utf8", shell: false });
   const version = probe.status === 0 ? /\b(\d+\.\d+\.\d+)\b/.exec(probe.stdout ?? "")?.[1] ?? "0.0.0" : "0.0.0";
-  versions.set(key, version);
+  versions.set(runner, key, version);
   return version;
 }
 
 /**
  * Playwright's root directory, the base its `--test-list` lines and report paths are relative to.
+ * Never caches failed probes as `undefined` so transient failures can recover on retry.
  * @param {Launch} launch
  * @param {string[]} args The runner's own extra arguments, so a `--config` override is honoured.
  * @param {string} cwd
  * @param {Record<string, string | undefined>} env
+ * @param {NodeJS.Platform} platform
+ * @param {PlatformContext} [context]
  * @returns {string | undefined} The root, or undefined when the probe cannot read one.
  */
-function playwrightRoot(launch, args, cwd, env) {
-  const key = `${[launch.file, ...launch.args].join("\0")}\0${args.join("\0")}\0${cwd}`;
-  if (roots.has(key)) return roots.get(key);
+function playwrightRoot(launch, args, cwd, env, platform, context = {}) {
+  const runner = context.run ?? defaultPlatformRunner;
+  const effectivePlatform = context.platform ?? platform;
+  const key = `${effectivePlatform}\0${envCacheKey(env)}\0${[launch.file, ...launch.args].join("\0")}\0${args.join("\0")}\0${cwd}`;
+  const known = roots.get(runner, key);
+  if (known !== undefined) return known;
   const dir = mkdtempSync(join(tmpdir(), "qa-skills-playwright-root-"));
   try {
     const list = join(dir, "test-list.txt");
     writeFileSync(list, `${ROOT_PROBE_LINE}\n`);
     const report = join(dir, "report.json");
-    spawnSync(launch.file, [...launch.args, ...args, "--list", "--test-list", list, "--reporter=json"], {
+    const probe = runner(launch.file, [...launch.args, ...args, "--list", "--test-list", list, "--reporter=json"], {
       cwd, env: { ...env, PLAYWRIGHT_JSON_OUTPUT_FILE: report }, encoding: "utf8", shell: false,
     });
+    if (probe.error) return undefined;
     const root = /** @type {PwReport | undefined} */ (JSON.parse(readFileSync(report, "utf8")))?.config?.rootDir;
-    roots.set(key, typeof root === "string" && root.length ? root : undefined);
+    if (typeof root === "string" && root.length) {
+      roots.set(runner, key, root);
+      return root;
+    }
+    return undefined;
   } catch {
-    roots.set(key, undefined);
+    return undefined;
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
-  return roots.get(key);
 }
 
 // A literal title line is faithful only when every component is a plain, trimmed title: the list
@@ -216,7 +257,7 @@ function playwrightRoot(launch, args, cwd, env) {
 /** @param {AutomationSelection} selection @returns {boolean} */
 const listable = (selection) =>
   selection.literal && selection.titles.length > 0 &&
-  selection.titles.every((title) => title.length > 0 && title.trim() === title && !title.includes("›"));
+  selection.titles.every((title) => title.length > 0 && title.trim() === title && !/[›>\r\n]/.test(title));
 
 // Whether the selection becomes a `--test-list` line, and so needs Playwright's root before the run.
 /** @param {AutomationSelection} selection @param {string} version @returns {boolean} */
@@ -314,10 +355,13 @@ export function parseReport(report, selection, cwd, repo) {
     }
   };
   walk(report.suites);
-  if (!Object.keys(parsed.instances).length) {
-    const errors = report.errors ?? [];
-    parsed.reason = errors.length && !noMatch(errors) ? "runner-error" : "no-result";
-    parsed.diagnostics.push(...errors.map((error) => error.message ?? (parsed.reason === "runner-error" ? "Root suite error" : "No tests found")));
+  const errors = report.errors ?? [];
+  if (errors.length) {
+    parsed.diagnostics.push(...errors.map((error) => error.message ?? (noMatch(errors) ? "No tests found" : "Root suite error")));
+    if (!noMatch(errors)) block("runner-error");
+    else if (!Object.keys(parsed.instances).length) parsed.reason ??= "no-result";
+  } else if (!Object.keys(parsed.instances).length) {
+    parsed.reason ??= "no-result";
   }
   return parsed;
 }
@@ -327,10 +371,12 @@ export function parseReport(report, selection, cwd, repo) {
  * @param {RunOptions} options
  * @returns {{ parsed: RunnerResult, selector: string }}
  */
-export function runPlaywright({ selection, runner, repo, dir, origin, env, retries, repeats, platform = process.platform }) {
-  const cwd = join(repo, runner.dir);
+export function runPlaywright({ selection, runner, repo, dir, origin, env, retries, repeats, platform = process.platform, context = {} }) {
+  const effectivePlatform = context.platform ?? platform;
+  const cwd = join(repo, runner.dir ?? ".");
   const launcher = runner.launcher ?? PLAYWRIGHT_RUNNER_LAUNCHER;
-  const launch = runnerLaunch(launcher, cwd, platform);
+  const baseEnv = context.env ? { ...env, ...context.env } : env;
+  const launch = runnerLaunch(launcher, cwd, effectivePlatform, { ...context, env: baseEnv });
   // A launcher the platform module refuses never starts a process: the Automation is Blocked
   // `runner-error` with the refusal as its diagnostic, as any other launcher problem is.
   if ("refusal" in launch) {
@@ -340,12 +386,12 @@ export function runPlaywright({ selection, runner, repo, dir, origin, env, retri
       selector: selectorOf(playwrightSelection(selection, "0.0.0", file), selection),
     };
   }
-  const inherited = { ...env, ...Object.fromEntries(runner.target_env.map((name) => [name, origin])) };
-  const version = playwrightVersion(launch, cwd, inherited);
+  const inherited = { ...baseEnv, ...Object.fromEntries(runner.target_env.map((name) => [name, origin])) };
+  const version = playwrightVersion(launch, cwd, inherited, effectivePlatform, context);
   const args = runner.args ?? [];
   // Only a `--test-list` line is rendered from Playwright's root; the location fallback stays
   // relative to the working directory, where Playwright matches it against absolute paths.
-  const probed = selectionsList(selection, version) ? playwrightRoot(launch, args, cwd, inherited) : undefined;
+  const probed = selectionsList(selection, version) ? playwrightRoot(launch, args, cwd, inherited, effectivePlatform, context) : undefined;
   const rendered = playwrightSelection(selection, version, posixRelative(probed ?? cwd, repo, selection.file));
   /** @type {string[]} */
   let filter;
@@ -360,7 +406,8 @@ export function runPlaywright({ selection, runner, repo, dir, origin, env, retri
     ...launch.args, ...args, ...filter, reporter, "--output", join(dir, "artifacts"), `--retries=${retries}`, ...(repeats ? [`--repeat-each=${repeats}`, "--max-failures=1", "--workers=1"] : []),
   ];
   const reportPath = join(dir, "report.json");
-  const child = spawnSync(launch.file, argv, { cwd, env: { ...inherited, PLAYWRIGHT_JSON_OUTPUT_FILE: reportPath }, encoding: "utf8", shell: false });
+  const spawnOptions = { cwd, env: { ...inherited, PLAYWRIGHT_JSON_OUTPUT_FILE: reportPath }, encoding: /** @type {const} */ ("utf8"), shell: false };
+  const child = context.run ? context.run(launch.file, argv, spawnOptions) : spawnSync(launch.file, argv, spawnOptions);
   /** @type {RunnerResult} */
   let parsed;
   try {
@@ -369,7 +416,8 @@ export function runPlaywright({ selection, runner, repo, dir, origin, env, retri
     parsed = { instances: {}, reason: "runner-error", diagnostics: ["Missing or unreadable runner report"] };
   }
   // A usable report survives exit 1 (test failures); a signal, a start error or an interruption blocks the run.
-  if (child.signal || child.error || child.status === 130) parsed.reason = "runner-error";
+  const signal = "signal" in child ? child.signal : undefined;
+  if (signal || child.error || child.status === 130) parsed.reason = "runner-error";
   parsed.diagnostics.push(...[child.stdout ?? "", child.stderr ?? ""].map((text) => text.trim()).filter(Boolean));
   // The record names the tag it ran. The end-bounded pattern is argv-only: the record keeps the
   // plain tag, and an ambiguous record selector would be worse than a narrower one.

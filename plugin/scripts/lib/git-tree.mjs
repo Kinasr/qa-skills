@@ -6,7 +6,7 @@
 // checkout. `git.mjs` batch-resolves pins for the Integrity checks; this module serves history.
 /** @import { ParsedFile, UnreadableFile } from "./knowledge-file.mjs" */
 /** @import { TreeEntries } from "./qa-index.mjs" */
-import { spawnSync } from "node:child_process";
+import { gitReason, runGitBuffer } from "./git.mjs";
 import { parseTree } from "./knowledge-file.mjs";
 import { readWorkingTree } from "./qa-index.mjs";
 
@@ -24,16 +24,6 @@ import { readWorkingTree } from "./qa-index.mjs";
  * @typedef {Map<string, string>} QaFiles
  */
 
-/**
- * @param {string | undefined} dir
- * @param {readonly string[]} args
- * @param {string} [input]
- * @returns {import("node:child_process").SpawnSyncReturns<Buffer>}
- */
-function git(dir, args, input) {
-  return spawnSync("git", ["-C", /** @type {string} */ (dir), ...args], { input, maxBuffer: 1 << 30 });
-}
-
 // Where `.qa/` sits in its repository: the top level and `.qa/`'s path prefix inside it (`.qa/`,
 // or `""` if it is the top level itself). Null when `root` is not inside a git repository.
 /**
@@ -41,7 +31,8 @@ function git(dir, args, input) {
  * @returns {Repository | null}
  */
 export function repositoryOf(root) {
-  const r = git(root, ["rev-parse", "--show-toplevel", "--show-prefix"]);
+  if (!root) return null;
+  const r = runGitBuffer(root, ["rev-parse", "--show-toplevel", "--show-prefix"]);
   if (r.status !== 0) return null;
   const [top, prefix = ""] = r.stdout.toString("utf8").split("\n");
   return { top, prefix };
@@ -54,8 +45,8 @@ export function repositoryOf(root) {
  * @returns {string | null}
  */
 export function resolveRef(dir, ref) {
-  if (typeof ref !== "string" || ref === "" || ref.startsWith("-")) return null;
-  const r = git(dir, ["rev-parse", "--verify", "--quiet", "--end-of-options", `${ref}^{commit}`]);
+  if (!dir || typeof ref !== "string" || ref === "" || ref.startsWith("-")) return null;
+  const r = runGitBuffer(dir, ["rev-parse", "--verify", "--quiet", "--end-of-options", `${ref}^{commit}`]);
   return r.status === 0 ? r.stdout.toString("utf8").trim() : null;
 }
 
@@ -67,7 +58,22 @@ export function resolveRef(dir, ref) {
  * @returns {boolean}
  */
 export function isStrictAncestor(dir, a, b) {
-  return a !== b && git(dir, ["merge-base", "--is-ancestor", a, b]).status === 0;
+  return a !== b && runGitBuffer(dir, ["merge-base", "--is-ancestor", a, b]).status === 0;
+}
+
+/**
+ * The commits on `tip`'s first-parent history that touch any of `paths` (repository-relative,
+ * literal), oldest first, or an explicit error when git cannot answer.
+ * @param {string} dir
+ * @param {string} tip
+ * @param {readonly string[]} paths
+ * @returns {{ ok: true, commits: string[] } | { ok: false, error: string }}
+ */
+export function firstParentTouchingResult(dir, tip, paths) {
+  if (paths.length === 0) return { ok: true, commits: [] };
+  const r = runGitBuffer(dir, ["--literal-pathspecs", "rev-list", "--first-parent", "--reverse", tip, "--", ...paths]);
+  if (r.status === 0 && !r.error) return { ok: true, commits: r.stdout.toString("utf8").split("\n").filter(Boolean) };
+  return { ok: false, error: gitReason(r, "rev-list") };
 }
 
 // The commits on `tip`'s first-parent history that touch any of `paths` (repository-relative,
@@ -79,9 +85,8 @@ export function isStrictAncestor(dir, a, b) {
  * @returns {string[]}
  */
 export function firstParentTouching(dir, tip, paths) {
-  if (paths.length === 0) return [];
-  const r = spawnSync("git", ["-C", dir, "--literal-pathspecs", "rev-list", "--first-parent", "--reverse", tip, "--", ...paths], { maxBuffer: 1 << 30 });
-  return r.status === 0 ? r.stdout.toString("utf8").split("\n").filter(Boolean) : [];
+  const res = firstParentTouchingResult(dir, tip, paths);
+  return res.ok ? res.commits : [];
 }
 
 // A commit's files never change, so each commit's `.qa/` is read from git once per process, by
@@ -89,36 +94,50 @@ export function firstParentTouching(dir, tip, paths) {
 /** @type {Map<string, QaFiles>} */
 const qaByCommit = new Map();
 
+// Every `.md` file under `.qa/` at `commit`, as rel path → text, in a stable order, or an
+// explicit error when git cannot list or read them. Each call returns its own map.
+/**
+ * @param {Repository | null} repo
+ * @param {string | null | undefined} commit
+ * @returns {{ ok: true, files: QaFiles } | { ok: false, error: string }}
+ */
+export function readQaAtResult(repo, commit) {
+  if (!repo || !commit) return { ok: false, error: !repo ? "not inside a git repository" : "missing commit" };
+  const key = `${repo.prefix}\0${commit}`;
+  /** @type {QaFiles | undefined} */
+  let files = qaByCommit.get(key);
+  if (!files) {
+    const res = readFromGitResult(repo, commit);
+    if (!res.ok) return res;
+    files = res.files;
+    if (/^[0-9a-f]{40,64}$/.test(commit)) qaByCommit.set(key, files);
+  }
+  return { ok: true, files: new Map(files) };
+}
+
 // Every `.md` file under `.qa/` at `commit`, as rel path → text, in a stable order. Each call
-// returns its own map.
+// returns its own map, or an empty map when git cannot list or read them.
 /**
  * @param {Repository | null} repo
  * @param {string | null | undefined} commit
  * @returns {QaFiles}
  */
 export function readQaAt(repo, commit) {
-  const key = `${/** @type {Repository} */ (repo).prefix}\0${commit}`;
-  /** @type {QaFiles | null | undefined} */
-  let files = qaByCommit.get(key);
-  if (!files) {
-    files = readFromGit(/** @type {Repository} */ (repo), /** @type {string} */ (commit));
-    if (!files) return new Map();
-    if (/^[0-9a-f]{40,64}$/.test(/** @type {string} */ (commit))) qaByCommit.set(key, files);
-  }
-  return new Map(files);
+  const res = readQaAtResult(repo, commit);
+  return res.ok ? res.files : new Map();
 }
 
-// `readQaAt`'s files, or null when git cannot list or read them.
+// `readQaAtResult`'s files, or an explicit error when git cannot list or read them.
 /**
  * @param {Repository} repo
  * @param {string} commit
- * @returns {QaFiles | null}
+ * @returns {{ ok: true, files: QaFiles } | { ok: false, error: string }}
  */
-function readFromGit(repo, commit) {
+function readFromGitResult(repo, commit) {
   /** @type {QaFiles} */
   const files = new Map();
-  const ls = git(repo.top, ["ls-tree", "-r", "-z", "--full-tree", commit, "--", repo.prefix || "."]);
-  if (ls.status !== 0) return null;
+  const ls = runGitBuffer(repo.top, ["ls-tree", "-r", "-z", "--full-tree", commit, "--", repo.prefix || "."]);
+  if (ls.status !== 0 || ls.error) return { ok: false, error: gitReason(ls, "ls-tree") };
   /** @type {Array<{ sha: string, rel: string }>} */
   const blobs = [];
   for (const entry of ls.stdout.toString("utf8").split("\0")) {
@@ -128,18 +147,20 @@ function readFromGit(repo, commit) {
     if (rel.endsWith(".md")) blobs.push({ sha: m[1], rel });
   }
   blobs.sort((x, y) => (x.rel < y.rel ? -1 : x.rel > y.rel ? 1 : 0));
-  if (blobs.length === 0) return files;
-  const cat = git(repo.top, ["cat-file", "--batch"], blobs.map((b) => `${b.sha}\n`).join(""));
-  if (cat.status !== 0) return null;
+  if (blobs.length === 0) return { ok: true, files };
+  const cat = runGitBuffer(repo.top, ["cat-file", "--batch"], { input: blobs.map((b) => `${b.sha}\n`).join("") });
+  if (cat.status !== 0 || cat.error) return { ok: false, error: gitReason(cat, "cat-file") };
   const out = cat.stdout;
   let at = 0;
   for (const b of blobs) {
     const eol = out.indexOf(10, at);
+    if (eol < 0) return { ok: false, error: `git cat-file truncated output at ${b.sha}` };
     const size = Number(out.toString("utf8", at, eol).split(" ")[2]);
+    if (!Number.isFinite(size)) return { ok: false, error: `git cat-file missing blob ${b.sha}` };
     files.set(b.rel, out.toString("utf8", eol + 1, eol + 1 + size));
     at = eol + 1 + size + 1;
   }
-  return files;
+  return { ok: true, files };
 }
 
 // Each `read*` gives `[rel, text]` entries for lib/knowledge-file.mjs `parseTree`, and its `load*`

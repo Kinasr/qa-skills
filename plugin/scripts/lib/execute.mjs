@@ -1,15 +1,15 @@
 // @ts-check
 // Planning pins the working-tree claim. No login or browser opens before the engineer confirms.
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { buildIndex, loadWorkingTree } from "./qa-index.mjs";
+import { buildIndex, buildScopeState, loadWorkingTree, resolveScopeToken } from "./qa-index.mjs";
 import { checkFile, projectConfig } from "./knowledge-file.mjs";
 import { digestOf, digests } from "./pin-digest.mjs";
 import { loadQaAt, repositoryOf, resolveRef } from "./git-tree.mjs";
 import { caseMatchesLevels, caseLevels, caseFields, casePreconditions, caseSteps, stepActor } from "./case-fields.mjs";
 import { isHeaderOnly, isNoLogin, signInUrl } from "./access-note.mjs";
 import { hasPasswordSource } from "./typed-secret.mjs";
-import { readHeaderCredential } from "./header-credential.mjs";
+import { headerRefusalFacts, readHeaderCredential } from "./header-credential.mjs";
 import { accessFor, accessNotes, rolesCoveringIn } from "./access.mjs";
 import { isDeclaredTag } from "./case-labels.mjs";
 import { executeTraining } from "./execute-training.mjs";
@@ -18,20 +18,20 @@ import { trainFile } from "./training.mjs";
 import { loginUrlOf } from "./execution-guard.mjs";
 import { loginFor } from "./scout.mjs";
 import { noArguments } from "./cli.mjs";
+import { platformRefusalFacts } from "./platform.mjs";
 /** @import { PlatformContext } from "./platform.mjs" */
 import { MIN_PLAYWRIGHT_CLI, UPGRADE_PLAYWRIGHT_CLI, playwrightCliVersion } from "./playwright-version.mjs";
-import { newRunDir, newRunId } from "./run-dir.mjs";
+import { newRunDir, newRunId, writeJsonAtomic } from "./run-dir.mjs";
 import { refuseUnreadSchema } from "./schema-guard.mjs";
 import { claimProjection } from "./stripped.mjs";
-import { ACCESS_TRAIN_KEY, CODEGEN_TRAIN_KEY, EXECUTE_TRAIN_KEY, LEVEL_ON_CASE_SCHEMA_VERSION, SCHEMA_VERSION } from "./schema.mjs";
+import { ACCESS_TRAIN_KEY, ANY_SCHEMA_VERSION, CODEGEN_TRAIN_KEY, EXECUTE_TRAIN_KEY, LEVEL_ON_CASE_SCHEMA_VERSION } from "./schema.mjs";
 import { scan } from "./scan.mjs";
 import { storedCaseFindings } from "./stored-findings.mjs";
-import { refusalsFor } from "./refusal.mjs";
-import { FALLBACK, readTrackerReference } from "./keys.mjs";
-import { concurrencyCap } from "./delegates.mjs";
-import { newDispatch } from "./dispatch.mjs";
-import { tierFor } from "./tiers.mjs";
-import { openActions, plannedRun } from "./execute-open.mjs";
+import { FALLBACK } from "./keys.mjs";
+import { concurrencyCap, tierFor } from "./delegates.mjs";
+import { openActions } from "./execute-open.mjs";
+import { plannedRun } from "./execute-plan.mjs";
+import { newRunState, saveState } from "./execute-state.mjs";
 import { briefActions } from "./execute-brief.mjs";
 import { ingestActions } from "./execute-ingest.mjs";
 import { followUpActions } from "./follow-ups.mjs";
@@ -40,209 +40,19 @@ import { buildCodeIndex, keyPatterns } from "./code-index.mjs";
 import { resolveAdapter } from "./stack.mjs";
 import { runActions } from "./execute-dispatch.mjs";
 import { unguardedReason } from "./host-admission.mjs";
-import { parseDecisions } from "./refusal.mjs";
+import { parseDecisions, refusalsWithoutLines } from "./refusal.mjs";
+import { buildSections } from "./report-sections.mjs";
 import { supportLink } from "./support-link.mjs";
-import { LEVEL_TARGET_REFUSALS, hasUnmappedSplit, levelTargetRefusalLine, resolveLevelTargets, spansMultipleTargets, unmappedLevelsData } from "./level-target.mjs";
+import { hasUnmappedSplit, resolveLevelTargets, spansMultipleTargets, unmappedLevelsData } from "./level-target.mjs";
 
 /**
- * @import { DispatchState } from "./dispatch.mjs"
  * @import { CommandAction, CommandContext, CommandDefinition, CommandResult } from "./cli.mjs"
  * @import { RefusalFact, RefusalResult } from "./refusal.mjs"
  * @import { HistorySection } from "./scan-history.mjs"
- */
-
-/**
- * Target configuration recorded in an ExecutePlan.
- * @typedef {{
- *   slug: string,
- *   origin: string,
- * }} ExecuteTarget
- */
-
-/**
- * Tester delegate configuration recorded in an ExecutePlan.
- * @typedef {{
- *   tier: string,
- *   label: string,
- * }} ExecuteTester
- */
-
-/**
- * Reason and explanation for an execution blocked before dispatch.
- * @typedef {{
- *   reason: string,
- *   why: string,
- * }} ExecuteBlocked
- */
-
-/**
- * Session specification for an execution in an ExecutePlan.
- * @typedef {{
- *   role: string,
- *   acc: string | null,
- *   setup: boolean,
- * }} ExecuteSession
- */
-
-/**
- * Pinned test case execution in an ExecutePlan.
- * @typedef {{
- *   id: string,
- *   key: string,
- *   summary: string,
- *   tracker?: string,
- *   feature: string,
- *   text: string,
- *   level: string,
- *   bound_levels?: string[],
- *   selected_levels?: string[],
- *   omitted_levels?: string[],
- *   mode: string,
- *   digest: string,
- *   dirty: boolean,
- *   review: string,
- *   stale: boolean,
- *   roles: string[],
- *   access: string[],
- *   sessions: ExecuteSession[],
- *   cap: number,
- *   blocked?: ExecuteBlocked,
- *   automations?: string[],
- *   execution_skipped?: string[],
- * }} ExecuteExecution
- */
-
-/**
- * Information on a case skipped during execution planning.
- * @typedef {{
- *   key: string,
- *   reasons: string[],
- * }} ExecuteSkipped
- */
-
-/**
- * A case a `level:` filter excluded before eligibility: a filter exclusion, not an eligibility skip.
- * @typedef {{
- *   key: string,
- *   bound_levels: string[],
- * }} ExecuteExcluded
- */
-
-/**
- * A Layer-free case the plan narrowed to its sole Automation's level while other executable levels
- * exist: this Run exercises only `level`, and `left_out_levels` are not exercised (ADR-0056).
- * @typedef {{
- *   key: string,
- *   level: string,
- *   left_out_levels: string[],
- *   prior_results?: import("./execution-results.mjs").LevelFailure[],
- * }} ExecuteNarrowed
- */
-
-/**
- * The Automation half of a Run's frozen plan (<run>/execute.json): the repository the code index
- * read, the project's `test_runner` (absent when none is declared), and every Automation due in
- * the Run. `execute automation` runs them; `ingest` reads its results.
- * @typedef {{
- *   repo: string,
- *   runner?: import("./knowledge-file.mjs").TestRunner,
- *   selections: import("./test-runner.mjs").AutomationSelection[],
- * }} AutoRun
- */
-
-/**
- * An Unguarded Run's pin (ADR-0057): present only when `execute plan` found a host whose Tester
- * guard cannot be verified, other than Claude Code below the floor. `digest` seals the pre-run Card the engineer acknowledges; `acknowledged` is
- * set by `execute confirm` from the engineer's Reply, after the digest check.
- * @typedef {{ reason: string, digest: string, acknowledged?: boolean }} ExecuteUnguarded
- */
-
-/**
- * `<run>/execute.json` contract shape owned by `execute`.
- * @typedef {{
- *   root?: string,
- *   confirmed: boolean,
- *   run: string,
- *   target: ExecuteTarget,
- *   created_at: string,
- *   playwright_cli: string,
- *   commit: string,
- *   tester: ExecuteTester,
- *   concurrency_cap: number,
- *   executions: ExecuteExecution[],
- *   skipped: ExecuteSkipped[],
- *   excluded?: ExecuteExcluded[],
- *   narrowed?: ExecuteNarrowed[],
- *   selection?: ExecuteSelection,
- *   automation?: AutoRun,
- *   no_password_source?: { role: string, access: string | null }[],
- *   unguarded?: ExecuteUnguarded,
- *   route_origins?: string[],
- *   route_sign_in_urls?: string[],
- * }} ExecutePlan
- */
-
-/**
- * The requested scope and filter values, preserving order and repeats.
- * @typedef {{ scope: string[], tags: string[], levels: string[] }} ExecuteSelection
- */
-
-/**
- * Lock state tracked per Access note in execute's dispatch.json.
- * @typedef {{
- *   mode: "exclusive" | "shared",
- *   holders: string[],
- * }} ExecuteLock
- */
-
-/**
- * Paused note entry in execute's dispatch.json.
- * @typedef {{
- *   acc: string,
- *   roles?: string[],
- *   reason: string,
- * }} ExecutePausedNote
- */
-
-/**
- * Unit tracked in execute's dispatch state machine.
- * @typedef {{
- *   id: string,
- *   blocked?: ExecuteBlocked,
- *   reply?: string,
- * }} ExecuteUnit
- */
-
-/**
- * `<run>/dispatch.json` shape owned by `execute` (specialization of DispatchState).
- * @typedef {DispatchState<ExecuteUnit> & {
- *   locks: Record<string, ExecuteLock>,
- *   paused: ExecutePausedNote[],
- *   retried: string[],
- *   skipped: string[],
- * }} ExecuteDispatchState
- */
-
-/**
- * Shape of a parsed file in the working tree.
- * @typedef {{
- *   rel: string,
- *   type?: string,
- *   data: Record<string, unknown>,
- *   [key: string]: unknown,
- * }} KnowledgeFile
- */
-
-/**
- * An entry in one of qa-index's declaration maps.
- * @typedef {{
- *   file: KnowledgeFile,
- *   line?: number,
- *   feature?: string,
- *   scenario?: string,
- *   entry?: Record<string, unknown> & { key: string, summary: string, data: Record<string, unknown> },
- *   [key: string]: unknown,
- * }} IndexDeclaration
+ * @import { AutoRun, ExecuteBlocked, ExecuteExcluded, ExecuteExecution, ExecuteNarrowed, ExecutePlan, ExecuteSelection, ExecuteSession, ExecuteSkipped, ExecuteTarget, ExecuteUnguarded } from "./execute-plan.mjs"
+ * @import { ParsedFile } from "./knowledge-file.mjs"
+ * @import { KeyIndex, ScopeCase, ScopeState } from "./qa-index.mjs"
+ * @import { ReportSection, SectionSpec } from "./report-sections.mjs"
  */
 
 /**
@@ -257,58 +67,6 @@ import { LEVEL_TARGET_REFUSALS, hasUnmappedSplit, levelTargetRefusalLine, resolv
  */
 
 /**
- * A declaration discovered during scope indexing.
- * @typedef {{
- *   kind: string,
- *   key: string,
- *   feature?: string,
- *   scenario?: string,
- *   file: KnowledgeFile & { rel: string, data: Record<string, unknown> },
- *   entry?: Record<string, unknown> & { key: string, summary: string, data: Record<string, unknown> },
- *   line?: number,
- *   [key: string]: unknown,
- * }} ScopeDeclaration
- */
-
-/**
- * A case declaration discovered during scope indexing.
- * @typedef {{
- *   kind: "case",
- *   key: string,
- *   feature: string,
- *   scenario?: string,
- *   file: KnowledgeFile & { rel: string, data: Record<string, unknown> },
- *   entry: import("./knowledge-file.mjs").ParsedEntry & { summary: string },
- *   line: number,
- *   [key: string]: unknown,
- * }} ScopeCase
- */
-
-/**
- * Index state for scope resolution.
- * @typedef {{
- *   retired: Map<string, string>,
- *   declarations: ScopeDeclaration[],
- *   cases: ScopeCase[],
- *   casesFor: (d: ScopeDeclaration) => ScopeCase[],
- *   liveFeature: (key: string) => boolean,
- * }} ScopeState
- */
-
-/**
- * Outcome of resolving a scope token.
- * @typedef {{
- *   cases: ScopeCase[],
- *   alias?: string,
- *   refusal?: undefined,
- * } | {
- *   cases?: undefined,
- *   alias?: undefined,
- *   refusal: RefusalResult,
- * }} ScopeResolveResult
- */
-
-/**
  * A test case with resolved Access notes and browser sessions.
  * @typedef {ScopeCase & {
  *   roles: string[],
@@ -318,70 +76,7 @@ import { LEVEL_TARGET_REFUSALS, hasUnmappedSplit, levelTargetRefusalLine, resolv
  * }} ResolvedAccessCase
  */
 
-/** @type {Record<string, string>} */
-const FILTER_REFUSALS = {
-  unknown_tag: "The requested Tag is not declared in the project.",
-  retired_tag: "The requested Tag is retired.",
-  unknown_level: "The requested Test level is not declared in the project.",
-};
-
-const { stop } = refusalsFor({
-  invalid_project: "Fix `.qa/project.md` before executing cases.",
-  no_targets: "Add a target origin to `.qa/project.md`: targets: {staging: https://app.example.test}",
-  multiple_targets: "A Run takes at most one target.",
-  unknown_target: "Choose one of the configured target names; raw URLs are not targets.",
-  unmapped_levels: LEVEL_TARGET_REFUSALS.unmapped_levels,
-  no_execute_levels: "Add executable levels to `.qa/project.md`: execute_levels: {ui: browser, api: api}",
-  not_a_repository: "Execution needs `.qa/` inside a git repository.",
-  no_commits: "Execution needs a resolving HEAD; commit the repository first.",
-  no_scope: "Choose a live Feature, Suite, Scenario or Test Case Key, a Tracker key, or a Tag or Test level filter.",
-  invalid_filter: "Use tag:<name> or level:<name> with a non-blank name and no whitespace or extra colon.",
-  ...FILTER_REFUSALS,
-  ambiguous_key: "The scope token names more than one declaration.",
-  unknown_key: "The scope token names no live Key or Tracker key.",
-  retired_key: "The scope token was retired and cannot be executed.",
-  no_cases: "The scope holds no live Test Case; design cases first with `/qa-design`.",
-  no_matching_cases: "No live Test Case in the scope matches the requested Tags and Test levels.",
-  no_default_level: "A Layer-free case needs a default Test level: name one in a `train/execute.md` Practice or give exactly one `execute_levels` entry the `browser` mode.",
-  no_executable_level: "None of the requested Test levels is in `execute_levels`.",
-  integrity_error: "A selected file has an Integrity error; fix it before executing.",
-  no_playwright_cli: "`/qa-execute` drives the app through `playwright-cli`, which is not on the PATH; install it first.",
-  refused_playwright_cli: "`/qa-execute` refused the `playwright-cli` binary or shim resolved from PATH.",
-  old_playwright_cli: "`/qa-execute` needs a newer `playwright-cli`; upgrade it first.",
-  note_withheld: "The Access note holds what looks like a credential; fix `train/access.md` with `/qa-train access`.",
-  login_secret_missing: "Put the login secret the Access note names where it says, then plan again.",
-  login_state_missing: "Save the login state the Access note names, then plan again.",
-  no_login_state: "Name a login-state file in the Access note with `/qa-train access`.",
-  wrong_via: "Change the Access note to a saved login or a CLI login with `/qa-train access`.",
-  login_state_tracked: "Stop git tracking the login-state file, then plan again.",
-  login_state_not_ignored: "Git-ignore the login-state file, then plan again.",
-  login_secret_tracked: "Stop git tracking the password file, then plan again.",
-  login_secret_not_ignored: "Git-ignore the password file, then plan again.",
-  already_confirmed: "The Run is already confirmed; its plan is frozen.",
-  duplicate_run_dir: "Pass each Run dir only once to `execute confirm`.",
-  unguarded_unacknowledged: "This host's Tester guard cannot be verified: the Run starts only after the engineer explicitly acknowledges an Unguarded Run on the pre-run Card.",
-  invalid_decisions: "The Reply's decisions are not a JSON object.",
-  card_changed: "The pre-run Card changed since it was shown; plan again and show the new Card.",
-}, (code, data) => {
-  if (Object.hasOwn(FILTER_REFUSALS, code) && Array.isArray(data.valid)) {
-    return { ...data, line: `${FILTER_REFUSALS[code]} Valid values: ${data.valid.join(", ") || "(none)"}.` };
-  }
-  const line = levelTargetRefusalLine(code, data);
-  return line !== null ? { ...data, line } : data;
-});
-
-/**
- * A parsed qa index.
- * @typedef {{
- *   project?: KnowledgeFile | null,
- *   features: Map<string, IndexDeclaration[]>,
- *   suites: Map<string, IndexDeclaration[]>,
- *   scenarios: Map<string, IndexDeclaration[]>,
- *   cases: Map<string, IndexDeclaration[]>,
- *   train?: Map<string, Array<{ file: KnowledgeFile }>>,
- *   tracker: { resolve: (token: string) => { status: string, entry: ScopeDeclaration } },
- * }} KnowledgeIndex
- */
+const { stop } = refusalsWithoutLines();
 
 /** @typedef {import("./access.mjs").ShownAccessNote} AccessNote */
 
@@ -392,50 +87,15 @@ const { stop } = refusalsFor({
 const strings = (value) => Array.isArray(value) ? /** @type {string[]} */ (value.filter((v) => typeof v === "string")) : [];
 
 /**
- * @param {KnowledgeIndex} index
- * @returns {ScopeState}
- */
-function scopeState(index) {
-  const retired = new Map(strings(/** @type {NonNullable<typeof index.project>} */ (index.project).data.retired_features).map((key) => [key, "retired_features"]));
-  for (const [key, declarations] of index.features) for (const { file } of declarations) {
-    for (const token of strings(file.data.retired)) retired.set(readTrackerReference(token) ?? token, key);
-  }
-  const liveFeature = (/** @type {string} */ key) => !retired.has(key);
-  const live = (/** @type {ScopeDeclaration} */ d) => liveFeature(d.feature ?? d.key) && !retired.has(d.key) && !retired.has(/** @type {string} */ (d.scenario));
-  const declarations = (/** @type {Array<[string, Map<string, IndexDeclaration[]>]>} */ ([["feature", index.features], ["suite", index.suites], ["scenario", index.scenarios], ["case", index.cases]]))
-    .flatMap(([kind, map]) => [...map].flatMap(([key, ds]) => ds.map((/** @type {IndexDeclaration} */ d) => ({ ...d, kind, key })))).filter(live);
-  const cases = /** @type {ScopeCase[]} */ (declarations.filter((d) => d.kind === "case"));
-  const casesFor = (/** @type {ScopeDeclaration} */ d) => cases.filter((c) => d.kind === "case" ? c.key === d.key : d.kind === "scenario" ? c.scenario === d.key : c.feature === (d.feature ?? d.key));
-  return { retired, declarations, cases, casesFor, liveFeature };
-}
-
-/**
  * @param {string} token
- * @param {KnowledgeIndex} index
+ * @param {KeyIndex} index
  * @param {ScopeState} state
- * @returns {ScopeResolveResult}
+ * @returns {{ cases: ScopeCase[], alias?: string, refusal?: undefined } | { cases?: undefined, alias?: undefined, refusal: RefusalResult }}
  */
 function resolveScope(token, index, state) {
-  const choose = (/** @type {ScopeDeclaration[]} */ found, former = false) => {
-    if (found.length > 1) return { refusal: stop("ambiguous_key", { key: token }) };
-    if (!found.length) return null;
-    return { cases: state.casesFor(found[0]), ...(former && { alias: `${token} → ${found[0].key}` }) };
-  };
-  const direct = choose(state.declarations.filter((d) => d.key === token));
-  if (direct) return direct;
-  const tracker = index.tracker.resolve(token);
-  if (tracker.status === "ambiguous") return { refusal: stop("ambiguous_key", { key: token }) };
-  if (tracker.status === "unique") {
-    if (state.retired.has(tracker.entry.key) || !state.liveFeature(/** @type {string} */ (tracker.entry.feature))) return { refusal: stop("retired_key", { key: token, feature: state.retired.get(tracker.entry.key) ?? "retired_features" }) };
-    return { cases: state.casesFor(tracker.entry) };
-  }
-  if (tracker.status === "absent") {
-    const suite = choose(state.declarations.filter((d) => d.kind === "feature" && /** @type {{ suite?: string } | undefined} */ (d.file.data.mirror)?.suite === token));
-    if (suite) return suite;
-  }
-  if (state.retired.has(token)) return { refusal: stop("retired_key", { key: token, feature: state.retired.get(token) }) };
-  const former = choose(state.declarations.filter((d) => d.kind !== "suite" && strings((d.entry ?? d.file).data.formerly).includes(token)), true);
-  return former ?? { refusal: stop("unknown_key", { key: token }) };
+  const res = resolveScopeToken(token, index, state);
+  if (res.ok) return { cases: res.cases, ...(res.alias !== undefined && { alias: res.alias }) };
+  return { refusal: stop(res.code, { key: res.key, ...(res.feature !== undefined && { feature: res.feature }) }) };
 }
 
 // The fallback level for a Layer-free case with no `level:` filter: the distinct level a Practice names
@@ -490,7 +150,7 @@ function skipReasons(c, config, history, levels = caseLevels(c.entry.data)) {
 // `access` lists the sessions' notes in that order; `notes` maps each key to its note.
 /**
  * @param {ScopeCase[]} cases
- * @param {{ index: KnowledgeIndex, target: ExecuteTarget }} options
+ * @param {{ index: KeyIndex, target: ExecuteTarget }} options
  * @returns {{ cases: ResolvedAccessCase[], warnings: string[], notes: Map<string, AccessNote> }}
  */
 function resolveCaseAccess(cases, { index, target }) {
@@ -543,19 +203,24 @@ function resolveCaseAccess(cases, { index, target }) {
  * @param {string} root
  * @param {ExecuteTarget} target
  * @param {{ cases: ResolvedAccessCase[], notes: Map<string, AccessNote> }} ctx
+ * @param {PlatformContext} [platformContext]
  * @returns {RefusalResult | null}
  */
-function loginRefusal(root, target, { cases, notes }) {
+function loginRefusal(root, target, { cases, notes }, platformContext) {
   for (const key of new Set(cases.filter((c) => !c.blocked).flatMap((c) => c.access))) {
     const note = notes.get(key);
-    if (/** @type {AccessNote} */ (note).withheld) return stop("note_withheld", { access: key });
+    if (/** @type {AccessNote} */ (note).withheld) return stop("note_withheld", { access: key, next: "/qa-train access" });
     const header = readHeaderCredential(root, note);
-    if (header.refusal) return stop(header.refusal.code, { access: key, error: header.refusal.message, ...(header.refusal.gitignore_line && { gitignore_line: header.refusal.gitignore_line }) });
+    if (header.refusal) return stop(header.refusal.code, headerRefusalFacts(header.refusal, { access: key }));
     if (isHeaderOnly(note)) continue;
-    const { refusal } = /** @type {{ refusal?: RefusalResult }} */ (loginFor(root, /** @type {import("./scout.mjs").ScoutAccessNote} */ (note), `${target.origin}/`));
+    const { refusal } = /** @type {{ refusal?: RefusalResult }} */ (loginFor(root, /** @type {import("./scout.mjs").ScoutAccessNote} */ (note), `${target.origin}/`, platformContext));
     if (refusal) {
       const { ok, reason, error, ...extra } = refusal.json;
-      return stop(/** @type {string} */ (reason), { access: key, error, ...extra });
+      const next = ["no_login_state", "wrong_via"].includes(/** @type {string} */ (reason)) ? "/qa-train access"
+        : ["login_secret_missing", "login_state_missing", "login_state_tracked", "login_state_not_ignored", "login_secret_tracked", "login_secret_not_ignored"].includes(/** @type {string} */ (reason)) ? "execute plan" : undefined;
+      const code = /** @type {string} */ (reason);
+      const dataOnly = code.startsWith("credential_") || ["acl_unreadable", "acl_not_private", "secret_target_unwritable", "refused_playwright_cli"].includes(code);
+      return stop(code, { access: key, ...(dataOnly ? {} : { error }), ...extra, ...(next && { next }) });
     }
   }
   return null;
@@ -575,7 +240,7 @@ function loginRefusal(root, target, { cases, notes }) {
 export function checkPlaywrightCli(env, platformContext = {}) {
   const found = playwrightCliVersion(env, platformContext);
   if (found.status === "missing") return { refusal: stop("no_playwright_cli", { upgrade: UPGRADE_PLAYWRIGHT_CLI }) };
-  if (found.status === "refused") return { refusal: stop("refused_playwright_cli", { check: found.refusal.code, reason: found.refusal.message }) };
+  if (found.status === "refused") return { refusal: stop("refused_playwright_cli", { check: found.refusal.code, ...platformRefusalFacts(found.refusal) }) };
   if (found.status === "old") return { refusal: stop("old_playwright_cli", { ...(found.found && { found: found.found }), ...(found.failure && { failure: found.failure }), minimum: MIN_PLAYWRIGHT_CLI, upgrade: UPGRADE_PLAYWRIGHT_CLI }) };
   return { version: /** @type {string} */ (found.version) };
 }
@@ -584,21 +249,43 @@ const word = (/** @type {string} */ s) => `'${s.replaceAll("'", `'\\''`)}'`;
 const cases = (/** @type {number} */ n) => `${n} case${n === 1 ? "" : "s"}`;
 const skippedLines = (/** @type {ExecuteSkipped[]} */ skipped) => skipped.map(({ key, reasons }) => `  ${key} (${reasons.join(", ")})`);
 
+/** @type {readonly SectionSpec[]} */
+export const PLAN_SECTION_ORDER = [
+  { id: "summary", label: "Execution plan" },
+  { id: "selection", label: "Selection" },
+  { id: "aliases", label: "Former keys" },
+  { id: "levels", label: "Levels" },
+  { id: "narrowed", label: "Narrowed Layer-free cases" },
+  { id: "excluded", label: "Excluded by filters" },
+  { id: "access", label: "Roles → Access notes" },
+  { id: "no_password_source", label: "Roles without a password source" },
+  { id: "blocked", label: "Blocked before dispatch" },
+  { id: "warnings", label: "Warnings" },
+  { id: "dirty", label: "Uncommitted case text" },
+  { id: "skipped", label: "Skipped" },
+  { id: "runs", label: "Runs" },
+  { id: "unguarded", label: "No verified Tester guard" },
+  { id: "data_handling", label: "Data handling" },
+  { id: "run_dir", label: "Run directory" },
+];
+
 /**
- * Shared selection and alias header lines for a confirm prompt.
+ * Shared selection and alias section parts for a confirm prompt.
  * @param {ExecuteSelection} selection
  * @param {readonly string[]} aliases
- * @returns {string[]}
+ * @returns {{ selection: string | null, aliases: string[] }}
  */
-function selectionHeaderLines(selection, aliases) {
-  return [
-    ...(selection.tags.length || selection.levels.length ? [`Selection: ${[...selection.scope, ...selection.tags.map((t) => `tag:${t}`), ...selection.levels.map((l) => `level:${l}`)].join(" ")}`] : []),
-    ...aliases.map((a) => `Former key: ${a}`),
-  ];
+function selectionHeaderParts(selection, aliases) {
+  return {
+    selection: selection.tags.length || selection.levels.length
+      ? `${[...selection.scope, ...selection.tags.map((t) => `tag:${t}`), ...selection.levels.map((l) => `level:${l}`)].join(" ")}`
+      : null,
+    aliases: [...aliases],
+  };
 }
 
 /**
- * Per-Run body lines: Levels, narrowed, excluded, Roles → Access notes, blocked, warnings, dirty, skipped.
+ * Per-Run body parts: Levels, narrowed, excluded, Roles → Access notes, no password source, blocked, warnings, dirty, skipped.
  * @param {{
  *   executions: ExecuteExecution[],
  *   skipped: ExecuteSkipped[],
@@ -607,9 +294,20 @@ function selectionHeaderLines(selection, aliases) {
  *   narrowed: ExecuteNarrowed[],
  *   noPassword: { role: string, access: string | null }[],
  * }} options
- * @returns {string[]}
+ * @returns {{
+ *   levels: string | null,
+ *   narrowed: string | null,
+ *   excluded: string | null,
+ *   access: string | null,
+ *   noPassword: string[],
+ *   blocked: string | null,
+ *   warnings: string[],
+ *   dirty: string | null,
+ *   skipped: string | null,
+ *   lines: string[],
+ * }}
  */
-function runDetailLines({ executions, skipped, warnings, excluded, narrowed, noPassword }) {
+function runDetailParts({ executions, skipped, warnings, excluded, narrowed, noPassword }) {
   const running = executions.filter((e) => !e.blocked);
   const blocked = executions.filter((e) => e.blocked);
   const logins = [...new Set(running.flatMap((e) => e.sessions).map(({ role, acc, setup }) =>
@@ -631,21 +329,40 @@ function runDetailLines({ executions, skipped, warnings, excluded, narrowed, noP
   }
   const levelLines = [...levelCases].map(([key, { bound, selected, executed }]) =>
     `  ${key}: bound ${levelList(bound)}; selected ${levelList(selected)}; executed ${levelList(executed)}; omitted ${levelList(bound.filter((level) => !selected.includes(level)))}`);
-  return [
+  const narrowedText = narrowed.length ? [
+    "Layer-free cases narrowed to their Automation's level (other executable levels are not exercised):",
+    ...narrowed.map(({ key, level, left_out_levels, prior_results }) => `  ${key}: ${level}; left out: ${levelList(left_out_levels)}${prior_results?.length ? `; prior: ${prior_results.map((r) => `${r.level} ${r.result}${r.reason ? ` (${r.reason})` : ""}`).join(", ")}` : ""}`),
+    "Run one at another level with `level:<name>`.",
+  ].join("\n") : null;
+  const excludedText = excluded.length ? [`Excluded by filters (${excluded.length}), not skipped:`, ...excluded.map((e) => `  ${e.key}: bound ${levelList(e.bound_levels)}`)].join("\n") : null;
+  const accessText = logins.length ? ["Roles → Access notes:", ...logins].join("\n") : null;
+  const noPasswordItems = noPassword.map(({ role }) => `Role ${role} has no password source; a case that signs in as ${role} will Block`);
+  const blockedText = blocked.length ? [`Blocked before dispatch (${blocked.length}), no result is earned:`, ...blocked.map((e) => `  ${e.key} (${(/** @type {ExecuteBlocked} */ (e.blocked)).reason}): ${(/** @type {ExecuteBlocked} */ (e.blocked)).why}`)].join("\n") : null;
+  const dirtyText = executions.some((e) => e.dirty) ? `Uncommitted case text runs as edited: ${executions.filter((e) => e.dirty).map((e) => e.key).join(", ")}` : null;
+  const skippedText = skipped.length ? [`Skipped (${skipped.length}), their previous result stays the latest:`, ...skippedLines(skipped)].join("\n") : null;
+  const lines = [
     ...(levelLines.length ? ["Levels:", ...levelLines] : []),
-    ...(narrowed.length ? [
-      "Layer-free cases narrowed to their Automation's level (other executable levels are not exercised):",
-      ...narrowed.map(({ key, level, left_out_levels, prior_results }) => `  ${key}: ${level}; left out: ${levelList(left_out_levels)}${prior_results?.length ? `; prior: ${prior_results.map((r) => `${r.level} ${r.result}${r.reason ? ` (${r.reason})` : ""}`).join(", ")}` : ""}`),
-      "Run one at another level with `level:<name>`.",
-    ] : []),
-    ...(excluded.length ? [`Excluded by filters (${excluded.length}), not skipped:`, ...excluded.map((e) => `  ${e.key}: bound ${levelList(e.bound_levels)}`)] : []),
-    ...(logins.length ? ["Roles → Access notes:", ...logins] : []),
-    ...noPassword.map(({ role }) => `Role ${role} has no password source; a case that signs in as ${role} will Block`),
-    ...(blocked.length ? [`Blocked before dispatch (${blocked.length}), no result is earned:`, ...blocked.map((e) => `  ${e.key} (${(/** @type {ExecuteBlocked} */ (e.blocked)).reason}): ${(/** @type {ExecuteBlocked} */ (e.blocked)).why}`)] : []),
+    ...(narrowedText ? [narrowedText] : []),
+    ...(excludedText ? [excludedText] : []),
+    ...(accessText ? [accessText] : []),
+    ...noPasswordItems,
+    ...(blockedText ? [blockedText] : []),
     ...warnings.map((w) => `Warning: ${w}`),
-    ...(executions.some((e) => e.dirty) ? [`Uncommitted case text runs as edited: ${executions.filter((e) => e.dirty).map((e) => e.key).join(", ")}`] : []),
-    ...(skipped.length ? [`Skipped (${skipped.length}), their previous result stays the latest:`, ...skippedLines(skipped)] : []),
+    ...(dirtyText ? [dirtyText] : []),
+    ...(skippedText ? [skippedText] : []),
   ];
+  return {
+    levels: levelLines.length ? levelLines.join("\n") : null,
+    narrowed: narrowedText,
+    excluded: excludedText,
+    access: accessText,
+    noPassword: noPasswordItems,
+    blocked: blockedText,
+    warnings,
+    dirty: dirtyText,
+    skipped: skippedText,
+    lines,
+  };
 }
 
 /**
@@ -700,21 +417,32 @@ function runFooterLines({ dir, root }) {
  *   noPassword: { role: string, access: string | null }[],
  *   unguarded?: ExecuteUnguarded,
  * }} options
- * @returns {string}
+ * @returns {ReportSection[]}
  */
-function confirmText({ target, executions, skipped, aliases, warnings, dir, root, selection, excluded, narrowed, noPassword, unguarded }) {
-  return [
-    `Execute ${cases(new Set(executions.map((e) => e.key)).size)} against ${target.slug} (${target.origin}).`,
-    ...selectionHeaderLines(selection, aliases),
-    ...runDetailLines({ executions, skipped, warnings, excluded, narrowed, noPassword }),
-    ...unguardedLines(unguarded),
-    ...dataHandlingLines(),
-    ...runFooterLines({ dir, root }),
-  ].join("\n");
+function confirmSections({ target, executions, skipped, aliases, warnings, dir, root, selection, excluded, narrowed, noPassword, unguarded }) {
+  const header = selectionHeaderParts(selection, aliases);
+  const detail = runDetailParts({ executions, skipped, warnings, excluded, narrowed, noPassword });
+  return buildSections(PLAN_SECTION_ORDER, [
+    { id: "summary", markdown: `Execute ${cases(new Set(executions.map((e) => e.key)).size)} against ${target.slug} (${target.origin}).` },
+    { id: "selection", markdown: header.selection },
+    { id: "aliases", items: header.aliases },
+    { id: "levels", markdown: detail.levels },
+    { id: "narrowed", markdown: detail.narrowed },
+    { id: "excluded", markdown: detail.excluded },
+    { id: "access", markdown: detail.access },
+    { id: "no_password_source", items: detail.noPassword },
+    { id: "blocked", markdown: detail.blocked },
+    { id: "warnings", items: detail.warnings },
+    { id: "dirty", markdown: detail.dirty },
+    { id: "skipped", markdown: detail.skipped },
+    { id: "unguarded", markdown: unguarded ? unguardedLines(unguarded).join("\n") : null },
+    { id: "data_handling", markdown: dataHandlingLines().join("\n") },
+    { id: "run_dir", markdown: runFooterLines({ dir, root }).join("\n") },
+  ]);
 }
 
 /**
- * Per-Run planning summary shared by `plan`'s prepared Runs and `multiConfirmText`.
+ * Per-Run planning summary shared by `plan`'s prepared Runs and `multiConfirmSections`.
  * @typedef {{
  *   target: ExecuteTarget,
  *   executions: ExecuteExecution[],
@@ -729,7 +457,7 @@ function confirmText({ target, executions, skipped, aliases, warnings, dir, root
  */
 
 /**
- * Confirm text for a multi-Run plan across multiple Level targets.
+ * Confirm sections for a multi-Run plan across multiple Level targets.
  * @param {{
  *   runs: PreparedRun[],
  *   totalCases: number,
@@ -738,22 +466,25 @@ function confirmText({ target, executions, skipped, aliases, warnings, dir, root
  *   unguarded?: ExecuteUnguarded,
  *   root: string,
  * }} options
- * @returns {string}
+ * @returns {ReportSection[]}
  */
-function multiConfirmText({ runs, totalCases, aliases, selection, unguarded, root }) {
-  return [
-    `Execute ${cases(totalCases)} as ${runs.length} Runs:`,
-    ...selectionHeaderLines(selection, aliases),
-    ...runs.flatMap((r, i) => [
-      "",
-      `Run ${i + 1} of ${runs.length}: ${r.target.slug} (${r.target.origin}) — ${cases(new Set(r.executions.map((e) => e.key)).size)}.`,
-      ...runDetailLines(r),
-      ...runFooterLines({ dir: r.dir, root }),
-    ]),
-    "",
-    ...unguardedLines(unguarded),
-    ...dataHandlingLines(),
-  ].join("\n");
+function multiConfirmSections({ runs, totalCases, aliases, selection, unguarded, root }) {
+  const header = selectionHeaderParts(selection, aliases);
+  return buildSections(PLAN_SECTION_ORDER, [
+    { id: "summary", markdown: `Execute ${cases(totalCases)} as ${runs.length} Runs:` },
+    { id: "selection", markdown: header.selection },
+    { id: "aliases", items: header.aliases },
+    {
+      id: "runs",
+      items: runs.map((r, i) => [
+        `Run ${i + 1} of ${runs.length}: ${r.target.slug} (${r.target.origin}) — ${cases(new Set(r.executions.map((e) => e.key)).size)}.`,
+        ...runDetailParts(r).lines,
+        ...runFooterLines({ dir: r.dir, root }),
+      ].join("\n")),
+    },
+    { id: "unguarded", markdown: unguarded ? unguardedLines(unguarded).join("\n") : null },
+    { id: "data_handling", markdown: dataHandlingLines().join("\n") },
+  ]);
 }
 
 /**
@@ -763,14 +494,17 @@ function multiConfirmText({ runs, totalCases, aliases, selection, unguarded, roo
  */
 function plan(args, { root, env, platformContext }) {
   const files = loadWorkingTree(root);
-  const index = /** @type {KnowledgeIndex} */ (buildIndex(files));
+  const index = buildIndex(files);
   const config = projectConfig(index.project);
-  const project = /** @type {KnowledgeFile | undefined} */ (files.find((f) => f.rel === "project.md"));
-  const problems = project ? checkFile(project, config).errors : [{ code: "missing_project" }];
-  if (project?.type !== "project" || problems.length || config.schemaVersion > SCHEMA_VERSION) return stop("invalid_project", { problems });
+  const project = files.find((f) => f.rel === "project.md");
+  const problems = project && !project.unreadable ? checkFile(project, config).errors : [{ code: "missing_project" }];
+  if (!project || project.unreadable || project.type !== "project") return stop("invalid_project", { problems });
+  const unread = refuseUnreadSchema(/** @type {string} */ (root), ANY_SCHEMA_VERSION);
+  if (unread) return unread;
+  if (problems.length) return stop("invalid_project", { problems });
   const schema = refuseUnreadSchema(/** @type {string} */ (root), LEVEL_ON_CASE_SCHEMA_VERSION);
   if (schema) return schema;
-  if (!config.targets) return stop("no_targets");
+  if (!config.targets) return stop("no_targets", { example: "targets: {staging: https://app.example.test}" });
   const targets = args.filter((a) => a.startsWith("target:")).map((a) => a.slice(7));
   if (targets.length > 1) return stop("multiple_targets", { targets });
   const rawUrl = args.find((a) => /^[a-z][a-z0-9+.-]*:\/\//i.test(a));
@@ -778,7 +512,7 @@ function plan(args, { root, env, platformContext }) {
   if (rawUrl || (explicitTarget !== undefined && !Object.hasOwn(config.targets, explicitTarget))) {
     return stop("unknown_target", { target: rawUrl ?? explicitTarget ?? "", targets: Object.keys(config.targets) });
   }
-  if (!config.execute_levels) return stop("no_execute_levels");
+  if (!config.execute_levels) return stop("no_execute_levels", { example: "execute_levels: {ui: browser, api: api}" });
   const training = executeTraining(trainFile(index, EXECUTE_TRAIN_KEY));
   const defaultResolution = resolveDefaultLevel(training, config.execute_levels);
   const repo = repositoryOf(root);
@@ -786,7 +520,7 @@ function plan(args, { root, env, platformContext }) {
   const commit = resolveRef(root, "HEAD");
   if (!commit) return stop("no_commits");
   const facts = scan(root);
-  const state = scopeState(index);
+  const state = buildScopeState(index);
   const tags = args.filter((a) => a.startsWith("tag:")).map((a) => a.slice(4));
   const levels = args.filter((a) => a.startsWith("level:")).map((a) => a.slice(6));
   const scope = args.filter((a) => !/^(target|tag|level):/.test(a));
@@ -826,10 +560,10 @@ function plan(args, { root, env, platformContext }) {
   for (const token of scope) {
     const resolved = resolveScope(token, index, state);
     if (resolved.refusal) return resolved.refusal;
-    for (const c of /** @type {ScopeCase[]} */ (resolved.cases)) union.add(c);
+    for (const c of resolved.cases) union.add(c);
     if (resolved.alias) aliases.push(resolved.alias);
   }
-  if (!union.size) return stop("no_cases", { scope });
+  if (!union.size) return stop("no_cases", { scope, next: "/qa-design" });
   const scopeCases = [...union].sort((a, b) => a.file.rel.localeCompare(b.file.rel) || a.line - b.line);
   const selectedFiles = new Set(scopeCases.map((c) => c.file.rel));
   const broken = facts.results.filter((r) => r.kind === "integrity_error" && selectedFiles.has(/** @type {string} */ (r.file)));
@@ -900,7 +634,13 @@ function plan(args, { root, env, platformContext }) {
   const runnable = selected.filter((c) => !(/** @type {string[]} */ (reasons.get(c))).length);
   const unexecutable = unavailable.length ? [`Requested Test levels cannot execute: ${unavailable.join(", ")}; matching cases at those levels are skipped.`] : [];
   if (!runnable.length && !promoted.size) {
-    return { exit: 0, json: { action: "plan", ok: true, executions: 0, skipped, text: ["Nothing to execute: every selected case is skipped.", ...unexecutable.map((w) => `Warning: ${w}`), ...skippedLines(skipped)].join("\n") } };
+    /** @type {ReportSection[]} */
+    const sections = buildSections(PLAN_SECTION_ORDER, [
+      { id: "summary", markdown: "Nothing to execute: every selected case is skipped." },
+      { id: "warnings", items: unexecutable },
+      { id: "skipped", markdown: skippedLines(skipped).join("\n") },
+    ]);
+    return { exit: 0, json: { action: "plan", ok: true, executions: 0, sections } };
   }
   const runnableSet = new Set(runnable);
   const plannedPairs = selected.filter((c) => runnableSet.has(c) || promoted.has(c)).flatMap((c) =>
@@ -916,11 +656,12 @@ function plan(args, { root, env, platformContext }) {
   if (hasUnmappedSplit(targetResolution, config.targets)) {
     return stop("unmapped_levels", unmappedLevelsData(targetResolution, config.targets, config.level_targets));
   }
-  const cli = checkPlaywrightCli(env, /** @type {PlatformContext | undefined} */ (platformContext));
+  const typedPlatformContext = /** @type {PlatformContext | undefined} */ (platformContext);
+  const cli = checkPlaywrightCli(typedPlatformContext?.env ?? env, typedPlatformContext);
   if (cli.refusal) return cli.refusal;
   const head = digests(loadQaAt(repo, commit));
   const stripped = new Map();
-  /** @param {{ file: KnowledgeFile, entry: { key: string } }} param0 */
+  /** @param {{ file: ParsedFile, entry: { key: string } }} param0 */
   const textOf = ({ file, entry }) => {
     if (!stripped.has(file)) stripped.set(file, claimProjection(file));
     return stripped.get(file).cases.get(entry.key);
@@ -932,7 +673,7 @@ function plan(args, { root, env, platformContext }) {
   const adapter = resolveAdapter(config.stack, repo.top).adapter;
   const hasDueAutomations = plannedPairs.some(({ c, level }) => automationsAt(c, level).length > 0);
   const code = hasDueAutomations && adapter ? buildCodeIndex(repo.top, config.modulePaths, config.annotationMap, adapter, keyPatterns(config)) : null;
-  const reason = unguardedReason({ env });
+  const reason = unguardedReason({ env: typedPlatformContext?.env ?? env });
   const groups = targetResolution.groups;
   const single = !spansMultipleTargets(targetResolution);
 
@@ -957,7 +698,7 @@ function plan(args, { root, env, platformContext }) {
     const groupPairs = single ? plannedPairs : plannedPairs.filter(({ level }) => group.levels.includes(level));
     const groupRunnable = single ? runnable : runnable.filter((c) => groupPairs.some((p) => p.c === c));
     const access = resolveCaseAccess(groupRunnable, { index, target });
-    const refused = loginRefusal(/** @type {string} */ (root), target, access);
+    const refused = loginRefusal(/** @type {string} */ (root), target, access, typedPlatformContext);
     if (refused) return refused;
     const accessByKey = new Map(access.cases.map((c) => [c.entry.key, c]));
     /** @type {ExecuteExecution[]} */
@@ -972,7 +713,7 @@ function plan(args, { root, env, platformContext }) {
       const automations = automationsAt(c, level);
       return {
         id: `ex_${i + 1}`, key: entry.key, summary: entry.summary,
-        ...(/** @type {{ tracker: string } | undefined} */ (entry.data.tracker && { tracker: entry.data.tracker })), feature,
+        ...(/** @type {{ tracker: string } | undefined} */ (entry.data.tracker && { tracker: entry.data.tracker })), feature: feature ?? "",
         text, level, bound_levels: planned.bound, selected_levels: selectedLevels, omitted_levels: omittedLevels,
         mode: config.execute_levels[level], digest, dirty: head.review(entry.key) !== digest,
         review: facts.history.reviews.find((r) => r.key === entry.key)?.status ?? "none",
@@ -1004,7 +745,7 @@ function plan(args, { root, env, platformContext }) {
     const routeOrigins = otherTargetOrigins(config.targets, target.origin);
     const routeSignInUrls = signInUrlsOn(/** @type {string} */ (root), [target.origin, ...routeOrigins]);
     /** @type {ExecutePlan} */
-    const pinned = { root: resolve(/** @type {string} */ (root)), confirmed: false, run: newRunId(), target, created_at: new Date().toISOString(), playwright_cli: cli.version, commit, tester: { tier, label }, concurrency_cap: cap, executions, skipped: groupSkipped, ...(groupExcluded.length && { excluded: groupExcluded }), ...(narrowed.length && { narrowed }), selection, ...(routeOrigins.length && { route_origins: routeOrigins }), ...(routeSignInUrls.length && { route_sign_in_urls: routeSignInUrls }) };
+    const pinned = { root: resolve(/** @type {string} */ (root)), confirmed: false, run: newRunId(), target, created_at: new Date().toISOString(), playwright_cli: cli.version, commit, tester: { tier, label }, concurrency_cap: cap, automation_retries: training.automation_retries, executions, skipped: groupSkipped, ...(groupExcluded.length && { excluded: groupExcluded }), ...(narrowed.length && { narrowed }), selection, ...(routeOrigins.length && { route_origins: routeOrigins }), ...(routeSignInUrls.length && { route_sign_in_urls: routeSignInUrls }) };
     const due = [...new Set(executions.flatMap((e) => e.automations ?? []))];
     if (due.length) {
       const selections = code ? due.flatMap((id) => {
@@ -1014,7 +755,7 @@ function plan(args, { root, env, platformContext }) {
         return [{
           id, stack: config.stack?.root ?? ".", file: fn.file, line: fn.line, titles,
           package: fn.package,
-          literal: !fn.parameterised && titles.every((t) => t.length > 0 && t.trim() === t && !/[›\r\n]|\$\{/.test(t)),
+          literal: !fn.parameterised && titles.every((t) => t.length > 0 && t.trim() === t && !/[›>\r\n]|\$\{/.test(t)),
           tagged: (config.annotationMap?.automation_key ?? []).includes("tag"),
         }];
       }) : [];
@@ -1037,18 +778,20 @@ function plan(args, { root, env, platformContext }) {
   for (const item of prepared) {
     const dir = /** @type {{ make(): string }} */ (newRunDir(undefined, "qa-skills-execute-")).make();
     mkdirSync(join(dir, ".playwright"));
-    writeFileSync(join(dir, "execute.json"), `${JSON.stringify(item.pinned, null, 2)}\n`);
+    writeJsonAtomic(join(dir, "execute.json"), item.pinned);
     item.dir = dir;
   }
 
   if (single) {
     const only = prepared[0];
-    return { exit: 0, json: { action: "plan", ok: true, dir: only.dir, executions: only.executions.length, skipped: only.skipped, ...(only.excluded.length && { excluded: only.excluded }), ...(only.narrowed.length && { narrowed: only.narrowed }), warnings: only.warnings, ...(only.pinned.unguarded && { unguarded: true }), text: confirmText({ target: only.target, executions: only.executions, skipped: only.skipped, aliases, warnings: only.warnings, dir: only.dir, root: /** @type {string} */ (root), selection, excluded: only.excluded, narrowed: only.narrowed, noPassword: only.noPassword, unguarded: only.pinned.unguarded }) } };
+    /** @type {ReportSection[]} */
+    const sections = confirmSections({ target: only.target, executions: only.executions, skipped: only.skipped, aliases, warnings: only.warnings, dir: only.dir, root: /** @type {string} */ (root), selection, excluded: only.excluded, narrowed: only.narrowed, noPassword: only.noPassword, unguarded: only.pinned.unguarded });
+    return { exit: 0, json: { action: "plan", ok: true, dir: only.dir, executions: only.executions.length, ...(only.pinned.unguarded && { unguarded: true }), sections } };
   }
 
-  const allNarrowed = prepared.flatMap((p) => p.narrowed);
-  const allWarnings = prepared.flatMap((p) => p.warnings);
   const totalCases = new Set(prepared.flatMap((p) => p.executions.map((e) => e.key))).size;
+  /** @type {ReportSection[]} */
+  const sections = multiConfirmSections({ runs: prepared, totalCases, aliases, selection, unguarded: prepared[0].pinned.unguarded, root: /** @type {string} */ (root) });
   return {
     exit: 0,
     json: {
@@ -1059,25 +802,17 @@ function plan(args, { root, env, platformContext }) {
         target: p.target.slug,
         origin: p.target.origin,
         executions: p.executions.length,
-        skipped: p.skipped,
-        ...(p.excluded.length && { excluded: p.excluded }),
-        ...(p.narrowed.length && { narrowed: p.narrowed }),
-        warnings: p.warnings,
       })),
       executions: prepared.reduce((sum, p) => sum + p.executions.length, 0),
-      skipped,
-      ...(excluded.length && { excluded }),
-      ...(allNarrowed.length && { narrowed: allNarrowed }),
-      warnings: allWarnings,
       ...(reason !== null && { unguarded: true }),
-      text: multiConfirmText({ runs: prepared, totalCases, aliases, selection, unguarded: prepared[0].pinned.unguarded, root: /** @type {string} */ (root) }),
+      sections,
     },
   };
 }
 
 // Freezes the plan: from here `execute.json` never changes and every mutable fact of the Run lives
-// in `dispatch.json` (lib/execute-dispatch.mjs): lib/dispatch.mjs's policy state, one queued unit
-// per Execution not already Blocked and the Tester's Delegates as the chain (its model, then the
+// in `dispatch.json`, created by lib/execute-state.mjs: lib/dispatch.mjs's policy state, one queued
+// unit per Execution not already Blocked and the Tester's Delegates as the chain (its model, then the
 // Fallback), plus the Access note `locks` and the login lifecycle's `paused`, `retried` and `skipped`
 // notes (lib/execute-auth.mjs).
 /**
@@ -1085,8 +820,9 @@ function plan(args, { root, env, platformContext }) {
  * @param {CommandContext} ctx
  * @returns {CommandResult}
  */
-function confirm(args, { dir, stdin, env }) {
-  noArguments("execute confirm", args, "--dir <run-dir>... [--stdin]");
+function confirm(args, { dir, stdin, env, platformContext: rawPlatformContext }) {
+  const platformContext = /** @type {PlatformContext | undefined} */ (rawPlatformContext);
+  noArguments("execute confirm", args, "(--dir <run-dir>)... [--input <path>]");
   const rawDirs = /** @type {string[] | string | undefined} */ (/** @type {unknown} */ (dir));
   const dirs = Array.isArray(rawDirs) ? rawDirs : rawDirs ? [rawDirs] : [];
   if (!dirs.length) plannedRun(undefined, "confirm");
@@ -1106,7 +842,7 @@ function confirm(args, { dir, stdin, env }) {
     seen.add(runDir);
     if (pinned.confirmed) return stop("already_confirmed", { run: pinned.run });
     if (pinned.unguarded) {
-      const refused = unguardedReply(pinned, cachedStdin, env);
+      const refused = unguardedReply(pinned, cachedStdin, platformContext?.env ?? env);
       if (refused) return refused;
       pinned.unguarded = { ...pinned.unguarded, acknowledged: true };
     }
@@ -1114,10 +850,8 @@ function confirm(args, { dir, stdin, env }) {
   }
   for (const { pinned, runDir, units } of prepared) {
     const label = pinned.tester?.label ?? FALLBACK;
-    /** @type {ExecuteDispatchState} */
-    const state = { ...newDispatch({ units, chain: label === FALLBACK ? [FALLBACK] : [label, FALLBACK], cap: pinned.concurrency_cap }), locks: {}, paused: [], retried: [], skipped: [] };
-    writeFileSync(join(runDir, "dispatch.json"), `${JSON.stringify(state, null, 2)}\n`);
-    writeFileSync(join(runDir, "execute.json"), `${JSON.stringify(/** @type {ExecutePlan} */ ({ ...pinned, confirmed: true }), null, 2)}\n`);
+    saveState(runDir, newRunState({ units, chain: label === FALLBACK ? [FALLBACK] : [label, FALLBACK], cap: pinned.concurrency_cap }));
+    writeJsonAtomic(join(runDir, "execute.json"), /** @type {ExecutePlan} */ ({ ...pinned, confirmed: true }));
   }
   if (prepared.length === 1) {
     const { pinned, runDir, units } = prepared[0];
@@ -1216,7 +950,7 @@ function unguardedReply(pinned, stdin, env) {
 export const command = {
   actions: /** @type {Record<string, CommandAction>} */ ({
     plan: { options: { root: "qa-dir" }, usage: "[<scope>...] [tag:<name>...] [level:<name>...] [target:<slug>] [--root <qa-dir>]", run: plan },
-    confirm: { options: { dir: "values", stdin: "flag" }, usage: "--dir <run-dir>... [--stdin]", run: confirm },
+    confirm: { options: { dir: "values", stdin: "flag" }, usage: "(--dir <run-dir>)... [--input <path>]", run: confirm },
     ...openActions,
     ...briefActions,
     ...ingestActions,

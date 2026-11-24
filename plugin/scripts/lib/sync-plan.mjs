@@ -429,7 +429,7 @@ export class Plan {
     if (s.feature !== l.feature) return { ok: false, error: { code: "merge_cross_feature", survivor, loser } };
     if ([s, l].some((d) => this.qa.get(d.file.rel)?.has(d.line) || this.mergedScenarios.has(d.file.rel))) return { ok: false, error: { code: "merge_pending_edit", survivor, loser } };
     const distinct = l.entry.data.tracker && l.entry.data.tracker !== s.entry.data.tracker;
-    if (distinct && !["keep", "retire"].includes(/** @type {string} */ (trackerDisposition))) return { ok: false, error: { code: "merge_disposition", survivor, loser } };
+    if (distinct && !["keep", "retire"].includes(/** @type {string} */ (trackerDisposition))) return { ok: false, error: { code: "merge_disposition", survivor, loser, allowed: ["keep", "retire"] } };
     this.caseOps({ key: /** @type {string} */ (survivor) });
     for (const field of ["automates", "covers", "relies_on"]) {
       const union = [...new Set([...(/** @type {unknown[]} */ (s.entry.data[field]) ?? []), ...(/** @type {unknown[]} */ (l.entry.data[field]) ?? [])])];
@@ -537,7 +537,7 @@ export class Plan {
     const conflict = [...s.file.cases, ...l.file.cases].find((c) => this.ctx.index.cases.get(c.key)?.length !== 1);
     if (conflict) return { ok: false, error: { code: "duplicate_key", key: conflict.key, survivor, loser } };
     const distinct = l.file.data.tracker && l.file.data.tracker !== s.file.data.tracker;
-    if (distinct && !["keep", "retire"].includes(/** @type {string} */ (trackerDisposition))) return { ok: false, error: { code: "merge_disposition", survivor, loser } };
+    if (distinct && !["keep", "retire"].includes(/** @type {string} */ (trackerDisposition))) return { ok: false, error: { code: "merge_disposition", survivor, loser, allowed: ["keep", "retire"] } };
     const { repairs, retired } = this.mergeTracker({ kind: "scenario", s: s.file.data, l: l.file.data,
       ref: { file: s.file.rel }, feature: s.feature, survivor, loser, trackerDisposition });
     const dependencies = [];
@@ -787,7 +787,7 @@ export class Plan {
       outputs.set(this.ctx.repoPath(rel), /** @type {string} */ (out.text));
     }
     for (const [rel, { text: head, item }] of this.createdQa) {
-      if (existsSync(join(this.ctx.root, rel))) fail(rel, [{ code: "exists", item, message: `${this.ctx.repoPath(rel)} exists already` }]);
+      if (existsSync(join(this.ctx.root, rel))) fail(rel, [{ code: "exists", item, path: this.ctx.repoPath(rel), message: `${this.ctx.repoPath(rel)} exists already` }]);
       const text = edit(parse(rel, head), (this.appends.get(rel) ?? []).map((a) => ({ append: a }))).text;
       this.checkQa(rel, text, errors);
       outputs.set(this.ctx.repoPath(rel), text);

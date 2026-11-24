@@ -1,8 +1,8 @@
 // @ts-check
 // Sync builds a sealed Card and applies validated JSON decisions in one uncommitted write.
 /**
- * @import { CardAdapter, CardApplyOut, CardChangeset, CardRefusal, CardRefused, CardShown } from "./card-run.mjs"
- * @import { CommandContext, CommandResult, OptionSpec, UsageError } from "./cli.mjs"
+ * @import { CardAdapter, CardApplyOut, CardChangeset, CardRefused, CardShown } from "./card-run.mjs"
+ * @import { CommandContext, CommandResult, OptionSpec } from "./cli.mjs"
  * @import { AttachFileRecord, SyncAttachContext } from "./sync-attach.mjs"
  * @import { MergeCard, MergeFileRecord, MergePair, MergeReply } from "./sync-merge.mjs"
  * @import { SyncCard, SyncCardContext, SyncCardData, SyncCardItem, SyncCardItemOut, SyncNote, SyncTrackerData } from "./sync-json.mjs"
@@ -14,11 +14,10 @@ import { dirname, join, relative, resolve, sep } from "node:path";
 import { keyLabel, summaries } from "./labels.mjs";
 import { cardRun } from "./card-run.mjs";
 import { changedPaths } from "./changeset.mjs";
-import { cardData, decisionsOf, fact, refusalOf, refuse } from "./sync-json.mjs";
+import { applySections, cardData, decisionsOf, fact, refusalOf, refuse } from "./sync-json.mjs";
 import { PATTERN } from "./keys.mjs";
 import { projectConfig } from "./knowledge-file.mjs";
 import { buildIndex, loadWorkingTree } from "./qa-index.mjs";
-import { table } from "./markdown.mjs";
 import { cascade } from "./sync-plan.mjs";
 import { newRunDir, openRunDir, readRunFile } from "./run-dir.mjs";
 import { scan } from "./scan.mjs";
@@ -184,7 +183,6 @@ import { unlanded, unlandedReports, unlandedScope } from "./sync-unlanded.mjs";
  * @typedef {{
  *   options: OptionSpec,
  *   actions: Record<string, SyncAction>,
- *   refuse: (e: UsageError) => CommandResult,
  * }} SyncCommand
  */
 
@@ -200,7 +198,7 @@ const SECTIONS = /** @type {SyncSection[]} */ (/** @type {unknown} */ ([declarat
  * @returns {CommandResult}
  */
 function withRun(action, args, { root, stdin, seed, dir }, act) {
-  if (action === "apply" && args.length) return refuse("apply_takes_no_feature");
+  if (action === "apply" && args.length) return refuse("apply_takes_no_feature", { feature_from: "run_dir" });
   if (args.length > 1) return refuse("too_many_features", { action });
   const [named] = args;
   if (named !== undefined && !PATTERN.slug.test(named)) return refuse("not_feature_key", { given: named });
@@ -208,7 +206,7 @@ function withRun(action, args, { root, stdin, seed, dir }, act) {
   if (action === "apply") {
     const newer = refuseUnreadSchema(root, ANY_SCHEMA_VERSION);
     if (newer) return newer;
-    if (!stdin) return refuse("apply_needs_stdin");
+    if (!stdin) return refuse("apply_needs_stdin", { input: "--input <path> | --stdin" });
     line = stdin();
   }
   const run = runDir(action, dir);
@@ -317,10 +315,10 @@ const ACTIONS = {
   },
 
   apply: {
-    usage: "--dir <run-dir> --stdin [--root <qa-dir>]",
+    usage: "--dir <run-dir> --input <path> [--root <qa-dir>]",
     run: (args, options) => withRun("apply", args, /** @type {SyncCommandContext} */ (options), (ctx, line) => {
       const { exit, ...json } = lifecycle.apply(ctx, ctx.dir, /** @type {string} */ (line));
-      if (exit === 2) return { exit, json: { ok: false, refusals: /** @type {{ refusals: CardRefusal[] }} */ (json).refusals } };
+      if (exit === 2) return { exit, json };
       return { exit, json: { dir: ctx.dir, confirm: false, rebuild: false, .../** @type {Record<string, unknown>} */ (json) } };
 
     }),
@@ -328,7 +326,7 @@ const ACTIONS = {
 };
 
 /** @type {SyncCommand} */
-export const command = { options: OPTIONS, actions: ACTIONS, refuse: (e) => refuse(/** @type {string} */ (e.detail.code), e.detail) };
+export const command = { options: OPTIONS, actions: ACTIONS };
 
 /**
  * @param {SyncContext} ctx
@@ -499,17 +497,21 @@ function applyCard(ctx, card, reply) {
     if (reply.edits[/** @type {number} */ (item.n)]?.bind && spansFeatures(ctx, edited)) cross_feature.push(/** @type {number} */ (item.n));
   }
   if (errors.length) return { refused: errors, rebuild: errors.some((e) => e.code === "prose_not_fetched") };
+  const shown = cardData(/** @type {SyncCardContext} */ (ctx), card);
+  /** @param {number} n @returns {string | null} */
+  const at = (n) => /** @type {SyncCardItemOut[]} */ (shown.sections.flatMap((s) => ("items" in s ? s.items : []))).find((i) => i.n === n)?.label ?? null;
   if (cascaded.length) {
     const drop = [...dropped].sort((a, b) => a - b);
     const removed = Object.keys(reply.edits).map(Number).filter((n) => dropped.has(n));
     const decisions = { take: reply.take.filter((n) => !dropped.has(n)), drop, edits: Object.fromEntries(Object.entries(reply.edits).filter(([n]) => !dropped.has(Number(n)))) };
-    const shown = cardData(/** @type {SyncCardContext} */ (ctx), card);
-    return { confirm: { cascade: cascaded.map((c) => ({ ...c, label: /** @type {SyncCardItemOut} */ (shown.items.find((i) => i.n === c.n)).label })), removed, decisions: { ...decisions, confirm: cascaded.map((item) => item.n) } } };
+    return { confirm: { report: { sections: applySections({
+      cascade: cascaded.map((c) => ({ ...c, label: at(c.n) })),
+      removed: removed.map((n) => ({ n, label: at(n) })),
+    }) }, decisions: { ...decisions, confirm: cascaded.map((item) => item.n) } } };
   }
   const rendered = plan.render();
   if (!rendered.ok) return { refused: rendered.errors.map(refusalOf) };
   const paths = changedPaths(/** @type {{ writes: Array<{ path: string, text: string, absent?: boolean }>, deletes?: never[] }} */ (rendered.changeset));
-  const shown = cardData(/** @type {SyncCardContext} */ (ctx), card);
   const labels = { ...shown.labels };
   const summary = summaries(ctx.index);
   for (const key of [...plan.minted.flatMap((m) => m.bind), ...Object.values(reply.edits).flatMap((e) => /** @type {string[] | undefined} */ (e.bind) ?? [])]) labels[key] ??= keyLabel(key, summary.testCase(key));
@@ -517,13 +519,15 @@ function applyCard(ctx, card, reply) {
   const scope = ctx.feature ? `qa(${ctx.feature})` : "qa";
   return { changeset: /** @type {CardChangeset} */ (rendered.changeset), message: `${scope}: /qa-sync`, data: { applied, dropped: reply.drop }, report: (commit) => ({
     labels,
-    minted_markdown: table(["Automation key", "Automation", "Test Cases to link"], plan.minted.map((m) => [labels[m.key], `\`${m.function.name}\` (\`${m.function.file}:${m.function.line}\`)`, m.bind.map((k) => labels[k])])),
-    minted: plan.minted.map((m) => ({ ...m, label: labels[m.key], unclaimed: !m.bind.length })), cross_feature,
-    warnings: rendered.warnings.map(refusalOf), files: paths,
-    notes: (plan.unlandedNotes ?? []).map((note) => ({ ...note, label: labels[note.key] })),
-    intaken: plan.intaken,
-    markdown: paths.map((p) => `- \`${p}\``).join("\n"),
     commit,
+    sections: applySections({
+      minted: plan.minted.map((m) => ({ ...m, label: labels[m.key], unclaimed: !m.bind.length })),
+      cross_feature: cross_feature.map((n) => ({ n, label: at(n) })),
+      intaken: plan.intaken,
+      warnings: rendered.warnings.map(refusalOf),
+      files: paths,
+      notes: (plan.unlandedNotes ?? []).map((note) => ({ ...note, label: labels[note.key] })),
+    }),
   }) };
 }
 

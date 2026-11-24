@@ -1,6 +1,7 @@
 // @ts-check
-// The settle engine, shared by `/qa-impact` and `/qa-design`: the walk and triage below, and the
-// action tables `impact` and `design` both run. The Card page (settle-page.mjs), proposals and links
+// The settle engine for `/qa-design`: the walk and triage below, and the single `SETTLE_ACTIONS`
+// table mounted exclusively on `design` (`impact persist` only lays out `walk.json` via
+// `walkCases` and `layOut`). The Card page (settle-page.mjs), proposals and links
 // (settle-propose.mjs), and checkpoint 2 with the Rule fix (settle-checkpoint.mjs) are split out.
 // The triage walk of `/qa-design`'s settlement (and `--review`). The engineer settles each
 // case the walk visits in one exchange over two independent things: the finding (dismiss / fix /
@@ -55,21 +56,21 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { keyLabel, summaries, terms } from "./labels.mjs";
-import { commitLine, writeAll } from "./changeset.mjs";
+import { commitLine } from "./changeset.mjs";
 import { isMap } from "./dialect.mjs";
 import { findingData } from "./finding-data.mjs";
 import { loadQaAt, repositoryOf, resolveRef } from "./git-tree.mjs";
 import { resolveCommits } from "./git.mjs";
 import { written } from "./impact-persist.mjs";
-import { backfillChangeset } from "./pin-digest.mjs";
 import { caseData, decisionsOf, featureData, refusalOf, KIND, MERGE_ORDER, mergeRules, findingLabel, refuse } from "./impact-json.mjs";
 import { trackerReference } from "./keys.mjs";
 import { relianceOf } from "./reliance.mjs";
 import { isQualifiedRuleRef, parseRuleRef, resolveRuleRef, ruleRefsIn } from "./rule-ref.mjs";
-import { checkFile, edit, parse } from "./knowledge-file.mjs";
+import { edit, parse } from "./knowledge-file.mjs";
 import { object } from "./refusal.mjs";
-import { buildIndex, loadWorkingTree, rootConfig } from "./qa-index.mjs";
-import { openPlan, readRunFile } from "./run-dir.mjs";
+import { buildIndex, loadWorkingTree } from "./qa-index.mjs";
+import { writeQa } from "./qa-write.mjs";
+import { openRunDir, readRunFile } from "./run-dir.mjs";
 import { localDate, scan } from "./scan.mjs";
 import { IMPACT_TRAIN_KEY } from "./schema.mjs";
 import { refuseUnreadSchema } from "./schema-guard.mjs";
@@ -641,8 +642,9 @@ const featureFindingsOf = (file) => (Array.isArray(file.data.finding) ? file.dat
  */
 const pinsResolved = (root, list) => /** @type {Map<string | null, string | null>} */ (resolveCommits(root, list.filter(isMap).map((x) => written(x.at_commit)).filter(Boolean)).resolved);
 
-// The cases the walk visits, before `impact persist` writes (it needs to know whether any is left
-// to settle: with none, the Watermark has no fix to wait for). `settled` is what the run raised.
+// The cases the walk visits, computed before `impact persist` writes `.qa/` (so `layOut` saves
+// `walk.json` for `design walk`, while every Feature's Watermark waits for `design checkpoint`).
+// `settled` is what the run raised.
 /**
  * @param {ImpactPlan} plan
  * @param {SettledFindings} settled
@@ -1087,7 +1089,7 @@ export function walk(dir, plan, given, key) {
   if (key !== undefined && !laid.cases.some((c) => c.key === key)) return refuse("case_not_in_walk", { key });
   if (key !== undefined && state.settled[/** @type {string} */ (key)]) return refuse("already_settled", { key });
   if (given !== undefined) {
-    if (!HUMAN.test(/** @type {string} */ (given))) return refuse("not_human", { given });
+    if (!HUMAN.test(/** @type {string} */ (given))) return refuse("not_human", { given, format: "human:<name>" });
     if (loaded.by !== null && loaded.by !== given) return refuse("name_differs", { stored: loaded.by });
   }
   const root = plan.root;
@@ -1190,18 +1192,6 @@ export function triage(dir, plan, text, expected) {
   const s = summaries(d.now.index);
   const r = rewrite(plan, input, d);
   if (r.refused) return refused([r.refused], s);
-  /** @type {Array<{ file: string, line: number | undefined, message: string }>} */
-  const errors = [];
-  const config = rootConfig(root);
-  for (const [rel, t] of r.edits) {
-    const checked = /** @type {{ errors: Array<{ line?: number, message: string }> }} */ (checkFile(parse(rel, t), config));
-    errors.push(...checked.errors.map((x) => ({ file: `${d.repo.prefix}${rel}`, line: x.line, message: x.message })));
-  }
-  if (errors.length) return refused([{ code: "check_file", errors }], s);
-  // Every file or none: a failure partway leaves `.qa/` as it was (and, as ever, throws).
-  const written = /** @type {{ error?: string }} */ (writeAll(root, backfillChangeset(root, root, { writes: [...r.edits].map(([path, text]) => ({ path, text })) })));
-  if (written.error) throw new Error(`design triage: ${written.error}`);
-
   // Then the Run's own record of what it settled and wrote.
   /**
    * @param {string} rel
@@ -1209,10 +1199,28 @@ export function triage(dir, plan, text, expected) {
    */
   const repoPath = (rel) => `${d.repo.prefix}${rel}`;
   const paths = [...r.edits.keys()].map(repoPath).sort();
-  state.settled[key] = { finding: d.decisions.map((x) => ({ id: x.f.id, kind: x.f.kind, finding: x.g.finding })), review: input.review, at: new Date().toISOString() };
-  state.written = [...new Set([...state.written, ...paths, ...d.fixed.map(repoPath)])].sort();
-  state.merge = [...new Set([...state.merge, ...r.merge])];
-  writeFileSync(join(dir, STATE), `${JSON.stringify(state, null, 2)}\n`);
+  /** @type {WalkState} */
+  const nextState = {
+    ...state,
+    settled: {
+      ...state.settled,
+      [key]: { finding: d.decisions.map((x) => ({ id: x.f.id, kind: x.f.kind, finding: x.g.finding })), review: input.review, at: new Date().toISOString() },
+    },
+    written: [...new Set([...state.written, ...paths, ...d.fixed.map(repoPath)])].sort(),
+    merge: [...new Set([...state.merge, ...r.merge])],
+  };
+  // Every file or none: a failure partway leaves `.qa/` as it was (and, as ever, throws).
+  const tx = writeQa({
+    root,
+    minSchema: ANY_SCHEMA_VERSION,
+    writes: [...r.edits].map(([path, text]) => ({ path, text })),
+    stage: [{ path: join(dir, STATE), value: nextState }],
+  });
+  if (!tx.ok) {
+    if (tx.kind === "schema") return tx.refusal;
+    if (tx.kind === "check") return refused([{ code: "check_file", errors: tx.errors.map((x) => ({ file: `${d.repo.prefix}${x.rel}`, line: x.line, message: x.message })) }], s);
+    throw new Error(`design triage: ${tx.error ?? "failed"}${tx.kind !== "write" && !tx.rolledBack && tx.rollbackError ? `; rollback failed: ${tx.rollbackError}` : ""}`);
+  }
 
   /** @type {Terms} */
   const t = terms();
@@ -1246,8 +1254,8 @@ function decide(plan, loaded, input) {
   const target = item ? targetOf(now, item, root) : null;
   if (!target) return { refused: { code: "case_gone", key } };
   const here = target;
-  if (input.review === "reject" && !target.feature_finding && !rejectable(now, key)) return no("reject_keyed");
-  if (input.review === "retire" && !target.feature_finding && rejectable(now, key)) return no("retire_unkeyed");
+  if (input.review === "reject" && !target.feature_finding && !rejectable(now, key)) return no("reject_keyed", { alternative: "retire" });
+  if (input.review === "retire" && !target.feature_finding && rejectable(now, key)) return no("retire_unkeyed", { alternative: "reject" });
   const list = target.list;
   const resolved = pinsResolved(root, list);
   const offered = target.offered;
@@ -1595,8 +1603,9 @@ export function caseRestsOn(decl, f, now) {
 
 // ---- The actions ----
 
-// The plan a settle action reads: the run dir `impact plan` made, which holds the walk `impact
-// persist` laid out. `/qa-design` settles the same run dir, so both commands open it alike.
+// The plan a `design` settle action reads: the run dir `impact plan` made, which holds the walk
+// `impact persist` laid out. Every settle action opens it as `design <action>` with the
+// `impact plan` recovery hint.
 /**
  * @param {string} action
  * @param {string[]} args
@@ -1605,15 +1614,25 @@ export function caseRestsOn(decl, f, now) {
  */
 export function readSettlePlan(action, args, dir) {
   if (args.length) return { refused: refuse("bad_arguments", { action }) };
-  const opened = openPlan("impact", action, args, dir);
-  return opened.error ? { refused: refuse("run_dir", { reason: opened.error }) } : /** @type {{ dir: string, plan: ImpactPlan }} */ (opened);
+  const from = "impact plan";
+  const run = openRunDir(dir, { cmd: "design", action, from });
+  if (run.error !== undefined) return { refused: refuse("run_dir", { reason: run.error }) };
+  /** @type {RunFileResult<ImpactPlan>} */
+  const plan = readRunFile(run.dir, "plan.json", {
+    by: from,
+    restart: from,
+    missing: `no plan in ${run.dir}: run \`${from}\` first`,
+  });
+  if (plan.error !== undefined) return { refused: refuse("run_dir", { reason: plan.error }) };
+  return { dir: run.dir, plan: /** @type {ImpactPlan} */ (plan.value) };
 }
 
 /** @type {OptionSpec} */
 const RUN_DIR = { dir: "value" };
 
-// The walk, triage, page and page-reply actions, the same on every command that settles (`impact`,
-// `design`): each opens its run dir through `readSettlePlan` and calls the engine above.
+// All eight settle actions (`walk`, `triage`, `checkpoint`, `rule-fix`, `page`, `page-reply`,
+// `propose`, `link`), mounted exclusively on `design`: each opens its run dir through
+// `readSettlePlan` and calls the settle engine.
 /** @type {Record<string, CommandAction>} */
 export const SETTLE_ACTIONS = {
   // The triage walk: where it stands, and the next case to settle. `by` is the name the walk's
@@ -1630,7 +1649,7 @@ export const SETTLE_ACTIONS = {
   // One case settled: the engineer's decisions are JSON on stdin.
   triage: {
     options: { ...RUN_DIR, stdin: "flag", case: "value" },
-    usage: "--dir <run-dir> --stdin [--case <key>]",
+    usage: "--dir <run-dir> --input <path> [--case <key>]",
     run(args, { stdin, case: expected, ...options }) {
       const { dir, plan, refused } = readSettlePlan("triage", args, options.dir);
       if (refused) return refused;
@@ -1654,20 +1673,19 @@ export const SETTLE_ACTIONS = {
   // A Rule fix on the walk: the Rule-edit transition, then the settled causes resting on it reopened.
   "rule-fix": {
     options: { ...RUN_DIR, stdin: "flag" },
-    usage: "<feature> --dir <run-dir> --stdin",
+    usage: "<feature> --dir <run-dir> --input <path>",
     run(args, { stdin, ...options }) {
-      const opened = openPlan("impact", "rule-fix", [], options.dir);
-      if (opened.error) return refuse("run_dir", { reason: opened.error });
-      const plan = /** @type {ImpactPlan} */ (opened.plan);
+      const { dir, plan, refused } = readSettlePlan("rule-fix", [], options.dir);
+      if (refused) return refused;
       const newer = refuseUnreadSchema(plan.root, ANY_SCHEMA_VERSION);
       if (newer) return newer;
       if (!stdin) return refuse("needs_stdin");
-      return ruleFix(/** @type {string} */ (opened.dir), plan, args, stdin());
+      return ruleFix(dir, plan, args, stdin());
     },
   },
   page: {
     options: { ...RUN_DIR, stdin: "flag" },
-    usage: "--dir <run-dir> [--stdin]",
+    usage: "--dir <run-dir> [--input <path>]",
     run(args, { stdin, ...options }) {
       const { dir, plan, refused } = readSettlePlan("page", args, options.dir);
       return refused ?? page(dir, plan, stdin?.());
@@ -1675,7 +1693,7 @@ export const SETTLE_ACTIONS = {
   },
   "page-reply": {
     options: { ...RUN_DIR, stdin: "flag" },
-    usage: "--dir <run-dir> --stdin",
+    usage: "--dir <run-dir> --input <path>",
     run(args, { stdin, ...options }) {
       const { dir, plan, refused } = readSettlePlan("page-reply", args, options.dir);
       if (refused) return refused;
@@ -1683,14 +1701,9 @@ export const SETTLE_ACTIONS = {
       return pageReply(dir, plan, stdin());
     },
   },
-};
-
-// The actions only `/qa-design` takes: design's proposals, and the links the engineer confirms.
-/** @type {Record<string, CommandAction>} */
-export const DESIGN_SETTLE_ACTIONS = {
   propose: {
     options: { ...RUN_DIR, stdin: "flag" },
-    usage: "--dir <run-dir> --stdin",
+    usage: "--dir <run-dir> --input <path>",
     run(args, { stdin, ...options }) {
       const { dir, plan, refused } = readSettlePlan("propose", args, options.dir);
       if (refused) return refused;
@@ -1700,7 +1713,7 @@ export const DESIGN_SETTLE_ACTIONS = {
   },
   link: {
     options: { ...RUN_DIR, stdin: "flag", case: "value" },
-    usage: "--dir <run-dir> --case <key> --stdin",
+    usage: "--dir <run-dir> --case <key> --input <path>",
     run(args, { stdin, case: key, ...options }) {
       const { dir, plan, refused } = readSettlePlan("link", args, options.dir);
       if (refused) return refused;

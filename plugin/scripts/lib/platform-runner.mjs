@@ -15,13 +15,16 @@
 // reporter and output arguments to it, which is why it resolves once and spawns three times.
 //
 // POSIX never reaches this module: `spawnNodeCli` returns its request unchanged there.
-import { dirname, extname, join, resolve, sep, win32 } from "node:path";
+import { win32 } from "node:path";
+import { isContained } from "./paths.mjs";
 import {
   BATCH_EXTENSIONS,
   EXE_EXTENSION,
   findWin32CommandHit,
+  isRegularFile,
   mergePlatformFs,
   NODE_SCRIPT_EXTENSIONS,
+  STRICT_WIN32,
 } from "./platform-path.mjs";
 /**
  * @import {
@@ -55,18 +58,6 @@ const refuse = (refusal) => ({ refusal });
 const isRecord = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
 
 /**
- * Whether `file` resolves inside the directory `base`: the confinement `@playwright/test`'s `bin`
- * entry must satisfy, so a planted or escaping entry never runs.
- * @param {string} base
- * @param {string} file
- * @returns {boolean}
- */
-const confined = (base, file) => {
-  const pathSep = base.includes("\\") ? "\\" : sep;
-  return file === base || file.startsWith(`${base}${pathSep}`);
-};
-
-/**
  * `npx playwright …` is the default launcher: its target is the project's own `@playwright/test`.
  * @param {string} file
  * @param {string[]} args
@@ -84,11 +75,11 @@ const isNpxPlaywright = (file, args) => file.toLowerCase() === "npx" && (args[0]
  * @returns {string}
  */
 function localPackageDir(cwd, fs) {
-  const start = resolve(cwd);
-  for (let dir = start; ; dir = dirname(dir)) {
-    const candidate = join(dir, "node_modules", "@playwright", "test");
-    if (fs.existsSync(join(candidate, "package.json"))) return candidate;
-    if (dirname(dir) === dir) return join(start, "node_modules", "@playwright", "test");
+  const start = win32.resolve(cwd);
+  for (let dir = start; ; dir = win32.dirname(dir)) {
+    const candidate = win32.join(dir, "node_modules", "@playwright", "test");
+    if (fs.existsSync(win32.join(candidate, "package.json"))) return candidate;
+    if (win32.dirname(dir) === dir) return win32.join(start, "node_modules", "@playwright", "test");
   }
 }
 
@@ -103,7 +94,7 @@ function localPackageDir(cwd, fs) {
  */
 function resolveLocalPackage(request, args, fs, execPath) {
   const packageDir = localPackageDir(request.cwd ?? process.cwd(), fs);
-  const manifest = join(packageDir, "package.json");
+  const manifest = win32.join(packageDir, "package.json");
   /** @type {Pick<PlatformRefusal, "file" | "source">} */
   const origin = { file: packageDir, source: "test_runner.launcher" };
   if (!fs.existsSync(manifest)) {
@@ -136,8 +127,8 @@ function resolveLocalPackage(request, args, fs, execPath) {
       message: `@playwright/test at ${packageDir} names no playwright bin entry; reinstall it`,
     });
   }
-  const script = resolve(packageDir, entry);
-  if (!confined(packageDir, script)) {
+  const script = win32.resolve(packageDir, entry);
+  if (!isContained(packageDir, script, STRICT_WIN32)) {
     return refuse({
       outcome: "refused",
       code: "unconfined_bin",
@@ -145,7 +136,7 @@ function resolveLocalPackage(request, args, fs, execPath) {
       message: `@playwright/test's playwright bin entry ${entry} resolves outside ${packageDir}`,
     });
   }
-  if (!fs.existsSync(script)) {
+  if (!isRegularFile(fs, script)) {
     return refuse({
       outcome: "refused",
       code: "unresolvable_shim",
@@ -166,7 +157,7 @@ function resolveLocalPackage(request, args, fs, execPath) {
       message: `@playwright/test's playwright bin entry ${entry} is not in ${packageDir}; reinstall it`,
     });
   }
-  if (!confined(realPkg, realScript)) {
+  if (!isContained(realPkg, realScript, STRICT_WIN32)) {
     return refuse({
       outcome: "refused",
       code: "unconfined_bin",
@@ -174,7 +165,7 @@ function resolveLocalPackage(request, args, fs, execPath) {
       message: `@playwright/test's playwright bin entry ${entry} resolves outside ${packageDir}`,
     });
   }
-  return { file: execPath, args: [script, ...args], options: request.options };
+  return { file: execPath, args: [realScript, ...args], options: request.options };
 }
 
 /**
@@ -234,7 +225,7 @@ export function resolvePlaywrightRunner(request, { platform = process.platform, 
     return { file: request.file, args: request.args, options: request.options };
   }
   const fs = mergePlatformFs(injectedFs);
-  const extension = extname(request.file).toLowerCase();
+  const extension = win32.extname(request.file).toLowerCase();
   if (!extension) {
     if (isNpxPlaywright(request.file, request.args)) return resolveLocalPackage(request, request.args.slice(1), fs, execPath);
     if (!win32.isAbsolute(request.file) && !/[\\/]/.test(request.file)) {

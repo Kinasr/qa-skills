@@ -517,7 +517,7 @@ function suiteCandidatesFor(ctx, e) {
   let refused = null;
   const asked = ctx.named?.[e.key];
   if (asked !== undefined) {
-    const v = e.recorded !== null ? { problem: { code: "attach_suite_recorded", entry: e.key, tracker: asked, current: e.recorded } } : vetSuite(ctx, e, asked);
+    const v = e.recorded !== null ? { problem: { code: "attach_suite_recorded", entry: e.key, tracker: asked, current: e.recorded, field: "mirror.suite" } } : vetSuite(ctx, e, asked);
     if (v.problem) refused = v.problem;
     else found.set(v.current, suiteCandidate(/** @type {VetSuiteResult & { current: string, shared_with: string[] }} */ (v), "named", { ...found.get(v.current)?.evidence, named: asked }));
   }
@@ -556,7 +556,7 @@ function suiteItems(ctx) {
 function applySuite(ctx, item, plan) {
   const e = suiteEntryNamed(ctx, item.key);
   if (!e) return { code: "no_entry", key: item.key };
-  if (!item.tracker) return { code: "needs_edit", message: `choose the tracker Test Suite to attach to \`${item.key}\` (edit item ${item.n} with \`tracker\`)` };
+  if (!item.tracker) return { code: "needs_edit", field: "tracker" };
   if (!item.candidates.some((c) => c.tracker === item.tracker)) return { code: "attach_not_candidate", entry: item.key, tracker: item.tracker, message: `\`${item.tracker}\` is not one of the Card's candidates: name it in the Reply so it is fetched first` };
   return writeSuiteAttach(ctx, e, item.tracker, plan, item.n);
 }
@@ -572,8 +572,8 @@ function applySuite(ctx, item, plan) {
  * @returns {{ code: string, [key: string]: unknown } | null}
  */
 function writeSuiteAttach(ctx, e, tracker, plan, n) {
-  if (e.suiteKey === null) return { code: "attach_suite_key_missing", entry: e.key };
-  if (e.recorded !== null) return { code: "attach_suite_recorded", entry: e.key, tracker, current: e.recorded };
+  if (e.suiteKey === null) return { code: "attach_suite_key_missing", entry: e.key, next: "migrate-keys" };
+  if (e.recorded !== null) return { code: "attach_suite_recorded", entry: e.key, tracker, current: e.recorded, field: "mirror.suite" };
   const v = vetSuite(ctx, e, tracker);
   if (v.problem) return v.problem;
   // A Suite may be shared, but two Features remarking it in one run would contend for its mark.
@@ -656,7 +656,7 @@ export const attach = {
     if (item.code === "attach_suite") return applySuite(ctx, item, plan);
     const e = entryNamed(ctx, item.key);
     if (!e) return { code: "no_entry", key: item.key };
-    if (item.code === "attach_tracker" && !item.tracker) return { code: "needs_edit", message: `choose the tracker ${item.kind} to attach to \`${item.key}\` (edit item ${item.n} with \`tracker\`)` };
+    if (item.code === "attach_tracker" && !item.tracker) return { code: "needs_edit", field: "tracker" };
     if (!item.candidates.some((c) => c.tracker === item.tracker)) return { code: "attach_not_candidate", entry: item.key, tracker: item.tracker, message: `\`${item.tracker}\` is not one of the Card's candidates: name it in the Reply so it is fetched first` };
     const v = vet(ctx, e, /** @type {string} */ (item.tracker));
     if (v.problem) return v.problem;
@@ -709,9 +709,9 @@ export function nameKeys(ctx, named) {
     const suite = e ? null : suiteEntryNamed(ctx, key);
     const owned = () => ctx.index.tracker.resolve(tracker).status;
     if (!e && !suite) problems.push({ code: "attach_unknown_entry", entry: key });
-    else if (suite?.suiteKey === null) problems.push({ code: "attach_suite_key_missing", entry: key });
+    else if (suite?.suiteKey === null) problems.push({ code: "attach_suite_key_missing", entry: key, next: "migrate-keys" });
     else if (!ctx.config.trackerPattern?.test(tracker)) problems.push({ code: "attach_bad_key", entry: key, tracker });
-    else if (suite && suite.recorded !== null) problems.push({ code: "attach_suite_recorded", entry: key, tracker, current: suite.recorded });
+    else if (suite && suite.recorded !== null) problems.push({ code: "attach_suite_recorded", entry: key, tracker, current: suite.recorded, field: "mirror.suite" });
     else if (owned() !== "absent") problems.push({ code: "attach_owned", entry: key, tracker, status: owned() });
   }
   if (problems.length) return { problems };

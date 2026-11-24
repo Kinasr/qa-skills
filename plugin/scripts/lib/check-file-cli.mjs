@@ -9,12 +9,12 @@ import { checkFile, parse } from "./knowledge-file.mjs";
 import { locate } from "./qa-index.mjs";
 import { credentialSourceProblems, credentialSourceWarnings } from "./credential-source.mjs";
 
-// With `--stdin` the contents come from stdin and <path> is where they are about to be written.
-// Exit 0 if ok, 1 if not.
+// With `--input <path>` the contents come from that file, or with `--stdin` from stdin, and <path>
+// is where they are about to be written. Exit 0 if ok, 1 if not.
 /** @type {CommandDefinition} */
 export const command = {
   options: { stdin: "flag", root: "value" },
-  usage: "<path> [--stdin] [--root <qa-dir>]",
+  usage: "<path> [--input <path>] [--root <qa-dir>]",
   run(args, { stdin, root }) {
     if (args.length !== 1) throw new UsageError("check-file takes exactly one <path>");
     const [file] = args;

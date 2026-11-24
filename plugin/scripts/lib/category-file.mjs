@@ -1,22 +1,18 @@
 // @ts-check
-// The blank-slate half of Coverage categories: the floor's one home, the `train/categories.md`
-// entry format, and the whole-file validation and write-path change checks. It reads no `.qa/`
-// file and never touches a repository, so `check-file` can validate a categories file without
-// reaching the knowledge-file cycle. `categories.mjs` adds the frontmatter reader and the resolver.
+// The blank-slate half of Coverage categories: `FLOOR` as typed JS data (no disk reads at import
+// time) kept in exact parity with the shared Coverage-categories reference by `scripts/lint-skills.mjs`,
+// the `train/categories.md` entry format, and the whole-file validation and write-path change checks.
+// It reads no `.qa/` file and never touches a repository, so `check-file` can validate a categories
+// file without reaching the knowledge-file cycle. `categories.mjs` adds the frontmatter reader and
+// the resolver.
 /** @import { CheckProblem } from "./check-file.mjs" */
-import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { parseYaml } from "./dialect.mjs";
 import { keyedHeading, splitFile } from "./markdown.mjs";
 import { CATEGORIES_TRAIN_KEY } from "./schema.mjs";
 
-// The shared floor reference, one directory above this module's `lib/`.
-const REFERENCE = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "skills", "references", "coverage-categories.md");
-
 /**
  * One category of the floor, as the reference states it.
- * @typedef {{ key: string, name: string, meaning: string }} FloorCategory
+ * @typedef {{ readonly key: string, readonly name: string, readonly meaning: string }} FloorCategory
  */
 
 /**
@@ -63,9 +59,22 @@ const REFERENCE = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "ski
  * }} CategoryMeta
  */
 
-// The floor, read from its one home. `FLOOR_KEYS` is derived, never typed twice.
+// The ten-category Coverage category floor in walk order. `FLOOR_KEYS` is derived, never typed twice.
 /** @type {readonly FloorCategory[]} */
-export const FLOOR = parseFloor(readFileSync(REFERENCE, "utf8"));
+export const FLOOR = Object.freeze(
+  [
+    { key: "happy-path", name: "Happy path", meaning: "The main flow produces its required outcome for a permitted actor with valid input." },
+    { key: "variations", name: "Valid variations", meaning: "Other valid inputs, paths and modes, including valid refusal or no-change outcomes." },
+    { key: "results", name: "Results and retrieval", meaning: "Which information is returned or presented, and how selection, ordering, calculation and transformation decide it." },
+    { key: "permissions", name: "Permissions", meaning: "Who may act on or see which data, under which conditions: roles, ownership, disclosure, signed-out users." },
+    { key: "input-validation", name: "Input validation", meaning: "Missing, malformed or disallowed content is rejected, with what the user or caller is told. Channel-agnostic." },
+    { key: "limits", name: "Edges and limits", meaning: "Values at and past their edges: empty, zero, min, max, length, size, quota, pagination ends, time thresholds, precision, rounding." },
+    { key: "state", name: "State and lifecycle", meaning: "Allowed and refused transitions, repeats (duplicates, idempotence), undo, temporary state, expiry, cancellation, what persists." },
+    { key: "failures", name: "Failures and recovery", meaning: "A dependency or step fails or times out: what the user sees, partial completion, rollback, the consistency left behind, retry." },
+    { key: "concurrency", name: "Concurrency", meaning: "Overlapping actions by the same or different actors, background work, stale data." },
+    { key: "side-effects", name: "Side effects", meaning: "Other required observable effects: notifications, audit records, integrations, other Features (a Dependency still needs its own Rule)." },
+  ].map((entry) => Object.freeze(entry)),
+);
 /** @type {readonly string[]} */
 export const FLOOR_KEYS = Object.freeze(FLOOR.map((c) => c.key));
 
@@ -73,25 +82,6 @@ export const FLOOR_KEYS = Object.freeze(FLOOR.map((c) => c.key));
 const KEY = /^[a-z][a-z0-9-]*$/;
 // The only keys a category's `yaml` block may hold.
 const BLOCK_KEYS = ["meaning", "after", "sources", "added", "key", "name"];
-
-/**
- * The table rows of the floor reference, in walk order: the `#`, `Key`, `Category` and `Meaning`
- * columns, with the key's backticks removed.
- * @param {string} text
- * @returns {FloorCategory[]}
- */
-function parseFloor(text) {
-  /** @type {FloorCategory[]} */
-  const floor = [];
-  for (const line of text.replace(/\r\n/g, "\n").split("\n")) {
-    const row = line.match(/^\|(.*)\|$/);
-    if (!row) continue;
-    const cells = row[1].split("|").map((c) => c.trim());
-    if (cells.length < 4 || !/^\d+$/.test(cells[0])) continue;
-    floor.push({ key: cells[1].replace(/`/g, "").trim(), name: cells[2], meaning: cells[3] });
-  }
-  return floor;
-}
 
 /**
  * A categories file's entries, retired list and its own structural errors, from text and the

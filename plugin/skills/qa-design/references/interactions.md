@@ -31,11 +31,11 @@ answer. Pass the reply unchanged. The contract validates questions and the write
 
 A filler may also return `check_gaps`: `{case, needs}` entries naming one of its own cases by summary
 and what checking its Expected result needs of the test environment. They are Training's knowledge,
-never a proposed Rule: show them with `check_handoff`, and never send them to `/qa-deep-dive` in
+never a proposed Rule: show them with the `check_gaps` section's `next` command, and never send them to `/qa-deep-dive` in
 place of a behaviour gap a Rule must state.
 
-Run `design report --dir <dir>` as usual. Show its `questions`, each implicated Rule and held
-proposal, then its `question_handoff` command. The report writes `design-questions.json` in the
+Run `design report --dir <dir>` as usual. Show its `questions` section, each implicated Rule and held
+proposal, then the section's `next` command. The report writes `design-questions.json` in the
 Run. `/qa-deep-dive` reads it with `deep-dive resume --dir <dir>` and uses the existing Feature
 `## Open questions` mechanism. There is no new Finding kind. Never edit Rules or park Feature prose
 from design.
@@ -44,7 +44,7 @@ from design.
 
 After the deep dive, run `design resume --dir <dir>` using the original design Run. Keep that dir
 when a later deep-dive settlement uses another. A still-parked question or unchanged Rule claims
-returns `waiting`; do not fill its expected outcome. `ready` offers the held proposal and its
+returns `waiting`; do not fill its expected outcome. `ready` offers the held proposal and its returned
 `rerun` command after Rule claims change and the question leaves Open questions. This is a cue to
 reconsider, never proof of resolution: read the Rules and verify that they now answer the question.
 A different Rule edit, a removed Rule or a cleared question alone supplies no missing behaviour.

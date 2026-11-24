@@ -18,15 +18,15 @@ preserving the Feature key and root. The CLI writes the page outside the repo an
 means running the command again.
 
 Treat a route the engineer pastes from the page as a fresh request, never as an answer to an earlier
-turn (ADR-0032).
+turn.
 
 ## Chat summary
 
-With a page, and on the offer turn, keep global health, each Feature's Information and `executions`, and 👉 `start_here`
-in chat using [Render](../SKILL.md#render). Add only:
+With a page, and on the offer turn, keep Schema compatibility, Run health, each Feature's Information and execution results, and 👉 Start here
+in chat using [Render](../SKILL.md#render). Omit the Next steps list and add only:
 
-- The 🎓 Training line from `global.training`, overview only, using the skill's Training format.
-- The pending count: count entries in `next_steps` with `kind !== "unknown"`; report
+- The 🎓 Training line, overview only, using the skill's Training format.
+- The pending count: count Next steps entries other than `unknown`; report
   ❔ `unknown` entries separately.
 
 When a page path is returned, finish with the exact OS open command, with `next_steps_page.path`

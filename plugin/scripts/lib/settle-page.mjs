@@ -9,7 +9,7 @@ import { isDeepStrictEqual } from "node:util";
 import { summaries, terms } from "./labels.mjs";
 import { decisionsOf, DISMISSAL_VALIDATION, refusalOf, refuse } from "./impact-json.mjs";
 import { renderCardPage } from "./card-page.mjs";
-import { object, refusalsFor } from "./refusal.mjs";
+import { object, refusalsWithoutLines } from "./refusal.mjs";
 import { newRunId, readRunFile } from "./run-dir.mjs";
 import { pageState } from "./settle-walk.mjs";
 /** @import { PageStateCase, PageStateQuestions, PageStateReviewState } from "./settle-walk.mjs" */
@@ -41,6 +41,7 @@ import { pageState } from "./settle-walk.mjs";
  * @typedef {object} PageRecordReply
  * @property {string} page
  * @property {string[]} answered
+ * @property {Record<string, string>} [fingerprints]
  */
 
 /**
@@ -70,21 +71,25 @@ import { pageState } from "./settle-walk.mjs";
 
 /** @type {number} */
 export const EXPLANATION_LIMIT = 280;
-/** @type {Record<string, string>} */
-export const PAGE_REFUSALS = {
-  page_explanations: `Explanations must be an items object of page case keys and plain text of at most ${EXPLANATION_LIMIT} characters each.`,
-  no_unsettled_cases: "No unsettled case is available for a Card page.",
-  reply_fence: "The Reply must contain exactly one fenced JSON block and no surrounding text.",
-  reply_json: "The Reply does not hold a parseable JSON object.",
-  reply_run: "The Reply names a different or unknown Run.",
-  reply_page: "This Run never rendered the page named by the Reply.",
-  reply_count: "The Reply count does not match its items.",
-  reply_duplicate: "The Reply names a case more than once.",
-  reply_field: "The Reply contains an unknown field.",
-  reply_case: "The Reply names a case this page did not offer.",
-  reply_shape: "The Reply has an unsupported version or malformed fields.",
-};
-const { refuse: pageRefuse } = refusalsFor(PAGE_REFUSALS);
+// Every refusal code the page can print, for the coverage test that drives each one.
+/** @type {readonly string[]} */
+export const PAGE_REFUSAL_CODES = [
+  "page_explanations",
+  "no_unsettled_cases",
+  "reply_fence",
+  "reply_json",
+  "reply_run",
+  "reply_page",
+  "reply_count",
+  "reply_duplicate",
+  "reply_field",
+  "reply_case",
+  "reply_shape",
+];
+const { refuse: pageRefuse } = refusalsWithoutLines((code, data) => ({
+  ...(code === "page_explanations" && { limit: EXPLANATION_LIMIT, shape: "{items: {<case key>: <text>}}" }),
+  ...data,
+}));
 
 /**
  * @param {unknown} value
@@ -100,6 +105,36 @@ export const unknown = (value, fields) => object(value) && Object.keys(value).so
  * @returns {RunFileResult<T>}
  */
 const readPageFile = (dir, name) => readRunFile(dir, name, { by: "design page", restart: "impact plan" });
+
+/**
+ * Map each previously answered case key to the set of fingerprints it was answered at, falling back
+ * to the rendered page snapshot when an older reply carries no `fingerprints` map.
+ * @param {string} dir
+ * @param {PageRecord} record
+ * @returns {Map<string, Set<string | null>>}
+ */
+function answeredFingerprints(dir, record) {
+  /** @type {Map<string, Map<string, string>>} */
+  const byPage = new Map();
+  /** @param {string} page */
+  const snapshotFor = (page) => {
+    if (!byPage.has(page)) {
+      const snap = /** @type {RunFileResult<PageSnapshot>} */ (readPageFile(dir, `card-page.${page}.json`));
+      byPage.set(page, new Map((snap.value?.cases ?? []).map((c) => [c.key, c.fingerprint])));
+    }
+    return /** @type {Map<string, string>} */ (byPage.get(page));
+  };
+  /** @type {Map<string, Set<string | null>>} */
+  const out = new Map();
+  for (const r of record.replies) {
+    for (const key of r.answered) {
+      const fp = r.fingerprints?.[key] ?? snapshotFor(r.page).get(key) ?? null;
+      if (!out.has(key)) out.set(key, new Set());
+      /** @type {Set<string | null>} */ (out.get(key)).add(fp);
+    }
+  }
+  return out;
+}
 
 /**
  * The Card page of the walk: the cases it offers, the explanations the engineer gave for them,
@@ -127,8 +162,12 @@ export function page(dir, plan, input) {
   if (saved.error) return pageRefuse("run_dir", { reason: saved.error });
   /** @type {PageRecord} */
   const record = saved.value ?? { run: newRunId(), pages: [], replies: [] };
-  const answered = new Set(record.replies.flatMap((r) => r.answered));
-  const cases = /** @type {PageStateCase[]} */ (state.cases.filter((c) => !c.settled && !c.gone && !answered.has(c.key)));
+  const answered = answeredFingerprints(dir, record);
+  const cases = /** @type {PageStateCase[]} */ (state.cases.filter((c) => {
+    if (c.settled || c.gone) return false;
+    const seen = answered.get(c.key);
+    return !seen || (!seen.has(c.fingerprint) && !seen.has(null));
+  }));
   if (!cases.length) return pageRefuse("no_unsettled_cases");
   if (Object.entries(explanations).some(([key, text]) => !cases.some((c) => c.key === key) || typeof text !== "string" || text.length > EXPLANATION_LIMIT)) return pageRefuse("page_explanations");
   /** @type {PageSnapshotCase[]} */
@@ -242,10 +281,16 @@ export function pageReply(dir, plan, text) {
     }
     return { ...out, status: "ready", decisions, ...(fixes.length && { fixes }) };
   });
-  // Re-reading the same Reply (the per-case freshness check) records it once.
-  const answered = input.items.filter((c) => Object.values(c.findings ?? {}).some((v) => v?.answer !== "fix" || typeof v.fix !== "string" || v.fix.trim()) || c.review !== undefined).map((c) => c.key);
-  if (!record.replies.some((r) => r.page === input.page && isDeepStrictEqual([...r.answered].sort(), [...answered].sort()))) {
-    record.replies.push({ page: input.page, answered });
+  // Re-reading the same Reply (the per-case freshness check) records it once. Only items whose
+  // answers were accepted at their current fingerprint (`ready`, `partial`, `invalid`) keep a case off
+  // a fresh page; `changed` items remain eligible for a fresh page.
+  const snapshotFingerprints = new Map(snapshot.cases.map((c) => [c.key, c.fingerprint]));
+  const answered = items
+    .filter((c) => c.status === "ready" || c.status === "partial" || c.status === "invalid")
+    .map((c) => c.key);
+  const fingerprints = Object.fromEntries(answered.map((key) => [key, snapshotFingerprints.get(key) ?? ""]));
+  if (answered.length > 0 && !record.replies.some((r) => r.page === input.page && isDeepStrictEqual([...r.answered].sort(), [...answered].sort()))) {
+    record.replies.push({ page: input.page, answered, fingerprints });
     writeFileSync(runFile, `${JSON.stringify(record, null, 2)}\n`);
   }
   return { exit: 0, json: { ok: true, items, ...(input.comment !== undefined && { comment: input.comment }) } };

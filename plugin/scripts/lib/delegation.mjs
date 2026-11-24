@@ -5,7 +5,7 @@
 // each unit's contract.
 //
 //   resolve   which Delegate a Run would use: the model label of the Tier its agent is bound to
-//             (lib/tiers.mjs), the Fallback (`inherit`) and the concurrency cap. Never writes.
+//             (`BINDING` in lib/delegates.mjs), the Fallback (`inherit`) and the concurrency cap. Never writes.
 //   start     resolves the chosen Delegate's label, once, before the first unit, and mints the Run
 //             id. Writes `dispatch.json`.
 //   next      hands the orchestrator the units to spawn as subagents, as many as may run now under
@@ -26,39 +26,20 @@
 // Cooldowns are real time. QA_SKILLS_DISPATCH_SCALE scales them; nothing but a test sets it.
 // Nothing outside the harness can end a subagent, so a timeout is whatever the harness reports
 // (`record --status timeout`), and so is a refusal to spawn one with the model (`--status refused`).
-import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { orThrow, UsageError } from "./cli.mjs";
 import { CONTRACTS } from "./contracts.mjs";
-import { AGENT_TYPES, COMMANDS, resolveDelegates } from "./delegates.mjs";
-import { activeDelegate, finished, inFlight, launch, newDispatch, nextReadyAt, POLICY, ready, settle } from "./dispatch.mjs";
-import { newRunId, openRunDir, readRunFile } from "./run-dir.mjs";
+import { AGENT_TYPES, COMMANDS, resolveDelegates, subagentModel } from "./delegates.mjs";
+import { activeDelegate, cooldownBackoff, finished, inFlight, launch, newDispatch, ready, scaledCooldown, settle } from "./dispatch.mjs";
+import { newRunId, openRunDir, readRunFile, stageJson, writeJsonAtomic } from "./run-dir.mjs";
 import { refuseUnreadSchema } from "./schema-guard.mjs";
 import { ANY_SCHEMA_VERSION, LEVEL_ON_CASE_SCHEMA_VERSION } from "./schema.mjs";
-import { subagentModel } from "./tiers.mjs";
 /** @import { RunFileResult } from "./run-dir.mjs" */
 
 /** @import {CommandContext, CommandDefinition, CommandResult, OptionSpec} from "./cli.mjs" */
+/** @import { DelegateNote } from "./delegates.mjs" */
 /** @import {Attempt, DispatchSpec, DispatchSpecUnit, DispatchState, DispatchedUnit, UnitStatus} from "./dispatch.mjs" */
-
-/**
- * A note the resolution made (lib/delegates.mjs `concurrencyCap` is unchecked): a code and one
- * line.
- * @typedef {object} DelegateNote
- * @property {string} code
- * @property {string} message
- */
-
-/**
- * The report the resolution gave the Run: the Delegate it chose, under which Tier, the Fallback
- * behind it, the concurrency cap, and its notes. `delegate resolve` prints it and `start` stores
- * it (lib/delegates.mjs `resolveDelegates` is unchecked, so this names the fields it reads).
- * @typedef {object} DelegateResolution
- * @property {{ label: string, tier: string }} chosen
- * @property {string} fallback
- * @property {number} concurrency_cap
- * @property {DelegateNote[]} notes
- */
 
 /**
  * The run's dispatch state, as `dispatch.json` carries it: the machine's own state
@@ -115,6 +96,8 @@ import { subagentModel } from "./tiers.mjs";
  * @property {boolean} done
  * @property {NextUnit[]} dispatch
  * @property {string[]} in_flight
+ * @property {number} [wait_ms]
+ * @property {string} [next_ready_at]
  * @property {DispatchReport} [summary]
  */
 
@@ -223,9 +206,7 @@ function start(dir) {
   const spec = orThrow(readSpec(dir));
   const newer = refuseUnreadSchema(spec.root, minimumSchema(spec.cmd));
   if (newer) return newer;
-  // lib/delegates.mjs is unchecked; its resolution (or `{error}`) is trusted past the gate in
-  // `readSpec`'s units.
-  const r = orThrow(/** @type {DelegateResolution | { error: string }} */ (resolveDelegates(spec.root, { cmd: spec.cmd })));
+  const r = orThrow(resolveDelegates(spec.root, { cmd: spec.cmd }));
 
   const chosen = r.chosen.label;
   const fallback = r.fallback;
@@ -246,7 +227,7 @@ function start(dir) {
     notes: r.notes,
     ...newDispatch({ units: spec.units, chain, cap: r.concurrency_cap }),
   };
-  save(dir, state);
+  writeJsonAtomic(join(dir, STATE), state);
   return {
     exit: 0,
     json: {
@@ -255,8 +236,7 @@ function start(dir) {
       run: state.run,
       delegate: chain[0],
       tier: state.tier,
-      // lib/tiers.mjs is unchecked: the label's model, or null when no Tier binds it.
-      model: /** @type {string | null} */ (subagentModel(chain[0])),
+      model: subagentModel(chain[0]),
       chosen,
       fallback,
       units_planned: spec.units.length,
@@ -269,42 +249,49 @@ function start(dir) {
 // The units to spawn now, under the failure policy.
 /**
  * @param {string} dir
- * @returns {Promise<CommandResult>}
+ * @returns {CommandResult}
  */
-async function next(dir) {
+function next(dir) {
   const state = orThrow(load(dir));
   /** @type {NextUnit[]} */
   let dispatch = [];
+  const now = Date.now();
   const label = activeDelegate(state);
   if (label && !finished(state)) {
-    let now = Date.now();
-    if (ready(state, now).length === 0 && inFlight(state).length === 0) {
-      const at = nextReadyAt(state);
-      if (at !== null && at > now) await sleep(at - now);
-      now = Date.now();
+    const readyUnits = ready(state, now);
+    if (readyUnits.length > 0) {
+      mkdirSync(join(dir, "attempts"), { recursive: true });
+      dispatch = readyUnits.map((u) => {
+        const a = launch(state, u, now);
+        return {
+          unit: u.id,
+          attempt: a.n,
+          feature: u.feature,
+          scenario: u.scenario,
+          delegate: label,
+          agent: AGENT_TYPES[state.cmd],
+          model: subagentModel(label),
+          brief: u.brief,
+          reply: attemptReply(dir, u, a),
+          prompt: subagentPrompt(state, u),
+        };
+      });
+      writeJsonAtomic(join(dir, STATE), state);
     }
-    mkdirSync(join(dir, "attempts"), { recursive: true });
-    dispatch = ready(state, now).map((u) => {
-      const a = launch(state, u, now);
-      return {
-        unit: u.id,
-        attempt: a.n,
-        feature: u.feature,
-        scenario: u.scenario,
-        delegate: label,
-        agent: AGENT_TYPES[state.cmd],
-        // lib/tiers.mjs is unchecked: the label's model, or null when no Tier binds it.
-        model: /** @type {string | null} */ (subagentModel(label)),
-        brief: u.brief,
-        reply: attemptReply(dir, u, a),
-        prompt: subagentPrompt(state, u),
-      };
-    });
-    save(dir, state);
   }
   const done = finished(state);
+  const inFlightIds = inFlight(state).filter((u) => !dispatch.some((x) => x.unit === u.id)).map((u) => u.id);
+  const backoff = dispatch.length === 0 && inFlightIds.length === 0 && !done ? cooldownBackoff(state, now) : null;
   /** @type {NextJson} */
-  const json = { action: "next", ok: true, run: state.run, done, dispatch, in_flight: inFlight(state).filter((u) => !dispatch.some((x) => x.unit === u.id)).map((u) => u.id) };
+  const json = {
+    action: "next",
+    ok: true,
+    run: state.run,
+    done,
+    dispatch,
+    in_flight: inFlightIds,
+    ...(backoff ?? {}),
+  };
   if (done) json.summary = dispatchSummary(state);
   return { exit: 0, json };
 }
@@ -343,7 +330,6 @@ function record(options) {
   /** @type {string[]} */
   const lines = [];
   const checked = conclude(dir, state, unit, attempt, outcome, lines, options.env);
-  save(dir, state);
   return {
     exit: 0,
     json: {
@@ -410,37 +396,6 @@ function load(dir) {
   return read.error ? /** @type {{ error: string }} */ (read) : /** @type {DispatchJson & { error?: never }} */ (read.value);
 }
 
-/**
- * @param {string} dir
- * @param {DispatchJson} state
- * @returns {void}
- */
-function save(dir, state) {
-  const tmp = join(dir, `${STATE}.tmp`);
-  writeFileSync(tmp, `${JSON.stringify(state, null, 2)}\n`);
-  renameSync(tmp, join(dir, STATE));
-}
-
-/**
- * @param {Record<string, string | undefined>} env
- * @returns {number}
- */
-const scale = (env) => {
-  const s = Number(env.QA_SKILLS_DISPATCH_SCALE);
-  return Number.isFinite(s) && s > 0 ? s : 1;
-};
-/**
- * @param {number} ms
- * @param {Record<string, string | undefined>} env
- * @returns {number}
- */
-const scaled = (ms, env) => Math.round(ms * scale(env));
-/**
- * @param {number} ms
- * @returns {Promise<void>}
- */
-const sleep = (ms) => new Promise((r) => setTimeout(r, Math.max(0, ms)));
-
 // Where one attempt's reply is saved: in the run directory, beside the unit's.
 /**
  * @param {string} dir
@@ -474,7 +429,6 @@ function conclude(dir, state, unit, attempt, outcome, lines, env = process.env) 
     ? contract.check(outcome.reply, /** @type {import("./contracts.mjs").LoadedContractData} */ (data))
     : { usable: false, problems: [] };
   const label = state.chain[attempt.delegate];
-  if (checked.usable && contract.accept) contract.accept(/** @type {string} */ (outcome.reply), /** @type {import("./contracts.mjs").LoadedContractData} */ (data), { checked, delegate: label });
   if (outcome.reply !== null) {
     const path = attemptReply(dir, unit, attempt);
     if (!existsSync(path)) {
@@ -483,8 +437,16 @@ function conclude(dir, state, unit, attempt, outcome, lines, env = process.env) 
     }
     if (checked.usable || !unit.attempts.some((a) => a.usable)) copyFileSync(path, unit.reply);
   }
-  lines.push(...settle(state, unit, { status: outcome.status, error_kind: outcome.error_kind, usable: checked.usable, problems: checked.problems.map((p) => p.code) }, Date.now(), scaled(POLICY.cooldown_ms, env)));
+  lines.push(...settle(state, unit, { status: outcome.status, error_kind: outcome.error_kind, usable: checked.usable, problems: checked.problems.map((p) => p.code) }, Date.now(), scaledCooldown(env)));
   state.announcements.push(...lines.filter((l) => !state.announcements.includes(l)));
+  const staged = stageJson(join(dir, STATE), state);
+  try {
+    if (checked.usable && contract.accept) contract.accept(/** @type {string} */ (outcome.reply), /** @type {import("./contracts.mjs").LoadedContractData} */ (data), { checked, delegate: label });
+    staged.commit();
+  } catch (e) {
+    staged.abort();
+    throw e;
+  }
   return checked;
 }
 

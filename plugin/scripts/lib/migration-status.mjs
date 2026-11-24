@@ -33,6 +33,7 @@ import { loadWorkingTree } from "./qa-index.mjs";
 export const command = {
   options: { root: "qa-dir?" },
   usage: "[--root <qa-dir>]",
+  omitMigration: true,
   run(args, { root }) {
     if (args.length) throw new UsageError("migration-status takes no argument: it checks the whole `.qa/`");
     return { exit: 0, json: migrationStatus(loadWorkingTree(root)) };

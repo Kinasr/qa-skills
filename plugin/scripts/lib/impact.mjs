@@ -17,16 +17,16 @@
 //   persist            a plan made with `--persist`, which refuses a `.qa/` holding
 //                      uncommitted knowledge and pins the run to a commit (`--target`'s, else
 //                      HEAD's): checks that again, then writes what the report settles case by
-//                      case (lib/impact-persist.mjs) and advances each complete Feature's
-//                      Watermark, before any triage walk begins. Prints the report, with the
-//                      Watermarks under Run health, the knowledge files in the changeset, and
-//                      `walk`, where the triage walk begins. It lays the walk out.
-//   entry, quick,      `/qa-impact`'s quick path around the judge step (lib/impact-entry.mjs,
-//   quick-check,       lib/quick-path.mjs, lib/change-escalate.mjs).
+//                      case (lib/impact-persist.mjs) and lays out `walk.json` for `design walk`
+//                      (leaving each Feature's Watermark to `design checkpoint`). Prints the report,
+//                      with the Watermarks under Run health, the knowledge files in the changeset,
+//                      and `walk`, where the triage walk begins.
+//   entry, quick,      `/qa-impact`'s quick path around the judge step (lib/quick-path.mjs,
+//   quick-check,       lib/change-escalate.mjs).
 //   escalate
 //
-// The triage walk that follows a persist is `design walk` and `design triage`, whichever command
-// settles (lib/settle-walk.mjs).
+// The triage walk that follows a persist runs through `design walk` and `design triage`
+// (lib/settle-walk.mjs).
 //
 // The run directory, per unit `<key>`:
 //   plan.json           the plan, as printed
@@ -39,7 +39,6 @@ import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, posix, resolve } from "node:path";
 import { brief } from "./brief.mjs";
 import { readChange } from "./change-data.mjs";
-import { enter } from "./impact-entry.mjs";
 import { unforecastRules } from "./forecast-guard.mjs";
 import { checkQuick, openQuick } from "./quick-path.mjs";
 import { escalate } from "./change-escalate.mjs";
@@ -51,7 +50,7 @@ import { featureUnitId } from "./dispatch.mjs";
 import { readDispatch } from "./delegation.mjs";
 import { loadQaTree, repositoryOf, resolveRef } from "./git-tree.mjs";
 import { settleFindings, writeFindings } from "./impact-persist.mjs";
-import { refuse, reportData } from "./impact-json.mjs";
+import { fact, refuse, reportData } from "./impact-json.mjs";
 import { layOut, walkCases } from "./settle-walk.mjs";
 import { PATTERN } from "./keys.mjs";
 import { projectConfig } from "./knowledge-file.mjs";
@@ -352,7 +351,7 @@ const UNPARSEABLE = ["dialect", "conflict_marker", "unreadable", "type"];
 // when given, is `{ref, commit}`.
 //
 // What each prints (ADR-0024): data for the model to word, never prose for the engineer. A refusal
-// is `{ok: false, refusals: [{code, line, ...}]}` (lib/impact-json.mjs).
+// is `{ok: false, refusals: [{code, ...facts}]}` (lib/impact-json.mjs).
 //   plan     {ok, dir, units, train}: `units` is how many judge units there are to dispatch;
 //            `train` is `train/impact.md` (lib/training.mjs), the working tree's whatever commit
 //            the run judges. The command reads it; the judge never does (ADR-0007)
@@ -377,7 +376,9 @@ const ACTIONS = {
     run(args, options) {
       const { dir, plan, refused } = readPlan("report", args, options.dir);
       if (refused) return refused;
-      return { exit: 0, json: { ok: true, report: report(plan, /** @type {DispatchSummary | null} */ (readDispatch(dir)), { dir }).report } };
+      const out = report(plan, /** @type {DispatchSummary | null} */ (readDispatch(dir)), { dir });
+      if (out.refused) return persistRefused(out.refused);
+      return { exit: 0, json: { ...out.report } };
     },
   },
 
@@ -396,7 +397,7 @@ const ACTIONS = {
       const out = report(plan, /** @type {DispatchSummary | null} */ (readDispatch(dir)), { persist: true, dir });
       if (out.refused) return persistRefused(out.refused);
       const cases = /** @type {unknown[]} */ (out.walk_cases).length;
-      return { exit: 0, json: { ok: true, report: out.report, walk: { cases }, ...(cases >= CARD_PAGE_OFFER_THRESHOLD && { card_page: { offer: true, cases } }) } };
+      return { exit: 0, json: { ...out.report, walk: { cases }, ...(cases >= CARD_PAGE_OFFER_THRESHOLD && { card_page: { offer: true, cases } }) } };
     },
   },
 
@@ -406,16 +407,16 @@ const ACTIONS = {
     options: { dir: "value", case: "value", root: "qa-dir" },
     usage: "--dir <run-dir> --case <key> [--root <qa-dir>]",
     run(args, { dir, case: key, root }) {
-      if (args.length) return refuse("bad_arguments", { action: "escalate" });
+      if (args.length) return refuse("bad_arguments", { action: "escalate", takes: ACTIONS.escalate.usage });
       if (dir === undefined) return refuse("run_dir", { reason: "escalate takes --dir <run-dir>: the run dir `impact plan --dir` will read" });
-      if (typeof key !== "string") return refuse("needs_case");
+      if (typeof key !== "string") return refuse("needs_case", { flag: "--case <key>" });
       const out = escalate({ root: /** @type {string} */ (root), dir, key });
       if (out.ok) return { exit: 0, json: { ok: true, dir: out.dir, file: out.file, escalated: out.escalated } };
       return out.refusal === "run_dir" ? refuse("run_dir", { reason: out.reason }) : refuse("unknown_case", { key });
     },
   },
 
-  // The front door of `/qa-impact` (lib/impact-entry.mjs): the quick path, or the answer an old
+  // The front door of `/qa-impact`: the quick path, or the answer an old
   // invocation (`--persist`, `--review`, `--target`, read-only) gets.
   entry: {
     options: { root: "qa-dir", persist: "flag", review: "optional", target: "value" },
@@ -429,26 +430,50 @@ const ACTIONS = {
     options: { dir: "value", root: "qa-dir" },
     usage: "[--dir <run-dir>] [--root <qa-dir>]",
     run(args, { dir, root }) {
-      if (args.length) return refuse("bad_arguments", { action: "quick" });
+      if (args.length) return refuse("bad_arguments", { action: "quick", takes: ACTIONS.quick.usage });
       return openQuick({ root: /** @type {string} */ (root), dir });
     },
   },
   "quick-check": {
     options: { dir: "value", root: "qa-dir", stdin: "flag" },
-    usage: "<feature> --dir <run-dir> --stdin [--root <qa-dir>]",
+    usage: "<feature> --dir <run-dir> --input <path> [--root <qa-dir>]",
     run(args, { dir, root, stdin }) {
-      if (args.length !== 1) return refuse("bad_arguments", { action: "quick-check" });
+      if (args.length !== 1) return refuse("bad_arguments", { action: "quick-check", takes: ACTIONS["quick-check"].usage });
       if (!PATTERN.slug.test(args[0])) return refuse("not_feature_key", { given: args[0] });
-      if (!stdin) return refuse("needs_stdin");
+      if (!stdin) return refuse("needs_stdin", { input: "--input <path> | --stdin" });
       return checkQuick({ root: /** @type {string} */ (root), dir, feature: args[0], stdin: stdin() });
     },
   },
 
 };
 
-// Every refusal is `impact`'s own (lib/impact-json.mjs), its usage errors included.
 /** @type {CommandDefinition} */
-export const command = { actions: ACTIONS, refuse: (e) => refuse(/** @type {string} */ (e.detail.code), e.detail) };
+export const command = { actions: ACTIONS };
+
+// `impact entry`: the front door of `/qa-impact`. Every retired judge/read-only invocation gets
+// a refusal naming its replacement; otherwise routes to the quick path. Reads `.qa/` only to check
+// the Feature exists, and writes nothing.
+/**
+ * @param {{ root: string, args: string[], persist?: boolean, review?: string | boolean, target?: string | boolean }} options
+ * @returns {CommandResult}
+ */
+function enter({ root, args, persist = false, review, target }) {
+  const references = args.slice(1);
+  const reviewed = typeof review === "string" ? review : undefined;
+  for (const key of [args[0], reviewed]) {
+    if (key !== undefined && !PATTERN.slug.test(key)) return refuse("not_feature_key", { given: key });
+  }
+  const placeholder = reviewed ?? args[0] ?? "<feature-key>";
+  /** @type {Array<Record<string, unknown>>} */
+  const refusals = [];
+  if (persist) refusals.push(fact("persist_retired", { replacement: `/qa-design ${placeholder}` }));
+  if (review !== undefined && review !== false) refusals.push(fact("review_retired", { replacement: `/qa-design ${placeholder} --review` }));
+  if (target !== undefined) refusals.push(fact("target_retired", { given: target, replacement: `/qa-design ${placeholder}` }));
+  if (refusals.length) return { exit: 2, json: { ok: false, refusals } };
+  if (args[0] === undefined) return refuse("read_only_retired", { replacement: "/qa-next" });
+  if (!scan(root, { feature: args[0] }).history.features.some((f) => f.feature === args[0])) return refuse("no_feature", { slug: args[0], root });
+  return { exit: 0, json: { ok: true, route: "quick", feature: args[0], references, next_step: "impact quick" } };
+}
 
 // The run's plan: `scan` first, then one judge unit per non-empty scenario file.
 /**
@@ -461,7 +486,7 @@ function makePlan(args, { root, target, dir: named, cap: givenCap, persist = fal
   const cap = givenCap === undefined ? undefined : Number(givenCap);
   if (cap !== undefined && !(Number.isInteger(cap) && cap >= 0)) return refuse("bad_cap");
   if (typeof review === "string" && !PATTERN.slug.test(review)) return refuse("not_feature_key", { given: review });
-  if (args.length > 1) return refuse("bad_arguments", { action: "plan" });
+  if (args.length > 1) return refuse("bad_arguments", { action: "plan", takes: ACTIONS.plan.usage });
   const [feature] = args;
   const run = /** @type {NewRun} */ (newRunDir(named, "qa-impact-"));
   if (run.error) return refuse("run_dir", { reason: run.error });
@@ -499,7 +524,7 @@ function makePlan(args, { root, target, dir: named, cap: givenCap, persist = fal
   // persisted run, so a fresh or lost run dir must not narrow the selection and let it advance.
   if (persist) {
     const rules = unforecastRules({ root, features: s.history.features, index, change });
-    if (rules.length) return refuse("forecast_missing", { rules }, 1);
+    if (rules.length) return refuse("forecast_missing", { rules, next: "impact quick-check --dir <run-dir>" }, 1);
   }
   // Every refusal is above: the run dir is made only now, so a refused plan leaves none.
   const dir = run.make();
@@ -588,7 +613,7 @@ function makePlan(args, { root, target, dir: named, cap: givenCap, persist = fal
  * @returns {({ dir: string, plan: ImpactPlan, refused?: never }) | ({ refused: RefusalResult, dir?: never, plan?: never })}
  */
 function readPlan(action, args, dir) {
-  if (args.length) return { refused: refuse("bad_arguments", { action }) };
+  if (args.length) return { refused: refuse("bad_arguments", { action, takes: ACTIONS[action]?.usage }) };
   /** @type {OpenPlanResult<ImpactPlan>} */
   const opened = openPlan("impact", action, args, dir);
   return opened.error ? { refused: refuse("run_dir", { reason: opened.error }) } : /** @type {{ dir: string, plan: ImpactPlan, refused?: never }} */ (opened);

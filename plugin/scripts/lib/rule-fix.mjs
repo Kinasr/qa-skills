@@ -15,17 +15,10 @@ import { isMap } from "./dialect.mjs";
 import { relianceOf } from "./reliance.mjs";
 import { changedRuleKeys } from "./rule-diff.mjs";
 import { dependencyIndex, parseRuleRef } from "./rule-ref.mjs";
-import { refusalsFor } from "./refusal.mjs";
+import { refusalsWithoutLines } from "./refusal.mjs";
 import { causeRefs, isOpenFinding, isStaleObligation } from "./stored-findings.mjs";
 
-/** @type {Record<string, string>} */
-export const RULE_FIX_REFUSALS = {
-  rule_fix_arguments: "`rule-fix` takes the one Feature whose Rules the engineer fixed, as `rule-fix <feature> --dir <run-dir> --input <file>`.",
-  no_feature: "No such Feature: a Rule fix follows the Rule edits of an existing Feature.",
-  no_rule_edit: "The Feature's Rules in the working tree do not differ from HEAD: edit the Rule first and run `rule-fix` before committing it (the Scan owes a Stale for a Rule edit already committed once `impact plan --persist` runs again).",
-  rules_edited_since_persist: "Rules reaching a Feature of this run were edited and committed after `persist`, without the Rule fix: checkpoint 2 would certify them unchecked. Run `impact plan --persist` again so the Scan stores the Stale they owe, or revert the edit.",
-};
-export const { refuse: ruleFixRefuse } = refusalsFor(RULE_FIX_REFUSALS);
+export const { refuse: ruleFixRefuse } = refusalsWithoutLines();
 
 /** `<feature>/<rule>` for a Rule ref as a case of `feature` writes it (a local key or already qualified). */
 /**
@@ -81,13 +74,16 @@ export function reopenable(files, featureOf, fixed) {
 }
 
 /**
- * Whether two sets of parsed files hold the same Rule texts for one Feature.
+ * Whether two sets of parsed files hold the same Rule and Boundary texts for one Feature.
  * @param {AffectedSnapshot} then
  * @param {AffectedSnapshot} now
  * @param {string} feature
- * @returns {string[]} the Rules (`<feature>/<rule>`) of `feature` that changed, were added or retired
+ * @returns {string[]} the Rules and Boundaries (`<feature>/<key>`) of `feature` that changed, were added or retired
  */
-const ownChanged = (then, now, feature) => changedRuleKeys(then.rules(feature), now.rules(feature)).map((k) => `${feature}/${k}`);
+const ownChanged = (then, now, feature) => [
+  ...changedRuleKeys(then.rules(feature), now.rules(feature)),
+  ...changedRuleKeys(then.boundaries(feature), now.boundaries(feature)),
+].map((k) => `${feature}/${k}`);
 
 /**
  * The Rules reaching `feature` whose text differs between `then` (the commit `persist` judged) and

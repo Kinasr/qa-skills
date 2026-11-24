@@ -21,9 +21,9 @@
 // `done` without a recorded PR in PR or branch mode.
 //
 // `execute summary --dir <run-dir>` is read-only and untruncated: it reports what the follow-ups did,
-// where the fixes are, the drafts awaiting publish and what still needs resuming. It prints nothing
-// (its `text` is null) when the work list is empty.
-import { existsSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
+// where the fixes are, the drafts awaiting publish and what still needs resuming. Its `sections`
+// array is empty when the work list is empty.
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { dirname, join, relative, sep } from "node:path";
 import { noArguments, orThrow } from "./cli.mjs";
 import { scrubRecordText } from "./credentials.mjs";
@@ -32,16 +32,17 @@ import { worstAutomationResult } from "./execute-chain.mjs";
 import { uncommittedUnder } from "./git.mjs";
 import { hasBugPublishTracker, parse } from "./knowledge-file.mjs";
 import { repositoryOf } from "./git-tree.mjs";
-import { openRunDir } from "./run-dir.mjs";
-import { plannedRun } from "./execute-open.mjs";
-import { readPlan } from "./execute-blocks.mjs";
-import { refusalsFor } from "./refusal.mjs";
+import { openRunDir, writeJsonAtomic } from "./run-dir.mjs";
+import { plannedRun, readPlan } from "./execute-plan.mjs";
+import { refusalsWithoutLines } from "./refusal.mjs";
+import { buildSections } from "./report-sections.mjs";
 import { loadWorkingTree } from "./qa-index.mjs";
 
 /**
  * @import { CommandAction, CommandContext, CommandResult } from "./cli.mjs"
  * @import { ParsedFile, ParsedEntry } from "./knowledge-file.mjs"
- * @import { ExecutePlan } from "./execute.mjs"
+ * @import { ExecutePlan } from "./execute-plan.mjs"
+ * @import { ReportSection, SectionSpec } from "./report-sections.mjs"
  */
 
 /**
@@ -56,7 +57,6 @@ import { loadWorkingTree } from "./qa-index.mjs";
  *   routes?: string[],
  *   state: "pending" | "in-progress" | "done" | "handed-off" | "failed",
  *   summary?: string,
- *   assertions_reduced?: string,
  *   outcome?: string,
  *   reason?: string,
  *   detail?: string,
@@ -157,12 +157,7 @@ import { loadWorkingTree } from "./qa-index.mjs";
  * }} PublishOffer
  */
 
-const { stop } = refusalsFor({
-  no_run: "The run dir holds no plan `execute plan` wrote; there is no work list to build.",
-  not_confirmed: "The Run was never confirmed; nothing ran.",
-  state_unreadable: "`follow-ups.json` in the run dir is not a shape `execute follow-ups` wrote; start a new Run.",
-  no_follow_ups: "The Run has no `follow-ups.json`; run `execute follow-ups --dir <run-dir>` first.",
-});
+const { stop } = refusalsWithoutLines();
 
 /**
  * @param {unknown} value
@@ -421,10 +416,7 @@ function readState(runDir) {
  * @returns {void}
  */
 function writeState(runDir, state) {
-  const path = join(runDir, "follow-ups.json");
-  const temp = `${path}.tmp`;
-  writeFileSync(temp, `${JSON.stringify(state, null, 2)}\n`);
-  renameSync(temp, path);
+  writeJsonAtomic(join(runDir, "follow-ups.json"), state);
 }
 
 /**
@@ -449,10 +441,10 @@ function followUps(args, { dir, root }) {
   noArguments("execute follow-ups", args, "--dir <run-dir>");
   const opened = orThrow(openRunDir(dir, { cmd: "execute", action: "follow-ups", from: "execute plan" }));
   const plan = readPlan(opened.dir);
-  if (!plan) return stop("no_run");
+  if (!plan) return stop("no_run", { next: "execute plan" });
   if (!plan.confirmed) return stop("not_confirmed", { run: plan.run });
   const read = readState(opened.dir);
-  if (read.invalid) return stop("state_unreadable", { dir: opened.dir });
+  if (read.invalid) return stop("state_unreadable", { dir: opened.dir, next: "a new Run" });
   if (read.state) return followUpResult(opened.dir, read.state, false);
 
   const record = recordPath(/** @type {string} */ (root), plan.run);
@@ -528,16 +520,54 @@ function modeReason(reason) {
   })[reason ?? ""] ?? reason ?? "no reason recorded";
 }
 
+/** @type {readonly SectionSpec[]} */
+export const SUMMARY_SECTION_ORDER = [
+  { id: "overview", label: "Follow-ups" },
+  { id: "fixes_done", label: "Fixes done" },
+  { id: "fixes_failed", label: "Fixes failed" },
+  { id: "fixes_handed_off", label: "Fixes handed off" },
+  { id: "fix_regress", label: "Fix regress" },
+  { id: "code_changes", label: "Code changes" },
+  { id: "bug_drafts", label: "Bug drafts" },
+  { id: "failed_bugs", label: "Failed bug items" },
+  { id: "pending", label: "Pending" },
+  { id: "dirty_fix_warning", label: "Working tree" },
+  { id: "record_status", label: "Record" },
+  { id: "publish_offer", label: "Publish" },
+];
+
+/**
+ * Format the `code_changes` line describing where committed or uncommitted fixes live.
+ * @param {FollowUps} state
+ * @param {number} doneCount
+ * @returns {string}
+ */
+function codeChangesMarkdown(state, doneCount) {
+  const mode = state.pr?.mode?.kind;
+  const record = state.pr?.record;
+  const branch = state.pr?.branch ?? "the fix branch";
+  if (record?.url) {
+    const count = state.pr?.items?.length ?? doneCount;
+    const base = state.pr?.mode?.base ? ` → ${state.pr.mode.base}` : "";
+    return `PR ${record.url} (${branch}${base}, ${count} commit${count === 1 ? "" : "s"}).`;
+  }
+  if (record?.pushed) return `branch ${branch} pushed, no PR (${scrubbed(record.error ?? "no reason recorded")}).`;
+  if (record?.error) return `branch ${branch} only (push failed: ${scrubbed(record.error)}); push it by hand with \`git push origin ${branch}\`.`;
+  if (mode === "branch") return `branch ${branch} only (${modeReason(state.pr?.mode?.reason)}); push it by hand with \`git push origin ${branch}\`.`;
+  if (mode === "working-tree") return `working tree only (${modeReason(state.pr?.mode?.reason)}), so the fixes are uncommitted in your checkout.`;
+  return "fixes prepared, not packaged; run `codefix pr-prepare` and `codefix pr-record`.";
+}
+
 /**
  * The follow-up summary, read-only and untruncated: what the fixes did, where they are, the
- * drafts awaiting publish, and what still needs resuming. `text` is null for an empty work list.
+ * drafts awaiting publish, and what still needs resuming. `sections` is empty for an empty work list.
  * @param {FollowUps} state
  * @param {{ dir: string, configured: boolean }} options
- * @returns {{ text: string | null, publish: PublishOffer }}
+ * @returns {{ sections: ReportSection[], publish: PublishOffer }}
  */
-export function summaryText(state, { dir, configured }) {
+export function summarySections(state, { dir, configured }) {
   const publish = publishOffer(state, configured);
-  if (state.items.length === 0) return { text: null, publish };
+  if (state.items.length === 0) return { sections: [], publish };
   const fixes = /** @type {FixItem[]} */ (state.items.filter((item) => item.kind === "fix"));
   const bugs = /** @type {BugItem[]} */ (state.items.filter((item) => item.kind === "bug"));
   const keyOf = (/** @type {string} */ caseKey) => bugs.find((item) => item.case === caseKey && item.draft)?.draft ?? "(bug pending)";
@@ -545,55 +575,75 @@ export function summaryText(state, { dir, configured }) {
   const failed = fixes.filter((item) => item.state === "failed");
   const handed = fixes.filter((item) => item.state === "handed-off");
   const pending = state.items.filter((item) => item.state === "pending" || item.state === "in-progress");
-  /** @type {string[]} */
-  const lines = [`Follow-ups for Run ${state.run} on ${state.target.slug}: ${fixes.length} fix, ${bugs.length} bug.`];
-  if (done.length) {
-    lines.push(`Fixes done (${done.length}):`, ...done.map((item) => [
-      `  ${item.automation}: ${item.cases.join(", ") || "(no cases)"} (${item.route}${item.route === "flaky" ? ", flaky" : ""})`,
-      item.summary ? ` — ${scrubbed(item.summary)}` : "",
-      item.assertions_reduced ? `; assertions reduced: ${scrubbed(item.assertions_reduced)}` : "",
-      item.outcome?.startsWith("fixed-by ") ? `; fixed by ${item.outcome.slice(9)}, with no edit of its own` : item.outcome === "already-passing" ? "; already passing, with no edit of its own" : "",
-    ].join("")));
-  }
-  if (failed.length) {
-    lines.push(`Fixes failed (${failed.length}):`, ...failed.map((item) => [
-      `  ${item.automation}: ${item.reason ?? "failed"}`,
-      item.detail ? `: ${scrubbed(item.detail)}` : "",
-      item.hypothesis ? `; hypothesis: ${scrubbed(item.hypothesis)}` : "",
-      item.diagnostics?.length ? `; diagnostics: ${item.diagnostics.map(scrubbed).join(" ")}` : "",
-      item.next ? `; next: ${scrubbed(item.next)}` : "",
-    ].join("")));
-  }
-  if (handed.length) {
-    lines.push(`Fixes handed off (${handed.length}):`, ...handed.map((item) => `  ${item.automation}: ${scrubbed(item.app_cause ?? "handed off")}; ${item.cases.map((key) => `${key}: ${keyOf(key)}`).join(", ")}`));
-  }
-  if (state.regress) {
-    const rolled = state.regress.rolled_back;
-    lines.push(`Fix regress: ${state.regress.checked} Automation${state.regress.checked === 1 ? "" : "s"} checked${rolled.length ? `, ${rolled.length} rolled back (${rolled.join(", ")})` : ", none rolled back"}.`);
-  }
-  if (done.length) {
-    const mode = state.pr?.mode?.kind;
-    const record = state.pr?.record;
-    const branch = state.pr?.branch ?? "the fix branch";
-    if (record?.url) lines.push(`Code changes: PR ${record.url} (${branch}${state.pr?.mode?.base ? ` → ${state.pr.mode.base}` : ""}, ${state.pr?.items?.length ?? done.length} commit${(state.pr?.items?.length ?? done.length) === 1 ? "" : "s"}).`);
-    else if (record?.pushed) lines.push(`Code changes: branch ${branch} pushed, no PR (${scrubbed(record.error ?? "no reason recorded")}).`);
-    else if (record?.error) lines.push(`Code changes: branch ${branch} only (push failed: ${scrubbed(record.error)}); push it by hand with \`git push origin ${branch}\`.`);
-    else if (mode === "branch") lines.push(`Code changes: branch ${branch} only (${modeReason(state.pr?.mode?.reason)}); push it by hand with \`git push origin ${branch}\`.`);
-    else if (mode === "working-tree") lines.push(`Code changes: working tree only (${modeReason(state.pr?.mode?.reason)}), so the fixes are uncommitted in your checkout.`);
-    else lines.push("Code changes: fixes prepared, not packaged; run `codefix pr-prepare` and `codefix pr-record`.");
-  }
   const drafts = bugs.filter((item) => item.state === "done" && item.draft);
-  if (drafts.length) lines.push(`Bug drafts (${drafts.length}):`, ...drafts.map((item) => `  ${item.draft}: ${item.case}: ${scrubbed(item.summary ?? "a draft")} (${item.route})${item.stale ? "; stale" : ""}`));
   const failedBugs = bugs.filter((item) => item.state === "failed");
-  if (failedBugs.length) lines.push(`Failed bug items (${failedBugs.length}):`, ...failedBugs.map((item) => `  ${item.case}: ${scrubbed(item.reason ?? "failed")}`));
-  if (pending.length) lines.push(`Pending (${pending.length}): ${pending.map((item) => item.id).join(", ")}. Resume with \`${resumeCommand(state, dir)}\`.`);
-  if (fixWorkRemains(state) && fixes.some((item) => item.state === "done" || item.state === "in-progress")) {
-    lines.push(`The working tree holds this Run's fix edits; finish with \`/qa-codefix --run ${dir}\` to restore HEAD.`);
-  }
-  if (state.record) lines.push(`${drafts.length ? "The drafts and the record are" : "The record is"} written, uncommitted${drafts.length ? "" : ` at \`${state.record}\``}.`);
-  if (publish.ask) lines.push(`Publish the ${publish.drafts} drafted bug${publish.drafts === 1 ? "" : "s"}? Answer yes (\`/qa-publish --run ${dir}\`), no (they stay drafts), or name Keys to discard (\`bug discard <bg_key…>\`).`);
-  else if (publish.reason === "bug_publishing_not_configured") lines.push(`Publishing bugs is not configured, so the ${publish.drafts} draft${publish.drafts === 1 ? "" : "s"} stay in \`.qa/bugs\`; set \`tracker.bug_type\`, \`bug_link_type\` and \`bug_link_direction\` with \`/qa-init\`.`);
-  return { text: lines.join("\n"), publish };
+  const rolled = state.regress?.rolled_back ?? [];
+  const publishMarkdown = publish.ask
+    ? `Publish the ${publish.drafts} drafted bug${publish.drafts === 1 ? "" : "s"}? Answer yes (\`/qa-publish --run ${dir}\`), no (they stay drafts), or name Keys to discard (\`bug discard <bg_key…>\`).`
+    : publish.reason === "bug_publishing_not_configured"
+      ? `Publishing bugs is not configured, so the ${publish.drafts} draft${publish.drafts === 1 ? "" : "s"} stay in \`.qa/bugs\`; set \`tracker.bug_type\`, \`bug_link_type\` and \`bug_link_direction\` with \`/qa-init\`.`
+      : null;
+
+  /** @type {ReportSection[]} */
+  const sections = buildSections(SUMMARY_SECTION_ORDER, [
+    { id: "overview", markdown: `Follow-ups for Run ${state.run} on ${state.target.slug}: ${fixes.length} fix, ${bugs.length} bug.` },
+    {
+      id: "fixes_done",
+      items: done.map((item) => [
+        `${item.automation}: ${item.cases.join(", ") || "(no cases)"} (${item.route}${item.route === "flaky" ? ", flaky" : ""})`,
+        item.summary ? ` — ${scrubbed(item.summary)}` : "",
+        item.outcome?.startsWith("fixed-by ") ? `; fixed by ${item.outcome.slice(9)}, with no edit of its own` : item.outcome === "already-passing" ? "; already passing, with no edit of its own" : "",
+      ].join("")),
+    },
+    {
+      id: "fixes_failed",
+      items: failed.map((item) => [
+        `${item.automation}: ${item.reason ?? "failed"}`,
+        item.detail ? `: ${scrubbed(item.detail)}` : "",
+        item.hypothesis ? `; hypothesis: ${scrubbed(item.hypothesis)}` : "",
+        item.diagnostics?.length ? `; diagnostics: ${item.diagnostics.map(scrubbed).join(" ")}` : "",
+        item.next ? `; next: ${scrubbed(item.next)}` : "",
+      ].join("")),
+    },
+    {
+      id: "fixes_handed_off",
+      items: handed.map((item) => `${item.automation}: ${scrubbed(item.app_cause ?? "handed off")}; ${item.cases.map((key) => `${key}: ${keyOf(key)}`).join(", ")}`),
+    },
+    {
+      id: "fix_regress",
+      markdown: state.regress
+        ? `${state.regress.checked} Automation${state.regress.checked === 1 ? "" : "s"} checked${rolled.length ? `, ${rolled.length} rolled back (${rolled.join(", ")})` : ", none rolled back"}.`
+        : null,
+    },
+    { id: "code_changes", markdown: done.length ? codeChangesMarkdown(state, done.length) : null },
+    {
+      id: "bug_drafts",
+      items: drafts.map((item) => `${item.draft}: ${item.case}: ${scrubbed(item.summary ?? "a draft")} (${item.route})${item.stale ? "; stale" : ""}`),
+    },
+    {
+      id: "failed_bugs",
+      items: failedBugs.map((item) => `${item.case}: ${scrubbed(item.reason ?? "failed")}`),
+    },
+    {
+      id: "pending",
+      markdown: pending.length ? `${pending.length} pending: ${pending.map((item) => item.id).join(", ")}.` : null,
+      next: pending.length ? resumeCommand(state, dir) : null,
+    },
+    {
+      id: "dirty_fix_warning",
+      markdown: fixWorkRemains(state) && fixes.some((item) => item.state === "done" || item.state === "in-progress")
+        ? `The working tree holds this Run's fix edits; finish with \`/qa-codefix --run ${dir}\` to restore HEAD.`
+        : null,
+    },
+    {
+      id: "record_status",
+      markdown: state.record
+        ? `${drafts.length ? "The drafts and the record are" : "The record is"} written, uncommitted${drafts.length ? "" : ` at \`${state.record}\``}.`
+        : null,
+    },
+    { id: "publish_offer", markdown: publishMarkdown },
+  ]);
+  return { sections, publish };
 }
 
 /**
@@ -606,14 +656,10 @@ function summary(args, { dir, root }) {
   noArguments("execute summary", args, "--dir <run-dir>");
   const opened = orThrow(openRunDir(dir, { cmd: "execute", action: "summary", from: ["execute follow-ups", "execute ingest"] }));
   const read = readState(opened.dir);
-  if (read.invalid) return stop("state_unreadable", { dir: opened.dir });
-  if (!read.state) return stop("no_follow_ups", { dir: opened.dir });
-  const { text, publish } = summaryText(read.state, { dir: opened.dir, configured: bugConfigured(/** @type {string} */ (root)) });
-  const counts = {
-    fix: read.state.items.filter((item) => item.kind === "fix").length,
-    bug: read.state.items.filter((item) => item.kind === "bug").length,
-  };
-  return { exit: 0, json: { action: "summary", ok: true, run: read.state.run, counts, items: read.state.items.length, text, publish } };
+  if (read.invalid) return stop("state_unreadable", { dir: opened.dir, next: "a new Run" });
+  if (!read.state) return stop("no_follow_ups", { dir: opened.dir, next: "execute follow-ups" });
+  const { sections, publish } = summarySections(read.state, { dir: opened.dir, configured: bugConfigured(/** @type {string} */ (root)) });
+  return { exit: 0, json: { action: "summary", ok: true, run: read.state.run, sections, publish } };
 }
 
 /** @type {Record<string, CommandAction>} */

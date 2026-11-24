@@ -7,14 +7,16 @@
 //   node scan.mjs <mode> [<action>] [<argument>...] [--<option> [<value>]]...
 //
 // Each mode is a command module, named in lib/modes.mjs, which declares its actions, the options
-// each takes, its synopsis and its refusals, and documents what each prints; lib/cli.mjs runs one
-// call against it. A bare or unknown mode prints every synopsis.
+// each takes, and its synopsis, and documents what each prints; lib/cli.mjs runs one call against
+// it. A bare or unknown mode refuses `unknown_mode` with every synopsis in `usage`.
 //
-// A usage error prints `{mode, ok: false, error}` and exits 2; `design`, `impact`, `init` and `sync`
-// word their own, `{mode, ok: false, text}`. A `.qa/` whose `project.md` declares a newer
-// `schema_version` than this CLI reads, or a malformed one, is refused by every command that writes
-// into the repository, `{mode, ok: false, text}`, exit 1, writing nothing; `scan` runs on, warning
-// of a newer one (lib/schema-guard.mjs).
+// Every `UsageError` prints `{mode, [migration,] ok: false, refusals: [{code, ...facts}]}` (with
+// zero `text` or `error` fields and zero `command.refuse` overrides) and exits 2; `migration` is
+// emitted only on allowlisted entry commands/actions and omitted on helper modes, inner-loop
+// actions, and shared-parser usage errors (lib/modes.mjs). A `.qa/` whose `project.md` declares a
+// newer, malformed, or below-minimum `schema_version` is refused by commands that write into the
+// repository with `{mode, [migration,] ok: false, refusals: [SchemaFact]}`, exit 1, writing
+// nothing; `scan` runs on, warning of a newer one (lib/schema-guard.mjs).
 //
 // `--root` names the `.qa/` directory (default ./.qa). Every run dir is named by `--dir` and printed
 // back absolute (lib/run-dir.mjs); `impact plan`, `design split` and `design plan` still take

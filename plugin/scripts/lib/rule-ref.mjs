@@ -8,6 +8,7 @@
 //   formatRuleRef({feature, rule})  → "<feature>/<rule>"
 //   isQualifiedRuleRef(text)        → is it a qualified reference?
 //   isRuleRef(text)                 → is it a local Rule key or a qualified reference?
+//   refUnder(ref, prefix)           → is the knowledge ref `feature/rule` under that key?
 //   readDependsOn(rule)             → {refs, line, malformed} | null
 //   parseDependsField(field)        → {refs, line, malformed}
 //   resolveRuleRef(index, files, ref) → live | retired | unresolved
@@ -118,6 +119,17 @@ export function formatRuleRef(ref) {
  */
 export function isQualifiedRuleRef(text) {
   return parseRuleRef(text) !== null;
+}
+
+// Is this knowledge ref (`feature/rule`) under `prefix`? A ref compares as text, not as a path: `ab/c`
+// is not under `a`, and `a` is not under `a`.
+/**
+ * @param {string} ref
+ * @param {string} prefix
+ * @returns {boolean}
+ */
+export function refUnder(ref, prefix) {
+  return ref.startsWith(`${prefix}/`);
 }
 
 // Is this text a Rule reference of either kind: a local `rule_` key, or a qualified reference?

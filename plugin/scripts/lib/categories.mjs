@@ -1,6 +1,7 @@
 // @ts-check
 // Coverage categories: the ten-category floor and the effective list the deep dive and design
-// walk. The floor's one home is `plugin/skills/references/coverage-categories.md`; a team extends
+// walk. The floor lives as typed JS data in `category-file.mjs:FLOOR`, kept in parity with
+// `plugin/skills/references/coverage-categories.md` by `scripts/lint-skills.mjs`; a team extends
 // it in `train/categories.md`, which holds category entries (`### <key>: <name>`, then `meaning`
 // and `after:` in the entry's `yaml` block) and a `retired:` list. The resolver inserts each
 // extension directly after its anchor, extensions sharing an anchor keeping their file order.

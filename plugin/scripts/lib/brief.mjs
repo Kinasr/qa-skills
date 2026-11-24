@@ -37,7 +37,7 @@ import { contextSection, featureBrief, featureOnlySentence, fenced, judgeBrief }
 import { projectConfig } from "./knowledge-file.mjs";
 import { buildIndex } from "./qa-index.mjs";
 import { relianceOf } from "./reliance.mjs";
-import { dependencyIndex, formatRuleRef, resolveRuleRef } from "./rule-ref.mjs";
+import { dependencyIndex, formatRuleRef, refUnder, resolveRuleRef } from "./rule-ref.mjs";
 import { scan } from "./scan.mjs";
 import { collides, governingOf, isJudged, selectCases } from "./selection.mjs";
 import { resolveAdapter, wordsOf } from "./stack.mjs";
@@ -65,7 +65,7 @@ import { proposedRulesSections } from "./proposed-rules.mjs";
 /**
  * What `brief` prints: the unit's JSON contract, a stale agreement's refusal, or the `{error}` of a
  * usage refusal.
- * @typedef {{ exit: number, json: JudgeBriefJson | DesignBrief | { ok: false, refusals: StaleAgreement[] } } | { error: string }} BriefResult
+ * @typedef {{ exit: number, json: JudgeBriefJson | DesignBrief | { ok: false, refusals: Array<{ code: string, [key: string]: unknown }> } } | { error: string }} BriefResult
  */
 
 /**
@@ -141,7 +141,9 @@ export function brief([unit, ...args], { root, target = null, cap = DEFAULT_CAP,
       const ctx = loadFeature(root, recorded.feature);
       if (!ctx.feature) return { error: `the agreement names no Feature \`${recorded.feature}\` in ${root}` };
       const stale = staleAgreement(ctx, recorded);
-      if (stale) return { exit: 1, json: { ok: false, refusals: [stale] } };
+      if (stale) {
+        return { exit: 1, json: { ok: false, refusals: [{ code: stale.code, feature: recorded.feature, scope: recorded.scope, next: "design agree" }] } };
+      }
     }
     /** @type {DesignUnitResult} */
     const d = designUnit(/** @type {string} */ (args[0]), { root, mode: m.mode, agreement: recorded, agreementBrief });
@@ -204,7 +206,7 @@ function judgeUnit(key, { root, target, cap, change: runData }) {
   const keys = [...new Set(scenario.cases.map((c) => c.key))].filter((k) => selection.keys.has(k));
   if (keys.length === 0) return { error: `scenario \`${key}\` has no selected case: only a scenario file with a case the change selects is a judge unit` };
   const chosen = scenario.cases.filter((c) => selection.keys.has(c.key));
-  const governing = new Set(chosen.flatMap((c) => governingOf(c, /** @type {string} */ (feature))).filter((r) => r.startsWith(`${feature}/`)).map((r) => r.slice(/** @type {string} */ (feature).length + 1)));
+  const governing = new Set(chosen.flatMap((c) => governingOf(c, /** @type {string} */ (feature))).filter((r) => refUnder(r, /** @type {string} */ (feature))).map((r) => r.slice(/** @type {string} */ (feature).length + 1)));
   const touched = new Set([...(first ? featureFile.rules.map((r) => r.key) : facts.rules_changed), ...governing]);
 
   // The changed-case component is the same for every unit of the Feature, the judged file's own

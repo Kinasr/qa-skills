@@ -25,28 +25,21 @@ A `/qa-*` close may invoke it once the engineer accepts; it then mines the run t
 
 A Practice that contradicts an Invariant is void.
 
-- **At startup, on every path**, run
-  `node <this skill's directory>/../../scripts/scan.mjs migration-status [--root <qa-dir>]`.
-  If `pending`, warn using `migrations` in order. Continue the command.
-
+- **On every path where the command's JSON carries `migration`**, read it first: if `pending`,
+  warn using `migrations` in order; continue the command.
 - **The tracker is read-only except `/qa-publish`.**
-
-- **Run it yourself, in this conversation.** The gate is a dialogue with the engineer, so never
-  hand it to a Delegate or a background worker.
-- **Write exactly one file**: `.qa/train/<target>.md`, and only through the gate (§2). For Access, the sole exception is an explicitly approved `.gitignore` line, appended as a second write after the training file by `train auth-ignore`. The CLI's `auth_template` goes in the same gate write.
-- **Write only a draft that passes `train check`.**
+- **Run it yourself, in this conversation.** The gate is a dialogue with the engineer: never hand
+  it to a Delegate or background worker.
+- **Write exactly one file**: `.qa/train/<target>.md`, and only through the gate (§2). For Access, the sole exception is an explicitly approved `.gitignore` line, appended as a second write after the training file by `train auth-ignore`; the Auth template goes in the same gate write.
+- **Write only a draft that passes `train check`**: fix every reported refusal and check again.
 - **Training makes no claim about the system under test.** That is a Rule, and Rules enter only
-  through `/qa-deep-dive`. Never soften a claim into "style" or a "practice" to get it past the gate.
-- **On the code-evidence branch, read only the CLI's sample and corpus, never the test files
-  themselves.** The sample is bounded and scrubbed; a free crawl is not Training.
-- **A Coverage category names a kind of behaviour, never part of the system under test, and its
-  meaning is immutable.** Retire the key and add a new one to change it.
-- **A Practice never overrides the target's Invariants.**
+  through `/qa-deep-dive`; never soften a claim into "style" or a "practice" to get it past the gate.
+- **A Practice never overrides the target's Invariants**: the target's Invariants win.
 - **A credential lives outside `.qa/`'s committed files.** A Practice or Access note names the env
   var, connector, CLI, or git-ignored login-state or password file that carries it; never ask for a credential,
   and never write one.
 - **Never run git to stage or commit yourself.** The commit follows the project's Commit mode through
-  `scan.mjs commit` (ADR-0062), never retried with `--no-verify`. A dirty working tree is fine.
+  `scan.mjs commit`, never retried with `--no-verify`. A dirty working tree is fine.
 
 ## Arguments
 
@@ -73,15 +66,19 @@ first argument on that list is always the target, never a scenario key. Each run
 - **`/qa-train codefix`**: learns repair Practices and the attempt, repeat and PR settings. Read [the Codefix reference](references/codefix.md) for their bounds and defaults.
 - **`/qa-train codegen`**: learns the Conventions code gen follows when it writes a test, one per
   facet, and records a stack as trained from the engineer's answers. A stack with test code starts
-  on the code-evidence branch: `evidence codegen --from-code`, named paths, or `--relearn`. Read
+  on the code-evidence branch: `evidence codegen --from-code`, named paths, or `--relearn`. On the
+  code-evidence branch, read only the CLI's sample and corpus, never the test files themselves: the
+  sample is bounded and scrubbed; a free crawl is not Training. Read
   [the Codegen reference](references/codegen.md) for §1 and for what is specific to codegen in §2
   and §3.
 - **`/qa-train bug`**: learns Practices for drafting bugs, which steer the summary's wording only.
   Read [the Practices reference](references/practices.md) for §1 and §2. Its file holds Practices
   only, never Conventions.
 - **`/qa-train categories`** (Coverage categories): learns a kind of behaviour the team tests, in
-  the shared `train/categories.md`. Read [the Categories reference](references/categories.md) for §1
-  and for what is specific to categories in §2 and §3.
+  the shared `train/categories.md`. A Coverage category names a kind of behaviour, never part of the
+  system under test, and its meaning is immutable: retire the key and add a new one to change it.
+  Read [the Categories reference](references/categories.md) for §1 and for what is specific to
+  categories in §2 and §3.
 
 ## The CLI
 
@@ -99,19 +96,19 @@ on stdout. Read it, and never re-derive its results by grep or prose.
 
 | Action | What it answers |
 |---|---|
-| `evidence [design] <scenario-key>` | the exemplar: the scenario's Bookkeeping-stripped `text` |
-| `evidence [design] --diff <commit-ish> [<scenario-key>]` | the scenario `changes` since `<commit-ish>`, compared with the working tree |
-| `evidence` | the uncommitted scenario `changes` (the same, since `HEAD`) |
-| `evidence <target>` | the target's training alone (`source: target`) |
-| `evidence codegen --from-code [<path>...] [--relearn [--facet <facet>]]` | the sample, corpus summary and gate signals from the project's test code (`source: code`) |
-| `evidence categories` | the shared file's extension `categories` in walk order and its `retired` keys |
-| `check [<target>] --input <file>` | the drafted file: `check-file`, the entries it adds, edits and removes (`conventions` and `practices`, or `access_notes` for `access`), the `statability` hits; when `ok`, the `changeset` and `commit`, and for `access` the `access_files` report |
-| `check categories [--input <file>]` | the categories draft: its `errors`, the floor plus the `effective` list, the `categories` added, edited and removed, the `statability` hits; when `ok`, the `changeset` and `commit` |
+| `evidence [design] <scenario-key>` | the exemplar scenario, Bookkeeping-stripped |
+| `evidence [design] --diff <commit-ish> [<scenario-key>]` | the scenario changes since `<commit-ish>` in the working tree |
+| `evidence` | the uncommitted scenario changes (the same, since `HEAD`) |
+| `evidence <target> [--stack <root>]` | target's training (`--stack` for `codegen`) |
+| `evidence codegen [--stack <root>] --from-code [<path>...] [--relearn [--facet <facet>]]` | bounded test-code sample, corpus summary and gate signals |
+| `evidence categories` | the shared file's categories in walk order and the keys never to reuse |
+| `check [<target>] [--stack <root>] --input <file>` | draft validation, added/edited/removed entries, Statability hits; on pass, changeset, commit, and files for `access` to ignore |
+| `check categories [--input <file>]` | categories draft validation, floor, walk, added/edited/removed categories, Statability hits; on pass, changeset and commit |
+| `auth-ignore <line>` | appends approved `.gitignore` line after `train/access.md` |
 
-Every `evidence` also returns `train` (the target's file, whether it `exists`, its entries with
-their `sources` and `added`: `conventions` and `practices`, `access_notes` for `access`, or
-`categories` and `retired` for `categories`), `roles` and `levels`; `evidence access` also returns
-`targets`. An entry listed as `withheld` holds what
+Word every section in order, copying any table row and exact command intact. Every
+`evidence` also returns the target's file as it stands (`train`) with the project's Roles and
+Levels; `evidence access` adds the application targets. An entry listed as `withheld` holds what
 looks like a credential, so only its key and line are shown: raise it at the gate as a coherence
 finding, to be rewritten without it.
 
@@ -191,9 +188,9 @@ added: <YYYY-MM-DD, today>
 
 Pass the draft to `train check <target> --input <file>`:
 
-- **`ok: false`**: fix every `errors` entry and check again.
-- **`statability`** hits (Conventions only) are settled as the Conventions reference says.
-- **`ok: true`** and nothing left unsettled: write the draft, byte for byte, to `path`.
+- **A failed check**: fix every reported error and check again.
+- **Statability hits** (Conventions only) are settled as the Conventions reference says.
+- **A passing check** and nothing left unsettled: write the draft, byte for byte, to `path`.
 
 ## 4. Close
 
@@ -201,8 +198,8 @@ Print, in this order:
 
 1. What changed: the entries added, edited and removed, every retired category key, and each
    contradiction with its resolution.
-2. The refused claims, as a hand-off: `/qa-deep-dive <feature-key>` with each proposed Rule. Never
-   run it yourself.
+2. The refused claims: `/qa-deep-dive <feature-key>` with each proposed Rule; with no item 3,
+   offer it once; run it on yes.
 3. When the conversation taught other targets, the next runs: one `/qa-train <target>` line each,
    with what it would learn (`/qa-train access` when it showed how a Reference was reached). Each
    is its own run: offer the first and, on yes, invoke it.

@@ -2,12 +2,12 @@
 // The command line's adapter: scripts/scan.mjs names each mode's command module, and this
 // runs one call against it. Nothing here knows a mode beyond what its command declares.
 //
-// A command is `{actions: {<name>: {options, usage, run}}, refuse?}`, or `{options, usage, run,
-// refuse?}` for a mode that takes no action. A command may give `options` beside its `actions`
-// instead, and then no action gives its own: its actions share them, and they may come before
-// the action. `run(args, ctx)` returns, or resolves, `{exit, json}`;
-// a refusal is one too, `json.ok` false. A usage error is a thrown `UsageError`, from the adapter or
-// from `run`: printed `{ok: false, error}`, exit 2, unless the command's `refuse(e)` words it.
+// A command is `{actions: {<name>: {options, usage, run}}}`, or `{options, usage, run}` for a
+// mode that takes no action. A command may give `options` beside its `actions` instead, and then
+// no action gives its own: its actions share them, and they may come before the action.
+// `run(args, ctx)` returns, or resolves, `{exit, json}`; a refusal is one too, `json.ok` false.
+// A usage error is a thrown `UsageError`, from the adapter or from `run`: emitted `{ok: false,
+// refusals: [{code, ...facts}]}`, exit 2.
 //
 // `options` is `{name: kind}`. Kinds, as `parseArgs` reads them:
 //   "value"     `--name <value>`
@@ -29,10 +29,15 @@
 // `ctx` is the options as resolved, plus `stdin` (a reader of the action's input when `--stdin` or
 // `--input` was given, else null), `input` (a reader of stdin, always: input is read from it with
 // no flag), `seed` (`QA_SKILLS_MINT_SEED`, which only a test sets) and `env` (the caller's environment).
+/** @import { MigrationStatus } from "./migration-status.mjs" */
 /** @import { PlatformContext } from "./platform.mjs" */
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { repositoryOf, resolveRef } from "./git-tree.mjs";
+import { migrationStatus } from "./migration-status.mjs";
+import { loadWorkingTree } from "./qa-index.mjs";
+import { refuse } from "./refusal.mjs";
+import { runDirRoot } from "./run-dir.mjs";
 
 // The CLI's own entry, which a brief tells a subagent to run and a scout runs on its own account.
 /** @type {string} */
@@ -80,6 +85,7 @@ export const SCAN_CLI = fileURLToPath(new URL("../scan.mjs", import.meta.url));
  *   usage?: string | readonly string[],
  *   parse?: (argv: readonly string[]) => { positional: string[], options: Record<string, unknown> },
  *   run(args: string[], ctx: CommandContext): CommandResult | Promise<CommandResult>,
+ *   omitMigration?: boolean,
  * }} CommandAction
  */
 
@@ -90,7 +96,7 @@ export const SCAN_CLI = fileURLToPath(new URL("../scan.mjs", import.meta.url));
  *   actions?: Record<string, CommandAction>,
  *   parse?: (argv: readonly string[]) => { positional: string[], options: Record<string, unknown> },
  *   run?(args: string[], ctx: CommandContext): CommandResult | Promise<CommandResult>,
- *   refuse?: (err: UsageError) => CommandResult,
+ *   omitMigration?: boolean,
  * }} CommandDefinition
  */
 
@@ -102,10 +108,10 @@ export const SCAN_CLI = fileURLToPath(new URL("../scan.mjs", import.meta.url));
  * @typedef {Error & { detail: Record<string, unknown> }} UsageError
  */
 
-// A usage error. `detail.code` names it, for a command that words its own refusals. It is a class
-// expression typed by its construct signature: a declared `class ... extends Error` would put
-// `Error`'s own statics (`prepareStackTrace` is typed `any` in @types/node) on the export, which
-// scripts/check-types.mjs walks.
+// A usage error. `detail.code` names the refusal code and remaining properties become its facts
+// (defaulting to `usage_error` with `reason`). It is a class expression typed by its construct
+// signature: a declared `class ... extends Error` would put `Error`'s own statics
+// (`prepareStackTrace` is typed `any` in @types/node) on the export, which scripts/check-types.mjs walks.
 /**
  * @type {new (message: string, detail?: Record<string, unknown>) => UsageError}
  */
@@ -130,7 +136,7 @@ export const UsageError = class extends Error {
  * @returns {void}
  */
 export function noArguments(command, args, only) {
-  if (args.length) throw new UsageError(`${command} takes no arguments, only ${only}`);
+  if (args.length) throw new UsageError(`${command} takes no arguments, only ${only}`, { code: "bad_arguments", command, only });
 }
 
 /**
@@ -141,7 +147,7 @@ export function noArguments(command, args, only) {
  * @returns {void}
  */
 export function requireOption(command, value, option, what) {
-  if (value === undefined) throw new UsageError(`${command} needs ${option}, ${what}`);
+  if (value === undefined) throw new UsageError(`${command} needs ${option}, ${what}`, { code: "missing_option", command, option, what });
 }
 
 // `result`, or its `error` thrown as a usage error: for a lib function that returns `{error}`.
@@ -156,8 +162,46 @@ export function orThrow(result) {
   return /** @type {Exclude<T, { error: unknown }>} */ (result);
 }
 
+/**
+ * Extracts the first string value from a parsed option (`string` or `string[]`).
+ * @param {unknown} value
+ * @returns {string | undefined}
+ */
+function firstString(value) {
+  const candidate = Array.isArray(value) ? value[0] : value;
+  return typeof candidate === "string" ? candidate : undefined;
+}
+
+/**
+ * Resolves the `.qa/` root for `migration`: an explicitly passed `--root`, else the root recorded
+ * in `--dir`, else the resolved `root` (which `resolveOptions` defaults to `".qa"`). A run dir whose
+ * state files carry no `root` (`design override`, `design keep`) falls back to that same default.
+ * @param {Record<string, unknown> | undefined} options
+ * @param {string | undefined} explicitRoot
+ * @returns {string}
+ */
+function resolveQaRoot(options, explicitRoot) {
+  if (typeof explicitRoot === "string") return explicitRoot;
+  const dir = firstString(options?.dir ?? options?.out);
+  if (dir !== undefined) return runDirRoot(dir) ?? ".qa";
+  // Neither `--root` nor `--dir` was passed: match `migration-status` (`root: "qa-dir?"`), which defaults `--root` to `".qa"`.
+  return typeof options?.root === "string" ? options.root : ".qa";
+}
+
+/**
+ * Whether `json` already carries the migration status: at the top level, or in a `global` object.
+ * @param {Record<string, unknown>} json
+ * @returns {boolean}
+ */
+function carriesMigration(json) {
+  if (Object.hasOwn(json, "migration")) return true;
+  const global = json.global;
+  return global !== null && typeof global === "object" && Object.hasOwn(global, "migration");
+}
+
 // One call: `[mode, ...argv]` against `modes` ({mode: command}). Returns `{exit, json}`, `json`
-// carrying `mode` first; a promise of it when the action's `run` returns one.
+// carrying `mode` first and `migration` on non-usage-error outputs; a promise of it when the
+// action's `run` returns one.
 /**
  * @param {CommandRegistry} modes
  * @param {readonly string[]} param1
@@ -166,25 +210,46 @@ export function orThrow(result) {
  */
 export function runCommand(modes, [mode, ...argv], { env, input, platformContext }) {
   const command = Object.hasOwn(modes, mode ?? "") ? modes[mode] : null;
+  /** @type {(CommandDefinition | CommandAction) | undefined} */
+  let entry;
+  /** @type {Record<string, unknown> | undefined} */
+  let parsedOptions;
+  /** @type {string | undefined} */
+  let explicitRoot;
+  let isCliUsageError = false;
   /**
    * @param {CommandResult} param0
+   * @param {boolean} [usageError]
    * @returns {CommandResult}
    */
-  const done = ({ exit, json }) => ({ exit, json: { mode: mode ?? null, ...json } });
+  const done = ({ exit, json }, usageError = false) => {
+    if (usageError || entry?.omitMigration || command?.omitMigration || carriesMigration(json)) {
+      return { exit, json: { mode: mode ?? null, ...json } };
+    }
+    /** @type {MigrationStatus} */
+    const migration = migrationStatus(loadWorkingTree(resolveQaRoot(parsedOptions, explicitRoot)));
+    return { exit, json: { mode: mode ?? null, migration, ...json } };
+  };
   /**
    * @param {unknown} e
    * @returns {CommandResult}
    */
   const refused = (e) => {
     if (!(e instanceof UsageError)) throw e;
-    return done(command?.refuse ? command.refuse(e) : { exit: 2, json: { ok: false, error: e.message } });
+    const { code, ...rest } = e.detail ?? {};
+    const result =
+      typeof code === "string" && code.length > 0
+        ? refuse(code, rest)
+        : refuse("usage_error", { ...rest, reason: e.message });
+    // A usage error from the shared parser is exempt from `migration`.
+    return done(result, isCliUsageError);
   };
   try {
-    if (!command) throw new UsageError(mode ? `unknown mode \`${mode}\`; ${usage(modes)}` : usage(modes));
+    isCliUsageError = true;
+    if (!command) throw new UsageError(mode ? `unknown mode \`${mode}\`; ${usage(modes)}` : usage(modes), { code: "unknown_mode", ...(mode !== undefined && { mode }), usage: usage(modes) });
     // A command with its own `options` shares them across its actions, and its action is the first
     // argument that is no option; else the action comes first and takes its own.
-    /** @type {CommandDefinition | CommandAction} */
-    let entry = command;
+    entry = command;
     let { positional, options } = command.options ? parseArgs(argv, withInputFile(command.options)) : /** @type {{ positional: string[], options: Record<string, unknown> }} */ ({ positional: argv });
     if (command.actions) {
       const names = Object.keys(command.actions);
@@ -193,11 +258,15 @@ export function runCommand(modes, [mode, ...argv], { env, input, platformContext
       entry = { ...command.actions[action], options: command.options ?? command.actions[action].options };
       positional = positional.slice(1);
     }
-    if (!command.options) ({ positional, options } = entry.parse ? entry.parse(positional) : parseArgs(positional, withInputFile(/** @type {OptionSpec} */ (entry.options))));
-    const resolved = resolveOptions(options, /** @type {OptionSpec} */ (entry.options));
+    const spec = /** @type {OptionSpec} */ (entry.options);
+    if (!command.options) ({ positional, options } = entry.parse ? entry.parse(positional) : parseArgs(positional, withInputFile(spec)));
+    parsedOptions = validateOptionConflicts(options, spec);
+    explicitRoot = typeof parsedOptions.root === "string" ? parsedOptions.root : undefined;
+    isCliUsageError = false;
+    const resolved = resolveOptions(parsedOptions, spec);
+    parsedOptions = resolved;
     const file = /** @type {string | undefined} */ (resolved.input);
     delete resolved.input;
-    if (file !== undefined && resolved.stdin) throw new UsageError("pass --stdin or --input <path>, not both", { code: "stdin_and_input" });
     /** @type {CommandContext} */
     const ctx = {
       ...resolved,
@@ -266,7 +335,8 @@ function inputFile(path) {
     try {
       return readFileSync(path, "utf8");
     } catch (e) {
-      throw new UsageError(`--input ${path} cannot be read: ${/** @type {NodeJS.ErrnoException} */ (e).code ?? /** @type {Error} */ (e).message}`, { code: "input_unreadable", path });
+      const reason = /** @type {NodeJS.ErrnoException} */ (e).code ?? /** @type {Error} */ (e).message;
+      throw new UsageError(`--input ${path} cannot be read: ${reason}`, { code: "input_unreadable", path, reason });
     }
   };
 }
@@ -303,22 +373,37 @@ function parseArgs(argv, spec) {
   return { positional, options };
 }
 
-// `options` with `--root`, `--out` and `--target` resolved as `spec` declares them.
+// Checks mutual option conflicts (`--dir` + `--out`, `--stdin` + `--input`) as CLI usage errors
+// before filesystem/git checks (`qa-dir`, `commit`) run.
 /**
  * @param {Record<string, unknown>} options
- * @param {OptionSpec} spec
+ * @param {OptionSpec | undefined} spec
  * @returns {Record<string, unknown>}
  */
-function resolveOptions(options, spec) {
+function validateOptionConflicts(options, spec = {}) {
+  const resolved = { ...options };
+  for (const [name, kind] of Object.entries(spec)) {
+    if (kind !== "dir-alias") continue;
+    if (options.dir !== undefined && options[name] !== undefined) throw new UsageError(`--${name} is --dir's old name: pass --dir only`, { code: "dir_and_out", old: `--${name}`, keep: "--dir" });
+    resolved.dir = options.dir ?? options[name];
+    delete resolved[name];
+  }
+  if (resolved.input !== undefined && resolved.stdin) throw new UsageError("pass --stdin or --input <path>, not both", { code: "stdin_and_input" });
+  return resolved;
+}
+
+// `options` with `--root` and `--target` resolved as `spec` declares them.
+/**
+ * @param {Record<string, unknown>} options
+ * @param {OptionSpec | undefined} spec
+ * @returns {Record<string, unknown>}
+ */
+function resolveOptions(options, spec = {}) {
   const resolved = { ...options };
   for (const [name, kind] of Object.entries(spec)) {
     if (kind === "qa-dir" || kind === "qa-dir?") {
       resolved[name] = options[name] ?? ".qa";
       if (kind === "qa-dir" && !isDir(/** @type {string} */ (resolved[name]))) throw new UsageError(`no \`.qa/\` directory at ${resolved[name]}`, { code: "no_qa_dir", root: resolved[name] });
-    } else if (kind === "dir-alias") {
-      if (options.dir !== undefined && options[name] !== undefined) throw new UsageError(`--${name} is --dir's old name: pass --dir only`, { code: "dir_and_out" });
-      resolved.dir = options.dir ?? options[name];
-      delete resolved[name];
     }
   }
   for (const [name, kind] of Object.entries(spec)) if (kind === "commit") resolved[name] = targetOf(/** @type {string} */ (resolved.root), /** @type {string | undefined} */ (options[name]));
@@ -343,4 +428,60 @@ function targetOf(root, ref) {
   const commit = resolveRef(root, ref);
   if (!commit) throw new UsageError(`--target \`${ref}\` names no commit`, { code: "target_unknown", ref });
   return { ref, commit };
+}
+
+/**
+ * Options controlling relaxed syntax accepted by `parseShellWords`. Defaults are fail-closed.
+ * @typedef {{
+ *   allowDoubleQuotes?: boolean,
+ *   allowNewlines?: boolean,
+ *   allowAndOperator?: boolean,
+ * }} ShellWordOptions
+ */
+
+/**
+ * Parse a shell command line into decoded literal words, returning `null` on any disallowed
+ * quoting, operator, or control character.
+ * @param {unknown} line
+ * @param {ShellWordOptions} [options]
+ * @returns {string[] | null}
+ */
+export function parseShellWords(line, options = {}) {
+  const { allowDoubleQuotes = false, allowNewlines = false, allowAndOperator = false } = options;
+  if (typeof line !== "string" || line.includes("\0") || (!allowNewlines && /[\r\n]/.test(line))) return null;
+  const segment = allowDoubleQuotes
+    ? /([A-Za-z0-9_@%+=:,./-]+)|'([^']*)'|\\(')|"([^"$`\\!]*)"/y
+    : /([A-Za-z0-9_@%+=:,./-]+)|'([^']*)'|\\(')/y;
+  /** @type {string[]} */
+  const words = [];
+  let offset = 0;
+  while (offset < line.length) {
+    if (line[offset] === " " || line[offset] === "\t") {
+      offset++;
+      continue;
+    }
+    if (
+      allowAndOperator &&
+      line.startsWith("&&", offset) &&
+      (offset + 2 === line.length || line[offset + 2] === " " || line[offset + 2] === "\t")
+    ) {
+      words.push("&&");
+      offset += 2;
+      continue;
+    }
+    let decoded = "";
+    let matched = false;
+    for (;;) {
+      segment.lastIndex = offset;
+      const match = segment.exec(line);
+      if (!match) break;
+      matched = true;
+      decoded += match[1] ?? match[2] ?? match[3] ?? match[4] ?? "";
+      offset = segment.lastIndex;
+    }
+    if (!matched) return null;
+    if (offset < line.length && line[offset] !== " " && line[offset] !== "\t") return null;
+    words.push(decoded);
+  }
+  return words;
 }

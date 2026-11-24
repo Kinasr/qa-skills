@@ -11,10 +11,12 @@
 //                             the open-finding gate (every open finding by kind and Feature) that a
 //                             bare run settles first; `--review` adds the unreviewed and Review
 //                             overdue cases
-//   agree <scope> --stdin     the agreement bound: the proposed agreement canonicalised with its
+//   agree <scope> --input <path>
+//                             the agreement bound: the proposed agreement canonicalised with its
 //                             computed basis, the planned and actual coverage views, its refusals
 //                             and a scoped run's reported Feature gaps. Writes nothing
-//   split <feature> --stdin   Phase 1's write: records the canonical agreement `design agree` made
+//   split <feature> --input <path>
+//                             Phase 1's write: records the canonical agreement `design agree` made
 //                             in a run directory, minting every `new:N` scenario. It writes the
 //                             agreed scenario files, empty, each with its H1 and a minted
 //                             `ts_` Key; the wanted levels stay in the agreement. All or nothing
@@ -29,20 +31,18 @@
 //                             agreement, declared coverage and hand-offs
 //
 // What each prints (ADR-0024): data for the model to word (lib/design-json.mjs). A refusal is
-// `{ok: false, refusals: [{code, line, ...}]}`, a code with one factual line.
-//   state    {ok, phase1, no_targets, rules, roles, levels, train, coverage}: `train` is
+// `{ok: false, refusals: [{code, ...facts}]}`, a code with the facts behind it.
+//   state    {ok, phase1, no_targets, rules, roles, levels, train, sections}: `train` is
 //            `train/design.md` as lib/training.mjs returns it; `no_targets` is true when a flagged
 //            run has no scenario files to target; `levels` is the project's vocabulary, never a
-//            question; `coverage` is the actual view, whether the Feature has a
-//            `## Coverage` section, what `/qa-next`'s predicate finds due, and the deep dive next;
-//            `open_findings` is the settle gate: `{open, total, by_kind, features: [{feature, total,
-//            by_kind, cases}]}`; `review` (only with `--review`) is `{feature, cases: [{key, scenario,
-//            file, why}]}`, `why` naming `unreviewed` and/or `review_overdue`
-//   agree    {ok, agreement, views, refusals, gaps} (lib/design-agreement.mjs)
+//            question. The Coverage standing, its due state, the open-finding gate, the Uncited
+//            cases, the Uncovered Rules, the Proposed Rules and `--review`'s list are ordered,
+//            labelled sections (`STATE_SECTION_ORDER`)
+//   agree    {ok, agreement, refusals, sections}: the planned and actual coverage views and a scoped
+//            run's Feature gaps are ordered, labelled sections (`AGREE_SECTION_ORDER`)
 //   split    {ok, dir, agreement}: `agreement` is the recorded `agreement.json`
 //   plan     {ok, dir, units}: `units` is how many files are dispatched
-//   report   {ok, feature, mode, scenarios, written_markdown, not_automatable, not_manual, skipped, still_empty,
-//             check_gaps, declared_coverage?, handoffs?, ...}
+//   report   {ok, feature, design_mode, dispatched, delegates, cases_written, sections, keep, changeset, glossary}
 
 // The mode picks the targets: a bare run fills the empty files, `--expand`
 // adds cases to the populated ones, and `--regenerate` redoes the files holding an unreviewed case
@@ -71,14 +71,15 @@
 //   <key>.reply.md      the usable reply the delegation layer left (else the last one it got)
 //   <key>.written.json  what the write of its usable reply did; absent = nothing was written
 import { heldCases, readDesignQuestions, writeDesignQuestions } from "./design-questions.mjs";
-import { readQaAt, repositoryOf, resolveRef } from "./git-tree.mjs";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { readQaAtResult, repositoryOf, resolveRef } from "./git-tree.mjs";
+import { chmodSync, existsSync, lstatSync, readFileSync, readlinkSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { keyLabel, summaries } from "./labels.mjs";
 import { commitLine } from "./changeset.mjs";
 import { checkReply } from "./check-reply.mjs";
 import { readDispatch } from "./delegation.mjs";
-import { refuse, reportData } from "./design-json.mjs";
+import { agreeData, refuse, reportData, stateData } from "./design-json.mjs";
+import { sectionItems } from "./report-sections.mjs";
 import { agreementBasis, checkAgreement, coverageViews, isNewScenarioKey, readAgreement, staleAgreement } from "./design-agreement.mjs";
 import { agreementBriefPosition } from "./design-agreement-brief.mjs";
 import { designMode, designUnit, loadFeature, modeRefusal } from "./design-unit.mjs";
@@ -90,20 +91,20 @@ import { table } from "./markdown.mjs";
 import { PATTERN } from "./keys.mjs";
 import { checkFile, edit, parse } from "./knowledge-file.mjs";
 import { mint } from "./mint.mjs";
-import { backfill } from "./pin-digest.mjs";
 /** @import { NewProposedRule } from "./proposed-rules.mjs" */
 import { appendProposedRules, normalizeStatement, parseProposedRules, proposedRulesProblems, sameStatement } from "./proposed-rules.mjs";
 import { rootConfig } from "./qa-index.mjs";
-import { newRunDir, openPlan } from "./run-dir.mjs";
+import { writeQa } from "./qa-write.mjs";
+import { newRunDir, openPlan, stageJson, writeJsonAtomic } from "./run-dir.mjs";
 import { localDate } from "./scan.mjs";
 import { refuseUnreadSchema } from "./schema-guard.mjs";
 import { DESIGN_TRAIN_KEY, LAYER_FREE_CASE_SCHEMA_VERSION, LEVEL_ON_CASE_SCHEMA_VERSION, oneLine } from "./schema.mjs";
-import { DESIGN_SETTLE_ACTIONS, SETTLE_ACTIONS, settleScope } from "./settle-walk.mjs";
+import { SETTLE_ACTIONS, settleScope } from "./settle-walk.mjs";
 import { linkScope } from "./settle-propose.mjs";
 import { trainFor } from "./training.mjs";
 
 /** Contract types this module owns and consumes from where they are owned. */
-/** @import { CheckFileResult, DesignBrief, DesignMode, EditResult, FeatureContext, ScenarioState } from "./design-unit.mjs"; */
+/** @import { DesignBrief, DesignMode, EditResult, FeatureContext, ScenarioState } from "./design-unit.mjs"; */
 /** @import { CaseEntry, ParsedFile as QaFile } from "./knowledge-file.mjs"; */
 /** @import { MintedKeys } from "./mint.mjs"; */
 /** @import { DesignCheckGap, DesignProposedRule, DesignResult } from "./design-contract.mjs"; */
@@ -113,7 +114,7 @@ import { trainFor } from "./training.mjs";
 /** @import { DeclaredCoverage, DeclaredOutcome, DesignReportJson, ReportCheckGap, ReportHandoffs, ReportProposal, ReportProposed, ReportScenario, RunHealth } from "./design-json.mjs"; */
 /** @import { DispatchSpec } from "./dispatch.mjs"; */
 /** @import { CommandContext, CommandDefinition, CommandResult, OptionKind } from "./cli.mjs"; */
-/** @import { OpenPlanResult } from "./run-dir.mjs"; */
+/** @import { OpenPlanResult, StagedJson } from "./run-dir.mjs"; */
 /** @import { RefusalResult } from "./refusal.mjs"; */
 
 /** A design run's scope once the command line's flags are read: its Feature, its one `<scenario>` when given, and the mode. */
@@ -218,6 +219,7 @@ export const PLAN_SKIP_REASONS = /** @type {const} */ (["populated", "not_popula
 // The actor a scenario file Phase 1 writes is generated by: the split the engineer agreed, written
 // by this script, as `/qa-sync` writes `script:qa-sync`.
 const SPLIT_ACTOR = "script:qa-design";
+let splitRollbackSeq = 0;
 
 // `--expand` and `--regenerate`, the modes besides a bare run's (lib/design-unit.mjs `designMode`).
 /** @type {Record<string, OptionKind>} */
@@ -247,8 +249,7 @@ const ACTIONS = {
     if (inScope.refusal) return inScope.refusal;
     return {
       exit: 0,
-      json: {
-        ok: true,
+      json: stateData({
         // Phase 1 runs only for a bare run over the whole Feature before any scenario file exists: a
         // single <scenario-key>, --expand and --regenerate all work on files that exist.
         phase1: ctx.scenarios.length === 0 && f.mode === "fill" && f.scenario === null,
@@ -264,18 +265,18 @@ const ACTIONS = {
         ...linkScope(root, f.slug),
         // The kept Proposed Rules (ADR-0067), which wait on /qa-deep-dive and block nothing here.
         proposed_rules: parseProposedRules(ctx.feature?.text ?? ""),
-      },
+      }),
     };
     },
   },
 
   agree: {
     options: { root: "qa-dir", stdin: "flag" },
-    usage: "<scope> --stdin [--root <qa-dir>]",
+    usage: "<scope> --input <path> [--root <qa-dir>]",
     /**
-     * `design agree`: the agreement bound. Reads the proposed agreement from `--stdin`, canonicalises
-     * it with its computed basis, and returns the planned and actual coverage views, refusals and a
-     * scoped run's reported Feature gaps. Nothing is written, in any outcome.
+     * `design agree`: the agreement bound. Reads the proposed agreement from `--input <path>`, or
+     * `--stdin`, canonicalises it with its computed basis, and returns the planned and actual coverage
+     * views, refusals and a scoped run's reported Feature gaps. Nothing is written, in any outcome.
      * @param {string[]} args
      * @param {CommandContext & { root: string }} ctx
      * @returns {CommandResult}
@@ -284,26 +285,26 @@ const ACTIONS = {
       if (args.length !== 1) return refuse("bad_arguments", { action: "agree" });
       const scope = args[0];
       const read = readProposal(stdin, {
-        missing: () => agreementRefused("agreement_not_json", "`design agree` reads the proposed agreement from --input <file> or --stdin, and none was given"),
-        notJson: () => agreementRefused("agreement_not_json", "the proposed agreement is not JSON"),
-        notObject: () => agreementRefused("agreement_not_json", "the proposed agreement must be a JSON object"),
+        missing: () => agreementRefused("agreement_not_json", { cause: "missing", input: "--input <file> | --stdin" }),
+        notJson: () => agreementRefused("agreement_not_json", { cause: "not_json" }),
+        notObject: () => agreementRefused("agreement_not_json", { cause: "not_object" }),
       });
       if (read.refusal) return read.refusal;
       const proposal = read.proposal;
       const feature = proposal.feature;
-      if (typeof feature !== "string" || !PATTERN.slug.test(feature)) return agreementRefused("agreement_feature", "the proposed agreement names no Feature key");
-      if (proposal.scope !== scope) return agreementRefused("scope_mismatch", `the proposed agreement's scope is ${JSON.stringify(proposal.scope)}, not ${JSON.stringify(scope)}`);
+      if (typeof feature !== "string" || !PATTERN.slug.test(feature)) return agreementRefused("agreement_feature", { expected: "feature" });
+      if (proposal.scope !== scope) return agreementRefused("scope_mismatch", { given: proposal.scope, expected: scope });
       const ctx = loadFeature(root, feature);
-      if (!ctx.feature) return agreementRefused("agreement_no_feature", `the knowledge layer holds no Feature \`${feature}\``);
+      if (!ctx.feature) return agreementRefused("agreement_no_feature", { feature });
       /** @type {AgreementResult} */
       const result = checkAgreement(ctx, proposal);
-      return { exit: result.ok ? 0 : 1, json: result };
+      return { exit: result.ok ? 0 : 1, json: agreeData(result) };
     },
   },
 
   split: {
     options: { root: "qa-dir", stdin: "flag", dir: "value", out: "dir-alias" },
-    usage: "<feature> --stdin [--dir <run-dir>] [--root <qa-dir>]",
+    usage: "<feature> --input <path> [--dir <run-dir>] [--root <qa-dir>]",
     /**
      * `design split`: records the canonical agreement `design agree` produced in a new run
      * directory. It refuses a stale basis before any write, mints every `new:N` scenario, writes the
@@ -321,28 +322,28 @@ const ACTIONS = {
       const read = readProposal(stdin, {
         missing: () => refuse("no_split"),
         notJson: () => refuse("split_not_json"),
-        notObject: () => agreementRefused("bad_proposal", "the agreement must be a JSON object"),
+        notObject: () => agreementRefused("bad_proposal", { cause: "not_object" }),
       });
       if (read.refusal) return read.refusal;
       const proposal = read.proposal;
       if (typeof proposal.feature !== "string" || !PATTERN.slug.test(proposal.feature)) {
-        return agreementRefused("agreement_feature", "the agreement names no Feature key");
+        return agreementRefused("agreement_feature", { expected: f.slug });
       }
       if (proposal.feature !== f.slug) {
-        return agreementRefused("agreement_feature", `the agreement is for \`${proposal.feature}\`, not \`${f.slug}\``);
+        return agreementRefused("agreement_feature", { given: proposal.feature, expected: f.slug });
       }
       if (typeof proposal.scope !== "string" || !proposal.scope) {
-        return agreementRefused("bad_proposal", "the agreement names no scope");
+        return agreementRefused("bad_proposal", { field: "scope" });
       }
       if (typeof proposal.basis !== "string" || !proposal.basis) {
-        return agreementRefused("bad_proposal", "the agreement carries no basis: run `design agree` first");
+        return agreementRefused("bad_proposal", { field: "basis", next: "design agree" });
       }
       const ctx = loadFeature(root, f.slug);
       const halt = halted(ctx, f.slug);
       if (halt) return halt;
       // The basis is the pre-write gate: a stale agreement must not even make its run directory.
       const stale = staleAgreement(ctx, /** @type {Agreement} */ (proposal));
-      if (stale) return agreementRefused(stale.code, stale.message);
+      if (stale) return agreementRefused(stale.code, { feature: proposal.feature, scope: proposal.scope, next: "design agree" });
       /** @type {AgreementResult} */
       const checked = checkAgreement(ctx, proposal);
       if (!checked.ok || checked.agreement === null) return { exit: 1, json: checked };
@@ -356,7 +357,6 @@ const ACTIONS = {
       const run = newRunDir(dir, "qa-design-");
       if (run.error) return refuse("run_dir", { reason: run.error });
       const at = localDate();
-      const config = rootConfig(ctx.root);
       /** @type {{ rel: string, text: string, entry: { scenario: string, summary: string | null, levels: string[], created: boolean } }[]} */
       const files = [];
       for (const [key, entry] of Object.entries(canonical.scenarios)) {
@@ -373,28 +373,122 @@ const ACTIONS = {
           continue;
         }
       }
-      for (const x of files) {
-        const checkedFile = /** @type {CheckFileResult} */ (checkFile(/** @type {QaFile} */ (parse(x.rel, x.text)), config));
-        if (!checkedFile.ok) throw new Error(`design split: ${x.rel} would not pass its check: ${checkedFile.errors.map((err) => err.message).join("; ")}`);
+      let made = "";
+      const tx = writeQa({
+        root: ctx.root,
+        minSchema: LEVEL_ON_CASE_SCHEMA_VERSION,
+        writes: files.map((x) => ({ path: x.rel, text: x.text })),
+        afterCommit() {
+          const hadDir = Boolean(run.exists);
+          const targetDir = (/** @type {{ make: () => string }} */ (run)).make();
+          made = targetDir;
+          const agreementPath = join(targetDir, "agreement.json");
+          const splitPath = join(targetDir, "split.json");
+          /** @type {{ exists: false } | { exists: true, kind: "file", bytes: Buffer, mode: number } | { exists: true, kind: "symlink", target: string } | null} */
+          let prevAgreement = null;
+          /** @type {StagedJson[]} */
+          const staged = [];
+          let agreementCommitted = false;
+          try {
+            if (hadDir) {
+              try {
+                const st = lstatSync(agreementPath);
+                if (st.isFile()) {
+                  prevAgreement = { exists: true, kind: "file", bytes: readFileSync(agreementPath), mode: st.mode & 0o7777 };
+                } else if (st.isSymbolicLink()) {
+                  prevAgreement = { exists: true, kind: "symlink", target: readlinkSync(agreementPath) };
+                } else if (st.isDirectory()) {
+                  throw Object.assign(new Error(`${agreementPath} is a directory`), { code: "EISDIR" });
+                } else {
+                  throw new Error(`${agreementPath} is not a file or symlink`);
+                }
+              } catch (err) {
+                const code = /** @type {NodeJS.ErrnoException} */ (err).code;
+                if (code === "ENOENT" || code === "ENOTDIR") {
+                  prevAgreement = { exists: false };
+                } else {
+                  throw err;
+                }
+              }
+            }
+            const written = files.map((x) => ({ ...x.entry, file: repoPath(ctx.root, x.rel) }));
+            const remapped = remapAgreement(canonical, minted);
+            /** @type {Agreement} */
+            const nextAgreement = {
+              ...remapped,
+              basis: agreementBasis(loadFeature(root, f.slug), remapped.feature, remapped.scope),
+            };
+            staged.push(stageJson(agreementPath, nextAgreement));
+            // `design report` still reads the files Phase 1 wrote from `split.json`; a run that wrote none
+            // leaves only `agreement.json`.
+            if (written.length) {
+              /** @type {SplitRecord} */
+              const splitRecord = { feature: f.slug, written };
+              staged.push(stageJson(splitPath, splitRecord));
+            }
+            staged[0].commit();
+            agreementCommitted = true;
+            if (staged[1]) staged[1].commit();
+          } catch (err) {
+            for (const s of staged) s.abort();
+            /** @type {string[]} */
+            const rbErrors = [];
+            if (agreementCommitted) {
+              if (prevAgreement?.exists && prevAgreement.kind === "file") {
+                const rbTemp = `${agreementPath}.rb.${process.pid}.${++splitRollbackSeq}`;
+                try {
+                  writeFileSync(rbTemp, prevAgreement.bytes);
+                  chmodSync(rbTemp, prevAgreement.mode);
+                  renameSync(rbTemp, agreementPath);
+                } catch (rbErr) {
+                  try { rmSync(rbTemp, { force: true }); } catch {}
+                  rbErrors.push(rbErr instanceof Error ? rbErr.message : String(rbErr));
+                }
+              } else if (prevAgreement?.exists && prevAgreement.kind === "symlink") {
+                try {
+                  rmSync(agreementPath, { force: true });
+                  symlinkSync(prevAgreement.target, agreementPath);
+                } catch (rbErr) {
+                  rbErrors.push(rbErr instanceof Error ? rbErr.message : String(rbErr));
+                }
+              } else {
+                try {
+                  rmSync(agreementPath, { force: true });
+                } catch (rbErr) {
+                  rbErrors.push(rbErr instanceof Error ? rbErr.message : String(rbErr));
+                }
+              }
+            }
+            if (!hadDir) {
+              try {
+                rmSync(targetDir, { recursive: true, force: true });
+              } catch (rbErr) {
+                rbErrors.push(rbErr instanceof Error ? rbErr.message : String(rbErr));
+              }
+            }
+            if (rbErrors.length) {
+              const origMsg = err instanceof Error ? err.message : String(err);
+              throw new Error(`${origMsg}; agreement.json rollback failed: ${rbErrors.join("; ")}`);
+            }
+            throw err;
+          }
+        },
+      });
+      if (!tx.ok) {
+        if (tx.kind === "schema") return tx.refusal;
+        if (tx.kind === "check") {
+          const rel = tx.errors[0].rel;
+          throw new Error(`design split: ${rel} would not pass its check: ${tx.errors.filter((e) => e.rel === rel).map((e) => e.message).join("; ")}`);
+        }
+        throw new Error(`design split: ${tx.error ?? "failed"}${tx.kind !== "write" && !tx.rolledBack && tx.rollbackError ? `; rollback failed: ${tx.rollbackError}` : ""}`);
       }
-
-      const made = (/** @type {{ make: () => string }} */ (run)).make();
-      for (const x of files) writeFileSync(join(ctx.root, x.rel), backfill(ctx.root, x.rel, x.text));
-
-      const written = files.map((x) => ({ ...x.entry, file: repoPath(ctx.root, x.rel) }));
-      const agreement = remapAgreement(canonical, minted);
-      agreement.basis = agreementBasis(loadFeature(root, f.slug), agreement.feature, agreement.scope);
-      writeFileSync(join(made, "agreement.json"), `${JSON.stringify(/** @type {Agreement} */ (agreement), null, 2)}\n`);
-      // `design report` still reads the files Phase 1 wrote from `split.json`; a run that wrote none
-      // leaves only `agreement.json`.
-      if (written.length) writeFileSync(join(made, "split.json"), `${JSON.stringify(/** @type {SplitRecord} */ ({ feature: f.slug, written }), null, 2)}\n`);
       return { exit: 0, json: { ok: true, dir: made, agreement: join(made, "agreement.json") } };
     },
   },
 
   override: {
     options: { stdin: "flag", dir: "value", out: "dir-alias" },
-    usage: "--stdin [--dir <run-dir>]",
+    usage: "--input <path> [--dir <run-dir>]",
     /**
      * `design override`: the engineer's reason that a proposal repeating a stored case is a
      * distinct pass. Reads `{"<Key of the stored case>": "<reason>"}` and records it in the
@@ -417,7 +511,7 @@ const ACTIONS = {
       const held = readOverrides(made);
       if (held.error) return refuse("run_dir", { reason: held.error });
       const overrides = { ...held.overrides, ...Object.fromEntries(reasons.map(([key, reason]) => [key, oneLine(/** @type {string} */ (reason))])) };
-      writeFileSync(join(made, OVERRIDES), `${JSON.stringify({ v: 1, overrides }, null, 2)}\n`);
+      writeJsonAtomic(join(made, OVERRIDES), /** @type {DesignOverridesFile} */ ({ v: 1, overrides }));
       return { exit: 0, json: { ok: true, dir: made, overrides } };
     },
   },
@@ -449,15 +543,15 @@ const ACTIONS = {
     if (agreed.refusal) return agreed.refusal;
     const agreement = agreed.agreement;
     if (agreement !== null && agreement.feature !== f.slug) {
-      return agreementRefused("agreement_feature", `the run's agreement is for \`${agreement.feature}\`, not \`${f.slug}\``);
+      return agreementRefused("agreement_feature", { given: agreement.feature, expected: f.slug });
     }
     if (agreement !== null) {
       const expectedScope = f.scenario ?? "feature";
       if (agreement.scope !== expectedScope) {
-        return agreementRefused("agreement_scope", `the run's agreement is for scope ${JSON.stringify(agreement.scope)}, not ${JSON.stringify(expectedScope)}: run \`design agree ${expectedScope}\` again`, { scope: agreement.scope, expected: expectedScope });
+        return agreementRefused("agreement_scope", { scope: agreement.scope, expected: expectedScope, next: `design agree ${expectedScope}` });
       }
       const stale = staleAgreement(ctx, agreement);
-      if (stale) return agreementRefused(stale.code, stale.message);
+      if (stale) return agreementRefused(stale.code, { feature: agreement.feature, scope: agreement.scope, next: "design agree" });
       const refusedTarget = agreementTargetsRefused(inScope, agreement, f.mode);
       if (refusedTarget) return refusedTarget;
     }
@@ -495,9 +589,9 @@ const ACTIONS = {
       ));
     }
     /** @type {DesignPlan} */
-    const plan = { root, dir, feature: f.slug, mode: f.mode, scenario: f.scenario, rules_in: ctx.rules.length, units, skipped };
-    writeFileSync(join(dir, "plan.json"), `${JSON.stringify(plan, null, 2)}\n`);
-    writeFileSync(join(dir, "dispatch.spec.json"), `${JSON.stringify(dispatchSpec(plan), null, 2)}\n`);
+    const plan = { root: resolve(root), dir, feature: f.slug, mode: f.mode, scenario: f.scenario, rules_in: ctx.rules.length, units, skipped };
+    writeJsonAtomic(join(dir, "plan.json"), plan);
+    writeJsonAtomic(join(dir, "dispatch.spec.json"), dispatchSpec(plan));
     return { exit: 0, json: { ok: true, dir, units: units.length } };
     },
   },
@@ -532,16 +626,30 @@ const ACTIONS = {
       const repo = repositoryOf(root);
       const head = resolveRef(root, "HEAD");
       if (!repo || !head) return refuse("unbind_history", { key });
-      const history = readQaAt(repo, head);
-      const committed = [...history].some(([rel, text]) => parse(rel, text).cases.some((c) => c.key === key));
+      const history = readQaAtResult(repo, head);
+      if (!history.ok) return refuse("unbind_history", { key });
+      const committed = [...history.files].some(([rel, text]) => parse(rel, text).cases.some((c) => c.key === key));
       if (Object.hasOwn(entry.data, "review") || committed) return refuse("unbind_kept", { key });
       /** @type {WrittenRecord} */
       const record = /** @type {WrittenRecord} */ (readJson(unit.written));
       const out = edit(file, [{ at: key, set: { level: undefined } }]);
-      if (!out.ok || !checkFile(out.file, rootConfig(root)).ok) return refuse("unbind_check", { key });
-      writeFileSync(join(root, file.rel), backfill(root, file.rel, out.text));
-      record.bindings = (record.bindings ?? []).map((b) => b.key === key ? { ...b, unbound: true } : b);
-      writeFileSync(unit.written, `${JSON.stringify(record, null, 2)}\n`);
+      if (!out.ok) return refuse("unbind_check", { key });
+      /** @type {WrittenRecord} */
+      const nextRecord = {
+        ...record,
+        bindings: (record.bindings ?? []).map((b) => (b.key === key ? { ...b, unbound: true } : b)),
+      };
+      const tx = writeQa({
+        root,
+        minSchema: LAYER_FREE_CASE_SCHEMA_VERSION,
+        writes: [{ path: file.rel, text: out.text }],
+        stage: [{ path: unit.written, value: nextRecord }],
+      });
+      if (!tx.ok) {
+        if (tx.kind === "schema") return tx.refusal;
+        if (tx.kind === "check") return refuse("unbind_check", { key });
+        throw new Error(`design unbind: ${tx.error ?? "failed"}${tx.kind !== "write" && !tx.rolledBack && tx.rollbackError ? `; rollback failed: ${tx.rollbackError}` : ""}`);
+      }
       return { exit: 0, json: { ok: true, dir, key, unbound: true } };
     },
   },
@@ -590,7 +698,7 @@ const ACTIONS = {
 
   keep: {
     options: { stdin: "flag", dir: "value" },
-    usage: "--dir <run-dir> --stdin",
+    usage: "--dir <run-dir> --input <path>",
     /**
      * `design keep` (ADR-0067): append the Proposed Rules the engineer kept at this Run's report to
      * the Feature's `## Proposed Rules`, the one Feature write /qa-design makes. Reads
@@ -611,10 +719,14 @@ const ACTIONS = {
       if (error) return refuse("run_dir", { reason: error });
       const intended = runAgreement(/** @type {string} */ (dir));
       if (intended.refusal) return intended.refusal;
-      const { proposals, changeset } = report(/** @type {string} */ (dir), /** @type {DesignPlan} */ (plan), /** @type {DispatchReadback | null} */ (readDispatch(/** @type {string} */ (dir))), intended.agreement ?? null);
+      const rep = report(/** @type {string} */ (dir), /** @type {DesignPlan} */ (plan), /** @type {DispatchReadback | null} */ (readDispatch(/** @type {string} */ (dir))), intended.agreement ?? null);
+      const proposals = /** @type {ReportProposal[]} */ (sectionItems(rep, "proposals"));
+      const { changeset } = rep;
       const unknown = items.filter((k) => !proposals.some((p) => p.item === k.item)).map((k) => k.item);
       if (unknown.length) return refuse("unknown_proposal", { items: unknown });
       const root = /** @type {DesignPlan} */ (plan).root;
+      const newer = refuseUnreadSchema(root, LAYER_FREE_CASE_SCHEMA_VERSION);
+      if (newer) return newer;
       const feature = loadFeature(root, /** @type {DesignPlan} */ (plan).feature).feature;
       if (!feature || feature.unreadable) return refuse("keep_no_feature");
       const held = parseProposedRules(feature.text).map((h) => h.statement);
@@ -631,13 +743,35 @@ const ACTIONS = {
       const text = appendProposedRules(feature.text, kept);
       const problems = proposedRulesProblems({ text });
       if (problems.length) return refuse("keep_check", { problems });
+      const parsedFeature = parse(feature.rel, text);
+      if (parsedFeature.problems.length) return refuse("keep_check", { problems: parsedFeature.problems });
       const file = repoPath(root, feature.rel);
-      if (kept.length) {
-        writeFileSync(join(root, feature.rel), text);
+      if (kept.length === 0) {
+        const checked = checkFile(parsedFeature, rootConfig(root));
+        if (!checked.ok) return refuse("keep_check", { problems: checked.errors });
+      } else {
         // The report item each kept statement came from, so a re-run report reads a reworded one as kept.
-        const from = keptFrom(/** @type {string} */ (dir));
-        for (const k of kept) from.push({ from: /** @type {ReportProposal} */ (proposals.find((x) => x.item === k.item)).statement, statement: k.statement });
-        writeFileSync(join(/** @type {string} */ (dir), KEPT_FILE), `${JSON.stringify({ v: 1, kept: from }, null, 2)}\n`);
+        /** @type {KeptFrom[]} */
+        const nextKept = [
+          ...keptFrom(/** @type {string} */ (dir)),
+          ...kept.map((k) => ({
+            from: /** @type {ReportProposal} */ (proposals.find((x) => x.item === k.item)).statement,
+            statement: k.statement,
+          })),
+        ];
+        /** @type {DesignKeptFile} */
+        const keptValue = { v: 1, kept: nextKept };
+        const tx = writeQa({
+          root,
+          minSchema: LAYER_FREE_CASE_SCHEMA_VERSION,
+          writes: [{ path: feature.rel, text }],
+          stage: [{ path: join(/** @type {string} */ (dir), KEPT_FILE), value: keptValue }],
+        });
+        if (!tx.ok) {
+          if (tx.kind === "schema") return tx.refusal;
+          if (tx.kind === "check") return refuse("keep_check", { problems: tx.errors.map(({ path: _p, rel: _r, ...rest }) => rest) });
+          throw new Error(`design keep: ${tx.error ?? "failed"}${tx.kind !== "write" && !tx.rolledBack && tx.rollbackError ? `; rollback failed: ${tx.rollbackError}` : ""}`);
+        }
       }
       // The keep's commit covers the Run's changeset and the Feature it wrote, so one commit holds both.
       const commit = kept.length ? commitLine([...new Set([...changeset.paths, file])], designCommitMessage(/** @type {DesignPlan} */ (plan))) : null;
@@ -645,29 +779,23 @@ const ACTIONS = {
     },
   },
 
-  // The walk, triage, Card page and page-reply: the settle engine (lib/settle-walk.mjs) that
-  // `/qa-impact` runs too, over the run dir `impact plan` and `impact persist` made.
+  // The triage walk, triage, checkpoint, rule-fix, Card page, proposals and links: the settle engine (lib/settle-walk.mjs) over the run dir `impact plan` and `impact persist` made.
   ...SETTLE_ACTIONS,
-  ...DESIGN_SETTLE_ACTIONS,
 };
 
-// Every refusal is `design`'s own, its usage errors included.
 /**
- * The command line's `design` (scripts/scan.mjs): its `refuse` words every usage error the registry
- * raises with one of the run's own refusal codes, the error's detail included.
+ * The command line's `design` (scripts/scan.mjs).
  * @type {CommandDefinition}
  */
-export const command = { actions: ACTIONS, refuse: (e) => refuse(/** @type {string} */ (e.detail.code), e.detail) };
+export const command = { actions: ACTIONS };
 
-// A proposal `design agree` or `design split` cannot even read: exit 1, one `{code, message}`
-// refusal and no write. `data` adds the detail a plan's agreement refusal names.
+// A proposal `design agree`, `design split` or `design plan` refuses before any write: exit 1, code and facts.
 /**
  * @param {string} code
- * @param {string} message
  * @param {Record<string, unknown>} [data]
  * @returns {CommandResult}
  */
-const agreementRefused = (code, message, data = {}) => ({ exit: 1, json: { ok: false, refusals: [{ code, message, ...data }] } });
+const agreementRefused = (code, data = {}) => refuse(code, data, 1);
 
 // A proposed agreement read from `--stdin`, shared by `design agree` and `design split`: each mode
 // supplies its own refusal messages, so their codes stay as they were.
@@ -837,11 +965,11 @@ function agreementTargetsRefused(scenarios, agreement, mode) {
     if (entry === undefined) continue;
     const data = { scenario: s.scenario, action: entry.action, mode };
     if (!/** @type {readonly string[]} */ (AGREED_ACTIONS[mode]).includes(entry.action)) {
-      return agreementRefused("agreement_mode", `the agreement gives \`${s.scenario}\` the action \`${entry.action}\`, which a \`${mode}\` run does not run: run \`design agree\` again`, data);
+      return agreementRefused("agreement_mode", { ...data, next: "design agree" });
     }
     const reason = modeRefusal(entry.action, s);
     if (reason !== null) {
-      return agreementRefused("agreement_target", `the agreement gives \`${s.scenario}\` the action \`${entry.action}\`, which its file cannot take: run \`design agree\` again`, { ...data, reason });
+      return agreementRefused("agreement_target", { ...data, reason, next: "design agree" });
     }
   }
   return null;
@@ -860,8 +988,8 @@ function runAgreement(named) {
   if (!existsSync(join(dir, "agreement.json"))) return { agreement: null };
   try {
     return { agreement: readAgreement(dir) };
-  } catch (e) {
-    return { refusal: agreementRefused("bad_agreement", e instanceof Error ? e.message : String(e)) };
+  } catch {
+    return { refusal: agreementRefused("bad_agreement", { dir, file: "agreement.json", next: "design split" }) };
   }
 }
 
@@ -934,7 +1062,7 @@ function writeUnit(dir, ctx, json, action, obligations, overrides = {}) {
     json = { ...json, brief: text, brief_bytes: Buffer.byteLength(text), overrides };
   }
   // `<key>.brief.json`, `check-reply design --brief`'s input, under the brief contract.
-  writeFileSync(briefJson, `${JSON.stringify(/** @type {DesignBrief} */ ({ mode: "brief", .../** @type {Partial<DesignBrief>} */ (json) }), null, 2)}\n`);
+  writeJsonAtomic(briefJson, /** @type {DesignBrief} */ ({ mode: "brief", .../** @type {Partial<DesignBrief>} */ (json) }));
   writeFileSync(briefText, json.brief);
   // The unit's file is the brief's own scenario file, which `designUnit` built the brief from.
   const cases = /** @type {QaFile} */ (ctx.files.find((f) => f.rel === json.file)).cases;
@@ -976,6 +1104,7 @@ function dispatchSpec(plan) {
 // The engineer's reasons the run dir holds (`design override`): by the Key of the stored case each
 // excuses a repeat of. `{overrides}` (empty when none), or `{error}` for a file that is not that.
 const OVERRIDES = "overrides.json";
+/** @typedef {{ v: number, overrides: Record<string, string> }} DesignOverridesFile */
 /**
  * @param {string} dir
  * @returns {{ overrides: Record<string, string>, error?: undefined } | { error: string, overrides?: undefined }}
@@ -1009,6 +1138,7 @@ const readJson = (path) => {
 // The kept statements `design keep` wrote, each with the report statement it came from.
 const KEPT_FILE = "kept.json";
 /** @typedef {{ from: string, statement: string }} KeptFrom */
+/** @typedef {{ v: number, kept: KeptFrom[] }} DesignKeptFile */
 /**
  * @param {string} dir
  * @returns {KeptFrom[]}
@@ -1072,7 +1202,7 @@ function report(dir, plan, dispatch, agreement) {
     if (w?.written) {
       outcomes.set(u.scenario, "written");
       bindings.push(...(w.bindings ?? []).map((b) => ({ ...b, scenario: u.scenario, file: u.file })));
-      return { ...entry, status: "written", cases_written: w.cases_written, cases: w.keys, not_automatable: w.not_automatable ?? [], not_manual: w.not_manual ?? [], replaced: w.replaced ? u.replace : [], ...(w.overridden && { overridden: w.overridden }), ...(w.duplicates && { duplicates: w.duplicates }), ...(w.dropped_labels && { dropped_labels: w.dropped_labels }), ...(w.lost_labels && { lost_labels: w.lost_labels }) };
+      return { ...entry, status: "written", cases_written: w.cases_written, cases: w.keys, not_automatable: w.not_automatable ?? [], not_manual: w.not_manual ?? [], replaced: w.replaced ? u.replace : [], ...(w.retired_in && { retired_in: repoPath(plan.root, w.retired_in) }), ...(w.overridden && { overridden: w.overridden }), ...(w.duplicates && { duplicates: w.duplicates }), ...(w.dropped_labels && { dropped_labels: w.dropped_labels }), ...(w.lost_labels && { lost_labels: w.lost_labels }) };
     }
     // A record that wrote nothing names its reason and its problems (lib/design-write.mjs `refused`).
     if (w) {
@@ -1094,24 +1224,31 @@ function report(dir, plan, dispatch, agreement) {
   const caseWarnings = permissionWarnings(ctx, writtenKeys);
   writeDesignQuestions(dir, { v: 1, feature: plan.feature, references: listOf(ctx.feature?.data.sources), questions });
   // An awaiting unit is not "still empty": its file waits on /qa-deep-dive, not on another fill.
-  const stillEmpty = ctx.scenarios.filter((s) => s.status === "empty" && outcomes.get(/** @type {string} */ (s.scenario)) !== "awaiting").map((s) => ({ scenario: /** @type {string} */ (s.scenario), file: repoPath(ctx.root, s.file) }));
+  const stillEmpty = ctx.scenarios
+    .filter((s) => s.status === "empty" && outcomes.get(/** @type {string} */ (s.scenario)) !== "awaiting")
+    .map((s) => ({
+      scenario: /** @type {string} */ (s.scenario),
+      file: repoPath(ctx.root, s.file),
+      command: ["/qa-design", plan.feature, /** @type {string} */ (s.scenario)].join(" "),
+    }));
+  const stillEmptyScenarios = new Set(stillEmpty.map((s) => s.scenario));
   const changed = scenarios.filter((s) => s.status === "written" && (s.cases_written > 0 || s.replaced.length));
   const proposals = proposalList(ctx.feature?.text ?? "", proposed, agreement, keptFrom(dir));
   const knowledge = [...new Set([
     ...(agreement !== null ? agreementPaths(ctx, plan, agreement, scenarios) : (/** @type {SplitRecord | null} */ (readJson(join(dir, "split.json")))?.written ?? []).map((w) => w.file)),
     ...changed.map((s) => s.file),
+    ...scenarios.flatMap((s) => (s.status === "written" && s.retired_in ? [s.retired_in] : [])),
   ])];
   const paths = knowledge;
   const mode = plan.mode;
   const flags = mode === "fill" ? [] : [`--${mode}`];
-  // A bare re-run fills only what is still empty. An expand or regenerate re-run is not
-  // idempotent (a second expand adds again, a second regenerate redoes this run's cases), so it
-  // is offered per file whose unit wrote nothing, never over the whole Feature. Each rerun takes
-  // its own unit's action, never the run's: a fill unit in an expand run needs no flag. An
-  // awaiting unit is re-offered its prerequisite instead: /qa-deep-dive, never a design rerun.
+  // A bare re-run fills only what is still empty (each still_empty item carries its own command).
+  // An expand or regenerate re-run is not idempotent (a second expand adds again, a second
+  // regenerate redoes this run's cases), so it is offered per populated file whose unit wrote
+  // nothing, never over the whole Feature. Each rerun takes its own unit's action, never the run's.
+  // An awaiting unit is handed off by awaiting_rules, never repeated in reruns.
   const reruns = scenarios.flatMap((s) => {
-    if (s.status === "awaiting_rules") return [{ scenario: s.scenario, command: `/qa-deep-dive ${plan.feature}` }];
-    if (s.status === "written") return [];
+    if (s.status === "written" || s.status === "awaiting_rules" || stillEmptyScenarios.has(s.scenario)) return [];
     const action = actions.get(s.scenario) ?? mode;
     if (mode === "fill" && action === "fill") return [];
     const actionFlags = action === "fill" ? [] : [`--${action}`];
@@ -1136,7 +1273,6 @@ function report(dir, plan, dispatch, agreement) {
       question_handoff: questions.length ? `/qa-deep-dive ${plan.feature} --dir ${dir}` : null,
       check_gaps: checkGaps,
       check_handoff: checkGaps.length ? "/qa-train design" : null,
-      proposed_rules: proposed,
       proposals,
       keep: proposals.some((p) => !p.kept) ? `design keep --dir ${dir} --input <file>` : null,
       handoff: `/qa-deep-dive ${plan.feature}`,
@@ -1321,8 +1457,17 @@ function proposalList(featureText, proposed, agreement, from = []) {
   /** @type {{ statement: string, why?: string, scenario: string | null }[]} */
   const all = [...proposed, ...(agreement?.handoffs.proposed_rules ?? []).map((p) => ({ ...p, scenario: null }))];
   for (const p of all) {
-    if (out.some((o) => sameStatement(o.statement, p.statement))) continue;
-    out.push({ item: out.length + 1, statement: p.statement, ...(p.why === undefined ? {} : { why: p.why }), scenario: p.scenario, kept: held.some((h) => sameStatement(h.statement, p.statement) || from.some((k) => sameStatement(k.from, p.statement) && sameStatement(h.statement, k.statement))) });
+    const attribution = { scenario: p.scenario, ...(p.why === undefined ? {} : { why: p.why }) };
+    const existing = out.find((o) => sameStatement(o.statement, p.statement));
+    if (existing) {
+      const scenarios = existing.scenarios ?? [];
+      if (!scenarios.some((a) => a.scenario === attribution.scenario && a.why === attribution.why)) {
+        scenarios.push(attribution);
+      }
+      if (existing.why === undefined && p.why !== undefined) existing.why = p.why;
+      continue;
+    }
+    out.push({ item: out.length + 1, statement: p.statement, ...(p.why === undefined ? {} : { why: p.why }), scenario: p.scenario, scenarios: [attribution], kept: held.some((h) => sameStatement(h.statement, p.statement) || from.some((k) => sameStatement(k.from, p.statement) && sameStatement(h.statement, k.statement))) });
   }
   return out;
 }

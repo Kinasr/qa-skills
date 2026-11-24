@@ -1,14 +1,17 @@
 // @ts-check
 // Impact output data and refusals for the model to word.
-import { refusalsFor, object, parseDecisions } from "./refusal.mjs";
+import { refusalsWithoutLines, object, parseDecisions, validateEdits } from "./refusal.mjs";
 import { table as markdownTable } from "./markdown.mjs";
 import { terms, labelOf, keyLabel } from "./labels.mjs";
 import { findingData } from "./finding-data.mjs";
 import { PATTERN } from "./keys.mjs";
 import { wordsOf } from "./stack.mjs";
+import { buildSections } from "./report-sections.mjs";
+import { RECONCILE_SECTION_ORDER } from "./deep-dive-json.mjs";
 
 /** @import {RefusalFact, RefusalResult, Refusals} from "./refusal.mjs" */
 /** @import { PersistChange } from "./scan-history.mjs" */
+/** @import { ReportSection, SectionSpec } from "./report-sections.mjs" */
 
 /**
  * The summaries of `.qa/`'s keys, as `labels.mjs` gives them: a key's label, or nothing when the
@@ -177,7 +180,6 @@ import { wordsOf } from "./stack.mjs";
  * @property {{ judged: number, present: number }} cases
  * @property {ImpactHealthFeature[]} [features]
  * @property {ImpactHealthDispatch | null} dispatch
- * @property {{ count: number, markdown: string | null, items: ImpactFailedUnit[] }} failed_units
  * @property {number} unknown_keys
  * @property {string | null} rerun
  * @property {Array<{ code: string, line: string }>} notes
@@ -226,18 +228,10 @@ import { wordsOf } from "./stack.mjs";
  * The impact output contract: the report of `impact report` and `impact persist`, as
  * the model words it. `impact-json` writes it; `impact` and `settle-walk` read it.
  * @typedef {object} ImpactReport
+ * @property {true} ok
  * @property {{ ref: string | null, commit: string | null }} target
  * @property {string[] | null} delegates
- * @property {ImpactScope} scope
- * @property {ImpactJudgements} judgements
- * @property {ImpactOverreaches} overreaches
- * @property {ImpactCarried} carried
- * @property {ImpactDismissed} dismissed
- * @property {ImpactScans} scans
- * @property {ImpactRunHealth} run_health
- * @property {ImpactWatermarkEntry[]} [watermarks]
- * @property {ImpactMissingCase[]} [missing]
- * @property {ImpactMergeRule[]} merge_rules
+ * @property {ReportSection[]} sections
  * @property {ImpactChangeset} changeset
  * @property {ImpactGlossaryEntry[]} glossary
  */
@@ -729,6 +723,115 @@ export const MERGE_ORDER = Object.keys(MERGE_RULES);
  */
 export const mergeRules = (keys) => MERGE_ORDER.filter((k) => keys.includes(k)).map((rule) => ({ rule, text: MERGE_RULES[rule] }));
 
+/** @type {readonly SectionSpec[]} */
+export const QUICK_CHECK_SECTION_ORDER = [
+  ...RECONCILE_SECTION_ORDER,
+  { id: "threshold", label: "Quick-path threshold" },
+];
+
+/** @type {readonly string[]} */
+export const QUICK_CHECK_ALLOWED_OUTSIDE = [
+  "mode", "migration", "action", "ok", "feature", "dir", "over", "handoff", "change_file", "changeset", "next_step",
+];
+
+/**
+ * Builds the `impact quick-check` JSON response with reconciliation outcomes and the quick-path
+ * threshold inside `sections`.
+ * @param {{
+ *   feature: string,
+ *   dir: string,
+ *   edited: readonly unknown[],
+ *   outside_band: readonly unknown[],
+ *   unedited_changes: readonly unknown[],
+ *   added: readonly unknown[],
+ *   retired: readonly unknown[],
+ *   boundary_check: readonly unknown[],
+ *   downstream: readonly unknown[],
+ *   downstream_features: readonly unknown[],
+ *   next_feature: { command: string } | null,
+ *   widened: readonly unknown[],
+ *   forecast: readonly unknown[],
+ *   threshold: { limit: number, source: string, rules: number, stale_cases: number, total: number, over: boolean },
+ *   handoff: string | null,
+ *   change_file: string | null,
+ *   changeset: ImpactChangeset,
+ *   next_step: string,
+ * }} data
+ * @returns {{
+ *   action: "quick-check",
+ *   ok: true,
+ *   feature: string,
+ *   dir: string,
+ *   over: boolean,
+ *   handoff: string | null,
+ *   change_file: string | null,
+ *   changeset: ImpactChangeset,
+ *   next_step: string,
+ *   sections: ReportSection[],
+ * }}
+ */
+export function buildQuickCheckJson(data) {
+  /** @type {ReportSection[]} */
+  const sections = buildSections(QUICK_CHECK_SECTION_ORDER, [
+    { id: "edited", items: data.edited },
+    { id: "outside_band", items: data.outside_band },
+    { id: "unedited_changes", items: data.unedited_changes },
+    { id: "added", items: data.added },
+    { id: "retired", items: data.retired },
+    { id: "boundary_check", items: data.boundary_check },
+    { id: "downstream", items: data.downstream },
+    { id: "downstream_features", items: data.downstream_features },
+    { id: "next_feature", items: data.next_feature ? [data.next_feature] : [], next: data.next_feature?.command ?? null },
+    { id: "widened", items: data.widened },
+    { id: "forecast", items: data.forecast },
+    { id: "threshold", items: [data.threshold], next: data.threshold.over ? data.next_step : null },
+  ]);
+  return {
+    action: "quick-check",
+    ok: true,
+    feature: data.feature,
+    dir: data.dir,
+    over: data.threshold.over,
+    handoff: data.handoff,
+    change_file: data.change_file,
+    changeset: data.changeset,
+    next_step: data.next_step,
+    sections,
+  };
+}
+
+/**
+ * Ordered section registry for `impact report` and `impact persist` (ADR-0071).
+ * @type {readonly SectionSpec[]}
+ */
+export const SECTION_ORDER = [
+  { id: "scope", label: "Scope" },
+  { id: "scope_files", label: "Scenario files in scope" },
+  { id: "excluded", label: "Excluded scenario files" },
+  { id: "judgements", label: "Judgements" },
+  { id: "overreaches", label: "Overreaches" },
+  { id: "carried", label: "Carried open Stales" },
+  { id: "dismissed", label: "Dismissed findings" },
+  { id: "scan_counts", label: "Scan summary" },
+  { id: "scans", label: "Mechanical scans" },
+  { id: "oldest_mirror", label: "Oldest mirrored values" },
+  { id: "failed_units", label: "Failed units" },
+  { id: "run_health", label: "Run health" },
+  { id: "watermarks", label: "Watermarks" },
+  { id: "missing", label: "Missing Test Cases" },
+  { id: "merge_rules", label: "Merge rules" },
+];
+
+/** @type {readonly string[]} */
+export const REPORT_ALLOWED_OUTSIDE = [
+  "mode", "migration", "ok", "target", "delegates", "changeset", "glossary",
+];
+
+/** @type {readonly string[]} */
+export const PERSIST_ALLOWED_OUTSIDE = [
+  ...REPORT_ALLOWED_OUTSIDE, "walk", "card_page",
+];
+
 // The report of `impact report` and `impact persist`. `m` is what `report` in lib/impact.mjs gathers,
 // `s` gives `.qa/`'s summaries, `adapter` is the stack's (lib/stack.mjs), or null.
 /**
@@ -767,16 +870,16 @@ export function reportData(report, summaryOf, adapter = null) {
   });
 
   glossary.add("Verdict");
-  const judgements = { count: report.judgements.length, markdown: table(["Case", "File", "Verdict", "Rules", "Why", "The case says", "The other side says"], report.judgements.map((judgement) => [testCase(judgement.key), `\`${judgement.file}\``, judgement.verdict, judgement.rules.map((key) => findingLabel(key, summaryOf)), judgement.why, judgement.quote_case, judgement.quote_other])) };
+  const judgementsMarkdown = table(["Case", "File", "Verdict", "Rules", "Why", "The case says", "The other side says"], report.judgements.map((judgement) => [testCase(judgement.key), `\`${judgement.file}\``, judgement.verdict, judgement.rules.map((key) => findingLabel(key, summaryOf)), judgement.why, judgement.quote_case, judgement.quote_other]));
   for (const judgement of report.judgements) glossary.add(judgement.verdict);
 
   // The Overreaches the judge raised (ADR-0039): a Test Case that checks behaviour a Boundary
   // hands elsewhere, or a Rule that states it. They are Findings of their own, beside the verdicts.
   if (report.overreaches.length) glossary.add("Overreach");
-  const overreaches = { count: report.overreaches.length, markdown: table(["Subject", "File", "Boundary", "The subject says", "The Boundary says", "What crosses"], report.overreaches.map((overreach) => [findingLabel(overreach.subject, summaryOf), `\`${overreach.file}\``, labelOf(summaryOf, overreach.boundary), overreach.subject_quote, overreach.boundary_quote, overreach.crossing])) };
+  const overreachesMarkdown = table(["Subject", "File", "Boundary", "The subject says", "The Boundary says", "What crosses"], report.overreaches.map((overreach) => [findingLabel(overreach.subject, summaryOf), `\`${overreach.file}\``, labelOf(summaryOf, overreach.boundary), overreach.subject_quote, overreach.boundary_quote, overreach.crossing]));
 
   if (report.carried.length) glossary.add("Stale");
-  const carried = { count: report.carried.length, markdown: table(["Case", "File", "Carried from", "Why", "Evidence"], report.carried.map((carriedFinding) => [testCase(carriedFinding.key), `\`${carriedFinding.file}\``, `${carriedFinding.at_commit === null ? "no recorded commit" : `\`${carriedFinding.at_commit.slice(0, 12)}\``}${carriedFinding.at_commit_resolves === false ? " (does not resolve)" : ""}`, BECAUSE[carriedFinding.because], evidenceText(carriedFinding.evidence, summaryOf)])) };
+  const carriedMarkdown = table(["Case", "File", "Carried from", "Why", "Evidence"], report.carried.map((carriedFinding) => [testCase(carriedFinding.key), `\`${carriedFinding.file}\``, `${carriedFinding.at_commit === null ? "no recorded commit" : `\`${carriedFinding.at_commit.slice(0, 12)}\``}${carriedFinding.at_commit_resolves === false ? " (does not resolve)" : ""}`, BECAUSE[carriedFinding.because], evidenceText(carriedFinding.evidence, summaryOf)]));
 
   glossary.add("Dismissal", "Scan");
   const scanResults = report.scans;
@@ -791,11 +894,15 @@ export function reportData(report, summaryOf, adapter = null) {
   add("Review overdue", scanResults.review_overdue);
   for (const entry of scanItems) glossary.add(entry.kind);
   if (scanResults.oldest_mirror.length) glossary.add("Mirrored value");
-  const scans = {
-    counts: { divergences: scanResults.divergences.length, integrity_errors: scanResults.integrity_errors.length, outcome_gaps: scanResults.outcome_gaps.length, overreaches: scanResults.overreaches.length, review_overdue: scanResults.review_overdue.length, link_proposals: scanResults.link_proposals },
-    items: scanItems,
-    oldest_mirror: scanResults.oldest_mirror.map((mirror) => ({ feature: feature(mirror.feature), at: mirror.at, age_days: mirror.age_days, case: labelOf(summaryOf, mirror.key), file: mirror.file })),
+  const scanCounts = {
+    divergences: scanResults.divergences.length,
+    integrity_errors: scanResults.integrity_errors.length,
+    outcome_gaps: scanResults.outcome_gaps.length,
+    overreaches: scanResults.overreaches.length,
+    review_overdue: scanResults.review_overdue.length,
+    link_proposals: scanResults.link_proposals,
   };
+  const oldestMirror = scanResults.oldest_mirror.map((mirror) => ({ feature: feature(mirror.feature), at: mirror.at, age_days: mirror.age_days, case: labelOf(summaryOf, mirror.key), file: mirror.file }));
 
   const health = report.run_health;
   const dispatch = health.dispatch;
@@ -806,29 +913,56 @@ export function reportData(report, summaryOf, adapter = null) {
     const problems = [...new Set(failedUnit.problems.map((problem) => PROBLEMS[problem.code](problem, summaryOf)))];
     return { scenario: failedUnit.scenario ? scenario(failedUnit.scenario) : "", file: failedUnit.file, reason: { ...reason(FAILED, /** @type {string} */ (code), /** @type {FailedUnit} */ (failedUnit)), ...(problems.length && { problems }) } };
   });
-  const run_health = {
-    files: health.files, cases: health.cases,
+  /** @type {ImpactRunHealth} */
+  const runHealthItem = {
+    files: health.files,
+    cases: health.cases,
     ...(health.features.length > 1 && { features: health.features.map((featureEntry) => ({ ...featureEntry, feature: feature(featureEntry.feature) })) }),
     dispatch: dispatch && { run: dispatch.run, calls: dispatch.calls, announcements: dispatch.announcements, retried: dispatch.retried.map((entry) => ({ scenario: entry.scenario ? scenario(entry.scenario) : "", attempts: entry.attempts })), breaker_trips: dispatch.breaker_trips.map((entry) => ({ delegate: entry.delegate, because: TRIPPED[entry.reason] })), fallbacks: dispatch.fallbacks.map((entry) => ({ from: entry.from, to: entry.to, because: TRIPPED[entry.reason] })), stopped: dispatch.stopped ? { code: dispatch.stopped, line: STOPPED[dispatch.stopped] } : null },
-    failed_units: { count: failed.length, markdown: table(["Scenario", "File", "Why"], failed.map((failedUnit) => [failedUnit.scenario, `\`${failedUnit.file}\``, [failedUnit.reason.line, ...(failedUnit.reason.problems ?? []).map((problem) => `its reply ${problem}`)].join("; ")])), items: failed },
     unknown_keys: health.unknown_keys,
     rerun: health.rerun,
     notes: health.notes.map((note) => { if (note.code === "conflict_side_unknown") glossary.add("Conflict"); return { code: note.code, line: NOTES[note.code](note, summaryOf, adapter) }; }),
   };
-  /** @type {ImpactReportDraft} */
-  const out = {
-    target: report.target,
-    delegates: report.delegate?.ran ?? null,
-    scope: { features, markdown: table(["Feature", "Scenario", "File", "Status", "Test Cases"], files), excluded },
-    judgements, overreaches, carried, dismissed: report.dismissed, scans, run_health,
-  };
+
+  /** @type {ImpactWatermarkEntry[]} */
+  let watermarks = [];
+  /** @type {ImpactMissingCase[]} */
+  let missing = [];
   if (report.persisted) {
     glossary.add("Watermark");
-    out.watermarks = report.persisted.features.map((featureEntry) => ({ feature: feature(featureEntry.feature), ...(featureEntry.watermark.advanced ? { advanced: true, to: featureEntry.watermark.to } : { advanced: false, ...(featureEntry.watermark.from && { stays: featureEntry.watermark.from }), why: reason(HELD, /** @type {string} */ (featureEntry.watermark.reason)) }), blocked: featureEntry.blocked.map((error) => ({ file: error.file, line: error.line ?? null })) }));
-    out.missing = report.persisted.missing.map((entry) => ({ case: testCase(entry.key), scenario: scenario(entry.scenario) }));
+    watermarks = report.persisted.features.map((featureEntry) => ({ feature: feature(featureEntry.feature), ...(featureEntry.watermark.advanced ? { advanced: true, to: featureEntry.watermark.to } : { advanced: false, ...(featureEntry.watermark.from && { stays: featureEntry.watermark.from }), why: reason(HELD, /** @type {string} */ (featureEntry.watermark.reason)) }), blocked: featureEntry.blocked.map((error) => ({ file: error.file, line: error.line ?? null })) }));
+    missing = report.persisted.missing.map((entry) => ({ case: testCase(entry.key), scenario: scenario(entry.scenario) }));
   }
   if (report.merge_rules.length) for (const rule of report.merge_rules) glossary.add(rule === "watermark" ? "Watermark" : rule === "findings" ? "Finding" : "Review");
-  return { ...out, merge_rules: mergeRules(report.merge_rules), changeset: report.changeset, glossary: glossary.pieces() };
+
+  const hasDismissed = report.dismissed.held > 0 || report.dismissed.rearmed > 0 || report.dismissed.total > 0;
+  const hasScanCounts = Object.values(scanCounts).some((count) => count > 0);
+  const sections = buildSections(SECTION_ORDER, [
+    { id: "scope", items: features },
+    { id: "scope_files", markdown: table(["Feature", "Scenario", "File", "Status", "Test Cases"], files) },
+    { id: "excluded", items: excluded },
+    { id: "judgements", markdown: judgementsMarkdown },
+    { id: "overreaches", markdown: overreachesMarkdown },
+    { id: "carried", markdown: carriedMarkdown },
+    { id: "dismissed", items: hasDismissed ? [report.dismissed] : [] },
+    { id: "scan_counts", items: hasScanCounts ? [scanCounts] : [] },
+    { id: "scans", items: scanItems },
+    { id: "oldest_mirror", items: oldestMirror },
+    { id: "failed_units", items: failed, next: health.rerun },
+    { id: "run_health", items: [runHealthItem], next: health.rerun },
+    { id: "watermarks", items: watermarks },
+    { id: "missing", items: missing },
+    { id: "merge_rules", items: mergeRules(report.merge_rules) },
+  ]);
+
+  return {
+    ok: true,
+    target: report.target,
+    delegates: report.delegate?.ran ?? null,
+    sections,
+    changeset: report.changeset,
+    glossary: glossary.pieces(),
+  };
 }
 
 // The walk's case, each field a label or a fact. It offers answers and suggests none.
@@ -900,83 +1034,64 @@ export function featureData(c, s, t) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Refusals: a code and one factual line; the model explains it and says what to do next.
-/** @type {Record<string, string>} */
-export const REFUSALS = {
-  unknown_action: "The step is missing or does not exist: the steps are plan, quick, quick-check, report, persist and escalate.",
-  dir_and_out: "`--dir` and `--out` both name the run directory; give `--dir` alone.",
-  bad_arguments: "The step takes other arguments: `plan` and `entry` at most one Feature key, every other step only the run directory (`escalate` also `--case`, `quick-check` also a Feature key and `--input <file>` or `--stdin`).",
-  persist_retired: "`/qa-impact --persist` is retired: the quick path takes a change end to end, and `/qa-design` settles the findings already on disk.",
-  review_retired: "`/qa-impact --review` is retired: `/qa-design <feature-key> --review` walks the unreviewed and Review overdue cases.",
-  target_retired: "`/qa-impact --target` is retired: the judge reads the committed knowledge at HEAD, so commit, then settle with `/qa-design`.",
-  read_only_retired: "A read-only `/qa-impact` report is retired: `/qa-next` says what is due, and `/qa-impact <feature-key>` takes a change to a Feature.",
-  quick_input: "`quick-check` reads {forecast, references, open_questions?} on stdin: the confirmed forecast, the Reference URIs the change came from, and the questions still open.",
-  needs_case: "`escalate` records the case `/qa-ask` sent to the judge: give it `--case <key>`.",
-  unknown_case: "The knowledge layer holds no Test Case with that key.",
-  bad_cap: "`--cap` takes a whole number of bytes, 0 or more.",
-  target_outside_git: "`--target` names a commit, so `.qa/` must be inside a git repository.",
-  target_unknown: "`--target` names no commit.",
-  no_feature: "The knowledge layer holds no such Feature.",
-  review_needs_persist: "`--review` adds unreviewed and Review overdue Test Cases to the triage walk, which only a persisted run has.",
-  review_unknown: "`--review` names a Feature the knowledge layer does not hold.",
-  not_persisted: "This run was planned without `--persist`, so it writes nothing and has no triage walk.",
-  persist_refused: "`--persist` needs the committed knowledge it pins to: `.qa/` holds uncommitted knowledge, the repository has no commits, or `.qa/` is outside git.",
-  forecast_missing: "`--persist` needs the engineer's confirmed forecast of each Rule whose statement changed since the Watermark, and the run dir holds none for the statement these Rules have now: confirm it again through `deep-dive reconcile` or `impact quick-check` with the same `--dir`, then plan again.",
-  not_human: "The name for the stamps is not a person's name as a stamp carries it: `human:<name>`, with no space, double quote or backslash.",
-  name_differs: "This Run's stamps carry another name, given when its walk began.",
-  needs_stdin: "This step needs its Reply or JSON decisions from --input <file> or stdin.",
-  bad_answer: "A finding's answer is not dismiss, keep, fix or holds.",
-  holds_not_stale: "Holds settles a Stale: it says the case is still right after the change that made it Stale.",
-  field_not_allowed: "Only a dismiss takes a reason or a ticket.",
-  bad_review: "The review answer is not accept, leave, reject or retire.",
-  reject_keyed: "Reject is offered only for a case with no Tracker key; a case with one is retired.",
-  retire_unkeyed: "Retire is offered only for a case with a Tracker key; a case without one is rejected.",
-  retire_with_finding: "Retire removes the case with its findings, so no finding is answered with it.",
-  reject_with_finding: "Reject removes the case with its findings, so no finding is answered with it.",
-  unaddressed: "The decisions leave findings or the review open.",
-  no_name: "No name is stored for this Run's stamps.",
-  no_case: "No case is waiting for a decision.",
-  case_not_in_walk: "The case is not in this Run's walk.",
-  case_mismatch: "The shown case is not the case the decisions were meant for.",
-  already_settled: "The case is already settled in this Run.",
-  case_gone: "The case is no longer in the knowledge layer.",
-  walk_unfinished: "The walk still has cases to settle, so checkpoint 2 has not been reached.",
-  case_changed: "The case's findings changed since the walk showed them.",
-  uncommitted_holds: "What the Stale rests on has uncommitted changes, so a holds pinned to HEAD would name text that is not in history.",
-  uncommitted_review: "The case has uncommitted changes, and a Review is pinned to HEAD.",
-  uncommitted_dismissal: "What the finding rests on has uncommitted changes, so a Dismissal pinned to HEAD would lapse at once.",
-  level_rewrite_failed: "A version of the knowledge layer could not be read at the current schema, so whether the finding changed cannot be judged.",
-  not_fixed: "The finding is answered fix, but nothing it rests on differs from HEAD.",
-  not_fixed_scan: "The finding is answered fix, but the Scan still reports it.",
-  no_longer_reported: "The Scan no longer reports the finding: the edit fixed it, so it can be answered fix only.",
-  no_head: "The repository has no commit to pin a stamp to.",
-  check_file: "The write would not pass its check, so nothing was written.",
-  no_block: "The case has no block of fields to hold its findings or its review.",
-  no_feature_file: "The Feature file is not in the knowledge layer to keep the Retired key.",
-};
+// Refusals: a code and the facts behind it; the skill words the sentence.
 
-// A changed file in a `persist_refused` line, by what happened to it.
-/** @type {Record<PersistChange["change"], string>} */
-const PERSIST_CHANGE = { added: "is not committed", deleted: "is deleted", modified: "is modified" };
+// Every refusal code this module can print, for the coverage test that drives each one.
+/** @type {readonly string[]} */
+export const REFUSAL_CODES = [
+  "unknown_action",
+  "dir_and_out",
+  "bad_arguments",
+  "persist_retired",
+  "review_retired",
+  "target_retired",
+  "read_only_retired",
+  "quick_input",
+  "needs_case",
+  "unknown_case",
+  "bad_cap",
+  "target_outside_git",
+  "target_unknown",
+  "no_feature",
+  "review_needs_persist",
+  "review_unknown",
+  "not_persisted",
+  "persist_refused",
+  "forecast_missing",
+  "not_human",
+  "name_differs",
+  "needs_stdin",
+  "bad_answer",
+  "holds_not_stale",
+  "field_not_allowed",
+  "bad_review",
+  "reject_keyed",
+  "retire_unkeyed",
+  "retire_with_finding",
+  "reject_with_finding",
+  "unaddressed",
+  "no_name",
+  "no_case",
+  "case_not_in_walk",
+  "case_mismatch",
+  "already_settled",
+  "case_gone",
+  "walk_unfinished",
+  "case_changed",
+  "uncommitted_holds",
+  "uncommitted_review",
+  "uncommitted_dismissal",
+  "level_rewrite_failed",
+  "not_fixed",
+  "not_fixed_scan",
+  "no_longer_reported",
+  "no_head",
+  "check_file",
+  "no_block",
+  "no_feature_file",
+];
 
-// The `persist_refused` line names the one reason the dirty check gave, never all three: `dirty`
-// lists the files that differ from HEAD, the other two name the missing commit or repository.
-/**
- * @param {string | undefined} reason
- * @param {unknown} changed
- * @returns {string}
- */
-function persistRefusedLine(reason, changed) {
-  if (reason === "no_commits") return "`--persist` needs a commit to pin to: the repository has no commits.";
-  if (reason === "not_a_repository") return "`--persist` needs `.qa/` inside a git repository, and it is not.";
-  const files = (Array.isArray(changed) ? changed : []).filter((x) => object(x)).map((x) => {
-    const c = /** @type {PersistChange} */ (x);
-    return `\`${c.file}\` ${PERSIST_CHANGE[c.change]}`;
-  });
-  const dirty = "`--persist` needs the working tree's knowledge to equal HEAD's";
-  return files.length ? `${dirty}: ${files.join(", ")}.` : `${dirty}: \`.qa/\` holds uncommitted knowledge.`;
-}
-export const { fact, refuse, refusalOf } = refusalsFor(REFUSALS, (code, data) => (code === "persist_refused" ? { ...data, line: persistRefusedLine(typeof data.reason === "string" ? data.reason : undefined, data.changed) } : data));
+export const { fact, refuse, refusalOf } = refusalsWithoutLines();
 
 // ---------------------------------------------------------------------------------------------
 // The decisions on one walk case, JSON on stdin:
@@ -999,13 +1114,16 @@ export function decisionsOf(text, shown) {
   const { input } = parsed;
   if (!object(input) || Object.keys(input).some((k) => !["findings", "review"].includes(k)) || (input.findings !== undefined && !Array.isArray(input.findings)) || (input.review !== undefined && typeof input.review !== "string")
     || (input.findings ?? []).some((g) => !object(g) || Object.keys(g).some((k) => !["n", "answer", "reason", "ticket"].includes(k)))) return { errors: [{ code: "invalid_decisions" }] };
+  /** @type {Array<{ code: string, item?: unknown, [key: string]: unknown }>} */
+  const idErrors = validateEdits(shown.findings.map((f, i) => ({ n: i + 1, ...f })), (input.findings ?? []).map((g) => g.n), [], {}, { badValue: () => null });
+  const unknown = new Set(idErrors.filter((e) => e.code === "unknown_item").map((e) => e.item));
   /** @type {Array<{ code: string, [key: string]: unknown }>} */
   const errors = [];
   /** @type {Map<number, { n: number, answer: string, reason?: string, ticket?: string }>} */
   const answered = new Map();
   for (const g of input.findings ?? []) {
     const n = g.n;
-    if (!Number.isSafeInteger(n) || n < 1 || n > shown.findings.length) { errors.push({ code: "unknown_item", item: n }); continue; }
+    if (unknown.has(n)) { errors.push({ code: "unknown_item", item: n }); continue; }
     if (answered.has(n)) { errors.push({ code: "duplicate_decision", item: n }); continue; }
     if (!FINDING_ANSWERS.includes(g.answer)) errors.push({ code: "bad_answer", item: n });
     else if (g.answer === "holds" && /** @type {{ kind?: string }} */ (shown.findings[n - 1]).kind !== "Stale") errors.push({ code: "holds_not_stale", item: n });
@@ -1020,10 +1138,10 @@ export function decisionsOf(text, shown) {
   const review = input.review;
   if (review !== undefined && !REVIEW_ANSWERS.includes(review)) errors.push({ code: "bad_review" });
   else if (review === "reject") {
-    if (!shown.reject) errors.push({ code: "reject_keyed" });
+    if (!shown.reject) errors.push({ code: "reject_keyed", alternative: "retire" });
     else if (answered.size) errors.push({ code: "reject_with_finding", items: [...answered.keys()] });
   } else if (review === "retire") {
-    if (!shown.retire) errors.push({ code: "retire_unkeyed" });
+    if (!shown.retire) errors.push({ code: "retire_unkeyed", alternative: "reject" });
     else if (answered.size) errors.push({ code: "retire_with_finding", items: [...answered.keys()] });
   } else {
     const open = shown.findings.map((_, i) => i + 1).filter((n) => !answered.has(n));

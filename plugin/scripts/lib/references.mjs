@@ -11,8 +11,9 @@
 // This module parses a reference and resolves what can be resolved locally. Tracker issues and URLs
 // are the agent's to fetch; the CLI only checks their shape.
 import { statSync } from "node:fs";
-import { isAbsolute, join, posix } from "node:path";
+import { isAbsolute, join, posix, win32 } from "node:path";
 import { isTracked } from "./git.mjs";
+import { isSafeRelativePath, within } from "./paths.mjs";
 
 const KINDS = ["tracker", "file", "code", "url", "human"];
 
@@ -143,9 +144,8 @@ function isWebUrl(s) {
  */
 function pathError(p) {
   if (!p) return "a file Reference needs a repo-relative path";
-  if (isAbsolute(p) || p.startsWith("/")) return `\`${p}\` is absolute; a Reference path is repo-relative`;
-  const n = posix.normalize(p);
-  if (n === ".." || n.startsWith("../")) return `\`${p}\` leaves the repository`;
+  if (isAbsolute(p) || p.startsWith("/") || win32.isAbsolute(p) || /^[A-Za-z]:/.test(p)) return `\`${p}\` is absolute; a Reference path is repo-relative`;
+  if (!isSafeRelativePath(p)) return `\`${p}\` leaves the repository`;
   return null;
 }
 
@@ -172,6 +172,6 @@ function underAny(p, roots) {
   const n = posix.normalize(p);
   return roots.some((r) => {
     const root = posix.normalize(r).replace(/\/$/, "");
-    return n === root || n.startsWith(`${root}/`);
+    return root === "." ? n === "." : within(n, root);
   });
 }

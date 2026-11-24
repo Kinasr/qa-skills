@@ -2,15 +2,17 @@
 // Card data and compact Markdown for the parts whose size grows with the repository.
 /**
  * @import { AttachCandidate } from "./sync-attach.mjs"
+ * @import { DecisionError } from "./refusal.mjs"
  * @import { TrackerCaseItem, TrackerScenarioItem, TrackerState, TrackerSuiteItem } from "./sync-tracker.mjs"
  */
-import { validateEdits } from "./decisions.mjs";
-import { refusalsFor, object, parseDecisions } from "./refusal.mjs";
+import { readDecisions, refusalsWithoutLines } from "./refusal.mjs";
 import { table } from "./markdown.mjs";
 import { glossaryOf, keyLabel, summaries } from "./labels.mjs";
 import { prefixRule } from "./keys.mjs";
 import { attachableFeatures } from "./sync-attach.mjs";
 import { accessNoteNamed } from "./access.mjs";
+import { buildSections } from "./report-sections.mjs";
+/** @import { ReportSection, SectionInput, SectionSpec } from "./report-sections.mjs" */
 
 /**
  * An Automation a card item names: the function a Key is bound to, or a choice among duplicates.
@@ -137,6 +139,7 @@ import { accessNoteNamed } from "./access.mjs";
  *   items: number[],
  *   skipped?: Array<{ function?: SyncAutomation, functions?: SyncAutomation[], message: string, [key: string]: unknown }>,
  *   canceled?: boolean | number,
+ *   canceled_keys?: string[],
  *   unsummarised_keys?: string[],
  *   [key: string]: unknown,
  * }} SyncCardSection
@@ -175,20 +178,91 @@ import { accessNoteNamed } from "./access.mjs";
  */
 
 /**
- * The sync card as `sync card` prints it.
+ * Ordered section registry for `sync card`: every outcome the skill words for the engineer, in the
+ * Card's reading order. The run header and the shared lookup maps stay outside `sections`.
+ * @type {readonly SectionSpec[]}
+ */
+export const CARD_SECTION_ORDER = [
+  { id: "counts", label: "Summary" },
+  { id: "declaration", label: "Key carrier declaration" },
+  { id: "refresh", label: "Mirror refresh" },
+  { id: "attach", label: "Attach" },
+  { id: "intake", label: "Tracker intake" },
+  { id: "tracker_skipped", label: "Tracker cases not intaken" },
+  { id: "unlanded", label: "Unlanded cases and Suites" },
+  { id: "prefix", label: "Key prefixes" },
+  { id: "code", label: "Code repairs" },
+  { id: "skipped", label: "Skipped repairs" },
+  { id: "merge", label: "Merge" },
+  { id: "notes", label: "Notes" },
+  { id: "divergences", label: "Divergences" },
+];
+
+/**
+ * A tracker case or Scenario the Card leaves out of intake, with why.
+ * @typedef {{ key: string, label: string | null, reason: "canceled" | "no summary" }} SyncNotIntaken
+ */
+
+/**
+ * The sync card as `sync card` prints it: the run header and the shared lookup maps the items
+ * reference stay outside its ordered, labelled sections.
  * @typedef {{
- *   counts: { changes: number, questions: number },
  *   feature?: string | null,
- *   sections: SyncCardSection[],
- *   items: SyncCardItemOut[],
+ *   sections: ReportSection[],
  *   choices: Record<string, string | string[]>,
  *   fields: Record<string, string>,
  *   labels: Record<string, string>,
  *   glossary: Array<{ term: string, explanation: string }>,
- *   notes: SyncNote[],
- *   divergences: SyncDivergence[],
  * }} SyncCardData
  */
+
+/**
+ * Ordered section registry for `sync apply`'s report: the applied outcomes and, before a write,
+ * the cascade the engineer confirms.
+ * @type {readonly SectionSpec[]}
+ */
+export const APPLY_SECTION_ORDER = [
+  { id: "minted", label: "Minted Automation keys" },
+  { id: "cross_feature", label: "Cross-feature links" },
+  { id: "intaken", label: "Tracker intake" },
+  { id: "warnings", label: "Warnings" },
+  { id: "files", label: "Files written" },
+  { id: "notes", label: "Notes" },
+  { id: "cascade", label: "Cascaded drops" },
+  { id: "removed", label: "Removed answers" },
+];
+
+/**
+ * The outcomes `sync apply`'s report carries, before they are labelled: absent ones get no section.
+ * @typedef {{
+ *   minted?: readonly unknown[],
+ *   cross_feature?: readonly unknown[],
+ *   intaken?: readonly unknown[],
+ *   warnings?: readonly unknown[],
+ *   files?: readonly string[],
+ *   notes?: readonly unknown[],
+ *   cascade?: readonly unknown[],
+ *   removed?: readonly unknown[],
+ * }} SyncApplySections
+ */
+
+/**
+ * Build `sync apply`'s ordered, labelled report sections from the outcomes it has.
+ * @param {SyncApplySections} outcomes
+ * @returns {ReportSection[]}
+ */
+export function applySections(outcomes) {
+  return buildSections(APPLY_SECTION_ORDER, [
+    { id: "minted", items: outcomes.minted ?? [] },
+    { id: "cross_feature", items: outcomes.cross_feature ?? [] },
+    { id: "intaken", items: outcomes.intaken ?? [] },
+    { id: "warnings", items: outcomes.warnings ?? [] },
+    { id: "files", items: outcomes.files ?? [] },
+    { id: "notes", items: outcomes.notes ?? [] },
+    { id: "cascade", items: outcomes.cascade ?? [] },
+    { id: "removed", items: outcomes.removed ?? [] },
+  ]);
+}
 
 /**
  * The context `cardData` reads: the scan index, the tracker, the stack adapter and the project settings.
@@ -246,6 +320,8 @@ export function cardData(ctx, card) {
   };
   /** @param {SyncAutomation} f @returns {string} */
   const automation = (f) => `\`${f.name}\` (\`${f.file}:${f.line}\`)`;
+  /** @type {Map<string, SyncCardItemOut[]>} */
+  const itemsBySection = new Map();
   const items = card.items.map((item) => {
     const out = /** @type {SyncCardItemOut} */ ({ n: /** @type {number | string} */ (item.n), code: item.code });
     if (item.key) out.label = label(item.key, item.code === "unlanded_suite" ? "suite" : item.kind === "suite" ? "feature" : item.kind === "scenario" || item.code.endsWith("_scenario") ? "scenario" : "case", item.summary ?? item.functions?.map((f) => f.name).join(", ") ?? item.function?.name);
@@ -329,6 +405,9 @@ export function cardData(ctx, card) {
       if (["mint_and_bind", "rebind"].includes(item.code)) term("Unkeyed test");
       if (item.code === "link_unclaimed" || item.bind?.length === 0) term("Unclaimed Automation");
     }
+    const section = item.section ?? "";
+    if (!itemsBySection.has(section)) itemsBySection.set(section, []);
+    /** @type {SyncCardItemOut[]} */ (itemsBySection.get(section)).push(out);
     return out;
   });
   const notes = card.notes.map((n) => {
@@ -337,21 +416,39 @@ export function cardData(ctx, card) {
     if (access) { term("Access note"); out.access = access; } else delete out.access_note;
     return out;
   });
-  const sections = card.sections.filter((s) => s.items.length || s.skipped?.length || s.canceled || s.unsummarised_keys?.length).map(({ key, title, items, skipped, canceled, unsummarised_keys }) => ({ key, title, items, ...(canceled && { canceled }), ...(unsummarised_keys?.length && { unsummarised: unsummarised_keys }), ...(skipped?.length && { markdown: table(["Automation", "Reason"], skipped.map((s) => [s.function ? automation(s.function) : /** @type {NonNullable<typeof s.functions>} */ (s.functions).map(automation), s.message])) }) }));
   const divergences = card.divergences.map(({ message, ...d }) => {
     term("Divergence");
     if (d.code.startsWith("unlanded_")) { term(d.kind === "suite" ? "Unlanded Suite" : "Unlanded case"); term("Retired key"); }
     return { ...d, label: label(d.key, d.kind === "suite" ? "suite" : d.kind === "scenario" || d.code === "tracker_scenario_vanished" ? "scenario" : "case"), ...(d.knowledge && { knowledge: label(d.knowledge, "scenario"), mirror: label(d.mirror, "scenario") }) };
   });
+  // Every skipped repair and every tracker case the intake leaves out is an outcome the skill
+  // words, so each gets a section of its own; the intake section keeps only its items.
+  /** @type {SyncNotIntaken[]} */
+  const notIntaken = [];
+  for (const s of card.sections) {
+    for (const key of s.canceled_keys ?? []) notIntaken.push({ key, label: label(key, trackerKind(ctx, key)), reason: "canceled" });
+    for (const key of s.unsummarised_keys ?? []) notIntaken.push({ key, label: label(key, trackerKind(ctx, key)), reason: "no summary" });
+  }
+  const skipped = card.sections.flatMap((s) => s.skipped ?? []);
+  const cardCounts = { changes: items.length, questions: items.filter((i) => i.needs.length).length };
+  /** @type {SectionInput[]} */
+  const sectionInputs = CARD_SECTION_ORDER.map(({ id }) => ({
+    id,
+    items: id === "counts" ? (cardCounts.changes > 0 || cardCounts.questions > 0 ? [cardCounts] : [])
+      : id === "notes" ? notes
+      : id === "divergences" ? divergences
+      : id === "tracker_skipped" ? notIntaken
+      : id === "skipped" ? skipped
+      : itemsBySection.get(id) ?? [],
+  }));
   const unlanded = items.some((i) => ["unlanded_case", "unlanded_suite"].includes(i.code));
   if (unlanded) {
     for (const key of ctx.index.features.keys()) label(key, "feature");
     for (const key of ctx.index.scenarios.keys()) label(key, "scenario");
   }
   return {
-    counts: { changes: items.length, questions: items.filter((i) => i.needs.length).length },
     ...(ctx.feature && { feature: label(ctx.feature, "feature") }),
-    sections, items,
+    sections: buildSections(CARD_SECTION_ORDER, sectionInputs),
     choices: {
       level: [...ctx.config.levels], roles: [...ctx.config.roles],
       ...(items.some((i) => i.code === "unlanded_case") && { resolution: ["intake", "retired_by_hand", "dismiss"] }),
@@ -361,77 +458,19 @@ export function cardData(ctx, card) {
     },
     fields: Object.fromEntries([...new Set(items.flatMap((i) => i.edits))].map((f) => [f, FIELD_LABELS[f] ?? f])),
     labels, glossary: glossaryOf(terms),
-    notes, divergences,
   };
 }
 
-// Stable refusal codes carry facts; the model supplies the explanation and next step.
-export const REFUSALS = {
-  duplicate_key: "A Key names two things: settle their bodies by hand, never by Merge.",
-  merge_selected: "The Merge choice is recorded: show the rebuilt Card before accepting its result.",
-  merge_identity: "Merge needs two distinct minted Keys, each declared once.",
-  merge_cross_feature: "Merge applies only within one Feature.",
-  merge_disposition: "Choose keep or retire for the loser's distinct tracker item.",
-  merge_survivor: "Choose a survivor from the two entries on the Card.",
-  merge_out_of_scope: "The Merge pair is outside the run's Feature.",
-  merge_pending_edit: "Another accepted item edits a Merge participant: apply these items in separate runs.",
-  unknown_action: "The requested sync action is unavailable.",
-  apply_takes_no_feature: "Apply uses the Feature recorded in the run dir.",
-  too_many_features: "The action accepts at most one Feature key.",
-  apply_needs_stdin: "Apply needs JSON decisions from --input <file> or stdin.",
-  no_feature: "The knowledge layer holds no such Feature.",
-  run_scoped_elsewhere: "The requested Feature differs from the run's scope.",
-  edit_dropped: "A dropped item also has an answer.",
-  edit_field: "The item does not accept that field.",
-  unaddressed: "The Reply leaves items open.",
-  no_card: "No Card is recorded in the run dir.",
-  card_changed: "The files or tracker payload changed since the Card was shown.",
-  write_failed: "The write failed and was rolled back.",
-  needs_edit: "An accepted item's question is unanswered.",
-  bad_resolution: "An Unlanded case needs Tracker intake, retired by hand or a Dismissal; an Unlanded Suite needs Attach, retired by hand or a Dismissal.",
-  intake_summary_missing: "The tracker case has no summary to transcribe; fetch it again after a person supplies one.",
-  retired_intake_scenario: "The destination scenario key is Retired and cannot be taken in again.",
-  not_human: "A Dismissal needs the person's name as human:<name>.",
-  no_head: "HEAD does not resolve to a commit to pin the Dismissal to.",
-  undecided: "The Automation that keeps the key is undecided.",
-  key_collision: "Two accepted items bring in the same Key.",
-  tracker_key_collision: "The move's current Tracker key is already claimed or retired.",
-  prose_not_fetched: "A Test Case's prose has not been fetched.",
-  unwritable: "A tracker value cannot be written to the knowledge layer.",
-  bad_path: "The declaration path is unavailable or outside the repository.",
-  bad_package: "The declaration package is invalid.",
-  bad_keep: "The keeper is not an Automation choice on this Card.",
-  bad_prefix: "A Key prefix does not fit the project's recipe.",
-  unknown_case: "A linked Test Case does not exist.",
-  attach_named: "The named Tracker keys are recorded in the run: fetch them, then build the Card again.",
-  attach_unknown_entry: "No Test Case or Test Scenario of that Key is declared once in scope.",
-  attach_bad_key: "The named key is not a Tracker key of this project.",
-  attach_owned: "Another entry already holds the Tracker key, as current, alias or tombstone.",
-  attach_not_fetched: "The Tracker key has not been fetched.",
-  attach_not_found: "The tracker no longer holds the Tracker key.",
-  attach_kind: "The tracker item is not the same kind as the entry.",
-  attach_mark: "The tracker item's mark names another Key.",
-  attach_not_candidate: "The Tracker key is not one of the Card's candidates.",
-  attach_suite_recorded: "The Feature already records a Test Suite in mirror.suite; correcting it is not supported.",
-  attach_suite_key_missing: "The Feature has no Suite key to remark the Test Suite with: run migrate-keys first.",
-  bad_level: "The level is not configured for the project.",
-  bad_roles: "A Role is not configured for the project.",
-  mint: "An Automation key could not be minted.",
-  annotation: "The Key carrier could not be written to its intended Automation.",
-  exists: "The Tracker intake destination already exists.",
-  render: "A knowledge value could not be rendered.",
-  no_block: "The Test Case has no block to edit.",
-  no_entry: "The knowledge entry does not exist.",
-  ambiguous: "The knowledge entry is declared more than once.",
-  check_file: "A proposed knowledge file fails validation.",
-  no_declaration: "The written Key carrier has no declaration or import.",
-};
-export const { fact, refuse, refusalOf } = refusalsFor(REFUSALS);
-
 /**
- * A problem with the decisions, as the sections report it.
- * @typedef {{ code: string, field?: string, [key: string]: unknown }} SyncDecisionError
+ * Whether a tracker key names a Test Scenario rather than a Test Case.
+ * @param {SyncCardContext} ctx
+ * @param {string} key
+ * @returns {"case" | "scenario"}
  */
+const trackerKind = (ctx, key) => (ctx.tracker.scenarios?.has(key) || ctx.tracker.markedScenarios?.has(key) ? "scenario" : "case");
+
+// A sync refusal carries no line: a code and the facts the model words. `/qa-sync` says how.
+export const { fact, refuse, refusalOf } = refusalsWithoutLines();
 
 /**
  * The decisions read from the agent's JSON, checked against the items the card showed.
@@ -443,28 +482,33 @@ export const { fact, refuse, refusalOf } = refusalsFor(REFUSALS);
  *   confirm: number[],
  *   name: Record<string, string>,
  *   merge: Record<string, string>,
- *   errors: SyncDecisionError[],
+ *   errors: DecisionError[],
  * }} SyncDecisions
  */
+
+/** The keys `sync apply` accepts: the lists of item ids, the string maps, and the per-item edits. */
+const DECISIONS = { keys: ["take", "drop", "edits", "confirm", "name", "merge"], lists: ["take", "drop", "confirm"], maps: ["name", "merge"], drop: "drop", edits: "edits", confirm: "confirm", all: "take" };
+
+/**
+ * Whether an edited value has the JSON type its field takes.
+ * @param {SyncCardItem} item
+ * @param {string} field
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+const badValue = (item, field, value) =>
+  !( ["bind", "roles"].includes(field) ? Array.isArray(value) && value.every((key) => typeof key === "string") : field === "level" ? value === null || typeof value === "string" || (Array.isArray(value) && value.every((level) => typeof level === "string")) : field === "keep" ? Number.isSafeInteger(value) : typeof value === "string");
 
 /**
  * @param {string} text
  * @param {SyncCardItem[]} items
- * @returns {SyncDecisions | { errors: SyncDecisionError[] }}
+ * @returns {SyncDecisions}
  */
 export function decisionsOf(text, items) {
-  /** @type {{ input: Record<string, unknown>, errors?: never } | { input?: never, errors: Array<{ code: string }> }} */
-  const parsed = parseDecisions(text);
-  if (parsed.errors) return parsed;
-  const { input } = parsed;
-  if (!object(input) || Object.keys(input).some((k) => !["take", "drop", "edits", "confirm", "name", "merge"].includes(k)) || (input.take !== undefined && input.take !== "all" && !Array.isArray(input.take)) || (input.drop !== undefined && !Array.isArray(input.drop)) || (input.edits !== undefined && !object(input.edits)) || (input.confirm !== undefined && !Array.isArray(input.confirm))) return { errors: [{ code: "invalid_decisions" }] };
-  if (input.name !== undefined && !(object(input.name) && Object.values(input.name).every((v) => typeof v === "string"))) return { errors: [{ code: "bad_value", field: "name" }] };
-  if (input.merge !== undefined && !(object(input.merge) && Object.values(input.merge).every((v) => typeof v === "string"))) return { errors: [{ code: "bad_value", field: "merge" }] };
-  const drop = /** @type {number[]} */ (input.drop ?? []);
-  const take = /** @type {number[]} */ (input.take === "all" ? items.filter((i) => !drop.includes(/** @type {number} */ (i.n))).map((i) => i.n) : input.take ?? []);
-  const edits = /** @type {Record<string, Record<string, unknown>>} */ (input.edits ?? {});
-  const confirm = /** @type {number[]} */ (input.confirm ?? []);
-  const errors = validateEdits(items, take, drop, edits, { confirm: /** @type {never[]} */ (confirm), badValue: (/** @type {SyncCardItem} */ item, /** @type {string} */ field, /** @type {unknown} */ value) =>
-    !( ["bind", "roles"].includes(field) ? Array.isArray(value) && value.every((key) => typeof key === "string") : field === "level" ? value === null || typeof value === "string" || (Array.isArray(value) && value.every((level) => typeof level === "string")) : field === "keep" ? Number.isSafeInteger(value) : typeof value === "string") });
-  return { input, take, drop, edits, confirm, name: /** @type {Record<string, string>} */ (input.name ?? {}), merge: /** @type {Record<string, string>} */ (input.merge ?? {}), errors };
+  const decisions = readDecisions(text, items, DECISIONS, badValue);
+  return {
+    ...decisions,
+    name: /** @type {Record<string, string>} */ (decisions.input.name ?? {}),
+    merge: /** @type {Record<string, string>} */ (decisions.input.merge ?? {}),
+  };
 }

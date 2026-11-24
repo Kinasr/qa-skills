@@ -15,9 +15,9 @@ reference says.)
 - **`ok: false`** (`no_cases`, `no_changes`): print its `error` and stop. There is nothing to learn
   from, so write nothing.
 - **Exemplar** (`source: exemplar`): the scenario is treated as the golden example of house style.
-  Read `exemplar.text` in full.
-- **Changes** (`source: diff` or `uncommitted`): each entry of `changes` is one scenario file with
-  its stripped `diff`, and each of its `cases` has its `before` and `after`. A case whose
+  Read the Exemplar Scenario section's text in full.
+- **Changes** (`source: diff` or `uncommitted`): each entry of the Scenario Changes section is one
+  scenario file with its stripped `diff`, and each of its `cases` has its `before` and `after`. A case whose
   `generated_by` names a Delegate (`delegate:…`) and was `modified` is an engineer's **fix** to a
   generated case. Fixes are the strongest evidence: each one is a literal delta between what the
   generator wrote and what the engineer wanted. Other changes are weaker evidence. Bookkeeping
@@ -66,12 +66,12 @@ and `/qa-train codegen` for an Automation's level or speed. Re-check old Convent
 flag each at the gate for revision or removal, naming its target. Every old Convention is read
 against these checks, not only the new ones, and each finding is a coherence finding for the gate.
 
-## Settling `statability` hits and `missing_anti_example` warnings
+## Settling Statability hits and `missing_anti_example` warnings
 
-`check` lists each mechanical hit on every Convention (a tracker key, status code, role name, `.qa/`
+`check` lists each mechanical hit on every Convention in its Statability Hits section (a tracker key, status code, role name, `.qa/`
 key, Rule term or endpoint path in its statement or rationale), with its `status`, and warns `missing_anti_example` when a prohibition carries no anti-example:
 
-- **`added` or `edited`**: add the missing anti-example, and treat a `statability` hit as a refusal, unless the engineer confirms it names
+- **`added` or `edited`**: add the missing anti-example, and treat a Statability hit as a refusal, unless the engineer confirms it names
   nothing in the system (for example, a length limit that reads as a status code). Then check
   again.
 - **`unchanged`**: if the gate did not already settle it, put it to the engineer as a coherence

@@ -105,7 +105,7 @@ export function splitFile(raw) {
   /** @type {MarkdownElement[]} */
   const elements = [];
   for (let i = start; i < lines.length; i++) {
-    const open = lines[i].match(/^(`{3,}|~{3,})\s*([^\s`~]*)/);
+    const open = lines[i].match(/^(`{3,}|~{3,})\s*([^\s`~]*)\s*$/);
     if (open) {
       const fence = open[1];
       const close = new RegExp(`^${fence[0] === "`" ? "`" : "~"}{${fence.length},}\\s*$`);
@@ -164,7 +164,8 @@ export function keyedHeading(text) {
  */
 export function proseLines(text) {
   const lines = text.replace(/\r\n?/g, "\n").trim().split("\n").map((l) => l.replace(/\s+$/, "").replace(/^(#|<{7}|>{7}|\|{7})/, "\\$1"));
-  const open = splitFile(lines.join("\n")).errors.some((e) => /fenced block is not closed/.test(e.message));
+  // Prefix closed dummy frontmatter so leading `---` horizontal rules in prose do not trigger frontmatter parsing.
+  const open = splitFile(`---\n---\n\n${lines.join("\n")}`).errors.some((e) => /fenced block is not closed/.test(e.message));
   return open ? lines.map((l) => l.replace(/^(`{3,}|~{3,})/, "\\$1")) : lines;
 }
 

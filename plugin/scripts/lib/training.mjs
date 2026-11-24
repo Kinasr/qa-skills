@@ -102,11 +102,49 @@ export function trainFor(source, key) {
 export const conventionsText = (source, key) => entriesText(source, key, "convention");
 
 /**
+ * Render `train`'s Conventions with each `refs` field filtered by `keepRef`, or `null` when
+ * there are no Conventions.
+ * @param {TrainFile | null} train
+ * @param {(ref: string) => boolean} keepRef
+ * @returns {string | null}
+ */
+export function cleanConventions(train, keepRef) {
+  if (!train) return null;
+  const lines = train.text.replace(/\r\n/g, "\n").split("\n");
+  const entries = /** @type {ParsedEntry[]} */ (train.conventions ?? []);
+  return entries.map((entry) => {
+    const chunk = lines.slice(entry.line - 1, entry.end);
+    const at = entry.keyLines.refs === undefined ? -1 : entry.keyLines.refs - entry.line;
+    if (at >= 0) {
+      let end = at + 1;
+      while (end < chunk.length && /^\s+-\s/.test(chunk[end])) end++;
+      const refs = Array.isArray(entry.data.refs) ? /** @type {string[]} */ (entry.data.refs.filter((r) => typeof r === "string")) : [];
+      chunk.splice(at, end - at, `refs: ${JSON.stringify(refs.filter(keepRef))}`);
+    }
+    return chunk.join("\n").replace(/\s+$/, "");
+  }).join("\n\n") || null;
+}
+
+/**
  * @param {string | Record<string, unknown>} source
  * @param {string} key
  * @returns {string | null}
  */
 export const practicesText = (source, key) => entriesText(source, key, "practice");
+
+/**
+ * Codefix training settings, with defaults when `train/codefix.md` omits them.
+ * @typedef {{ fix_attempts: number, flaky_repeats: number, pr: string }} FixTraining
+ */
+
+/**
+ * @param {TrainFile | null} file
+ * @returns {FixTraining}
+ */
+export function fixTraining(file) {
+  const data = file?.data ?? {};
+  return { fix_attempts: Number(data.fix_attempts ?? 3), flaky_repeats: Number(data.flaky_repeats ?? 5), pr: String(data.pr ?? "on-request") };
+}
 
 /**
  * @param {string | Record<string, unknown>} source

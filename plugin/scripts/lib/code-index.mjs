@@ -94,7 +94,7 @@ import { PATTERN, prefixFits } from "./keys.mjs";
  *   parse: (text: string, file: string) => {
  *     package?: string | null,
  *     classes: readonly { line: number, name: string, path: string, carriers: unknown, [key: string]: unknown }[],
- *     functions: readonly { line: number, name: string, classPath: string, carriers: unknown, [key: string]: unknown }[],
+ *     functions: readonly { line: number, name: string, classPath: string, classes?: readonly unknown[], carriers: unknown, [key: string]: unknown }[],
  *     header?: { keyPrefixes: CodeKey[], [key: string]: unknown } | null,
  *   },
  *   keys: (carriers: unknown, names: readonly string[], pattern: RegExp | PatternMatcher | null) => readonly CodeKey[],
@@ -170,13 +170,18 @@ export function indexSource(text, file, annotationMap, adapter, patterns) {
   const read = (/** @type {unknown} */ carriers, /** @type {string} */ role) => /** @type {CodeKey[]} */ ((/** @type {CodeIndexAdapter} */ (adapter)).keys(carriers, names(role), patterns[role] ?? null));
   const parsed = (/** @type {CodeIndexAdapter} */ (adapter)).parse(text, file);
   const pkg = typeof parsed.package === "string" ? parsed.package : "";
-  /** @type {Map<string, IndexedClass>} */
+  /** @type {Map<unknown, IndexedClass>} */
+  const byNode = new Map();
+  /** @type {Map<string, IndexedClass[]>} */
   const byPath = new Map();
   /** @type {IndexedClass[]} */
   const classes = [];
   for (const c of parsed.classes) {
     const cls = { file, line: c.line, name: c.name, path: c.path, trackerKeys: read(c.carriers, "tracker_key_class"), keyPrefixes: read(c.carriers, "automation_key_prefix"), disabled: (/** @type {CodeIndexAdapter} */ (adapter)).disabled(c) };
-    byPath.set(c.path, cls);
+    byNode.set(c, cls);
+    const list = byPath.get(c.path);
+    if (list) list.push(cls);
+    else byPath.set(c.path, [cls]);
     classes.push(cls);
   }
   /** @type {IndexedFunction[]} */
@@ -185,8 +190,18 @@ export function indexSource(text, file, annotationMap, adapter, patterns) {
     const automationKeys = read(f.carriers, "automation_key");
     const trackerKeys = read(f.carriers, "tracker_key_fn");
     if (!(/** @type {CodeIndexAdapter} */ (adapter)).isTest(f) && !automationKeys.length && !trackerKeys.length) continue;
-    const chain = f.classPath ? f.classPath.split(adapter.sep) : [];
-    const enclosing = /** @type {IndexedClass[]} */ (chain.map((_, i) => byPath.get(chain.slice(0, i + 1).join(adapter.sep))).filter(Boolean));
+    /** @type {IndexedClass[]} */
+    let enclosing;
+    if (Array.isArray(f.classes)) {
+      enclosing = /** @type {IndexedClass[]} */ (f.classes.map((c) => byNode.get(c)).filter(Boolean));
+    } else {
+      const chain = f.classPath ? f.classPath.split(adapter.sep) : [];
+      enclosing = /** @type {IndexedClass[]} */ (chain.map((_, i) => {
+        const candidates = byPath.get(chain.slice(0, i + 1).join(adapter.sep));
+        if (!candidates?.length) return undefined;
+        return candidates.findLast((c) => c.line <= f.line) ?? candidates[0];
+      }).filter(Boolean));
+    }
     functions.push({
       file,
       line: f.line,

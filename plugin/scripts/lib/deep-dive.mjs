@@ -19,22 +19,22 @@
 //                        usable key)
 //   roles <name>...      which roles `project.roles` lacks, with the `/qa-init --add-role` command
 //                        for each: deep-dive never writes project.md
-//   reconcile <key> --stdin [--dir <run-dir>]
+//   reconcile <key> --input <path> [--dir <run-dir>]
 //                        the Rule-edit transition (lib/rule-edit.mjs): the confirmed forecast against
 //                        the Rules edited since HEAD, Boundary pairs, downstream Rules and the next
 //                        Feature; writes only the widened Rules and the forecast of each edited
 //                        statement into the run dir's `change.json`
 //   amend <key> <rule>...
 //                        the bounded amendment inventory: those Rules, the cases linked to them
-//   check <key> --stdin  a drafted Feature file, before the skill writes it: `check-file` plus the
+//   check <key> --input <path>
+//                        a drafted Feature file, before the skill writes it: `check-file` plus the
 //                        re-run rules and the Coverage contract, then the changeset (the Feature,
 //                        plus the uncommitted Observations it cites: this run's), the draft's
 //                        `coverage_digest`, suggested commit and next step
 /**
  * @import { CommandDefinition, OptionSpec } from "./cli.mjs"
  * @import { CaseEntry, ParsedFile, ParsedSection, ProjectConfig } from "./knowledge-file.mjs"
- * @import { CaseDecl, KeyIndex } from "./qa-index.mjs"
- * @import { RuleCoverageIndex } from "./rule-coverage.mjs"
+ * @import { CaseDecl, KeyIndex, RuleCoverageIndex } from "./qa-index.mjs"
  * @import { DependencyEnd } from "./rule-ref.mjs"
  * @import { HistorySection } from "./scan-history.mjs"
  */
@@ -55,7 +55,7 @@ import { isUncommitted } from "./git.mjs";
 import { readQaAt, repositoryOf, resolveRef } from "./git-tree.mjs";
 import { PATTERN } from "./keys.mjs";
 import { checkFile, parse, projectConfig } from "./knowledge-file.mjs";
-import { buildIndex, loadWorkingTree, rootConfig } from "./qa-index.mjs";
+import { buildIndex, casesCoveringRule, loadWorkingTree, rootConfig } from "./qa-index.mjs";
 import { parkedQuestions } from "./parked-questions.mjs";
 import { referenceShapeError, resolveReference } from "./references.mjs";
 import { scan } from "./scan.mjs";
@@ -63,12 +63,12 @@ import { dependencyProblems } from "./scan-integrity.mjs";
 import { refuseSuiteSchema } from "./schema-guard.mjs";
 import { DEEP_DIVE_TRAIN_KEY } from "./schema.mjs";
 import { trainFor } from "./training.mjs";
-import { casesCoveringRule } from "./rule-coverage.mjs";
 import { dependencyEnds, dependencyIndex } from "./rule-ref.mjs";
 import { relianceOf } from "./reliance.mjs";
 import { retiredLinks } from "./link-repair.mjs";
 import { ruleEdit, ruleTexts } from "./rule-diff.mjs";
 import { parseForecast, reconcile } from "./rule-edit.mjs";
+import { buildAmendJson, buildCheckJson, buildFeatureJson, buildReconcileJson, buildRefsJson, buildResumeJson, buildRolesJson } from "./deep-dive-json.mjs";
 
 /**
  * @typedef {ProjectConfig & {
@@ -162,7 +162,7 @@ export const command = {
         // Only a Reference the agent fetches can sit behind a login; every other one is null.
         const reached = accessFor(ctx.index, references.filter((r) => r.status === "pending").map((r) => /** @type {string} */ (r.uri)));
         const access = Object.fromEntries(references.filter((r) => r.uri).map((r) => [r.uri, reached[/** @type {string} */ (r.uri)] ?? null]));
-        return { json: { action: "refs", ok, references, access, train: trainFor(ctx.index, DEEP_DIVE_TRAIN_KEY) }, exit: ok ? 0 : 1 };
+        return { json: buildRefsJson({ ok, references, access, train: trainFor(ctx.index, DEEP_DIVE_TRAIN_KEY) }), exit: ok ? 0 : 1 };
       },
     },
 
@@ -183,9 +183,7 @@ export const command = {
         const feature = ctx.index.features.get(key)?.[0]?.file ?? null;
         const deferred = feature ? parseDeferred(feature.text) : [];
         return {
-          json: {
-            action: "feature",
-            ok: true,
+          json: buildFeatureJson({
             ...state,
             ...featureIndex(ctx, key, reviews),
             categories: effectiveCategories(ctx.root).categories,
@@ -194,7 +192,7 @@ export const command = {
             deferred_functionality: deferred,
             proposed_rules: feature ? parseProposedRules(feature.text) : [],
             train: trainFor(ctx.index, DEEP_DIVE_TRAIN_KEY),
-          },
+          }),
           exit: 0,
         };
       },
@@ -208,12 +206,10 @@ export const command = {
         const { roles } = load(root);
         const names = [...new Set(args)];
         const missing = names.filter((n) => !roles.has(n));
-        const json = {
-          action: "roles",
+        const json = buildRolesJson({
           known: names.filter((n) => roles.has(n)),
-          missing,
-          commands: missing.map((n) => `/qa-init --add-role ${/^[A-Za-z0-9_.-]+$/.test(n) ? n : JSON.stringify(n)}`),
-        };
+          missing: missing.map((role) => ({ role, command: `/qa-init --add-role ${/^[A-Za-z0-9_.-]+$/.test(role) ? role : JSON.stringify(role)}` })),
+        });
         return { json, exit: 0 };
       },
     },
@@ -222,13 +218,15 @@ export const command = {
     // Writes only `change.json` in `--dir`, and only when the forecast names widened Rules or confirms
     // a Rule whose statement was edited since the Watermark.
     reconcile: {
-      usage: "<key> --stdin [--dir <run-dir>] [--root <qa-dir>]",
+      usage: "<key> --input <path> [--dir <run-dir>] [--root <qa-dir>]",
       run(args, { root, stdin, dir }) {
         if (args.length !== 1) throw new UsageError("deep-dive reconcile takes exactly one <key>");
         if (!stdin) throw new UsageError("deep-dive reconcile reads the confirmed forecast from --input <file> or --stdin");
         const guard = refuseSuiteSchema(/** @type {string} */ (root));
         if (guard) return guard;
-        return reconcile(load(root), args[0], parseForecast(stdin()), dir);
+        const res = reconcile(load(root), args[0], parseForecast(stdin()), dir);
+        if (!res.json.ok) return res;
+        return { exit: res.exit, json: buildReconcileJson(/** @type {Parameters<typeof buildReconcileJson>[0]} */ (res.json)) };
       },
     },
 
@@ -247,7 +245,7 @@ export const command = {
         if (held.error) throw new UsageError(held.error);
         const designData = design.data?.questions.length ? design.data : null;
         if (!held.handoff && !designData) {
-          return { json: { action: "resume", ok: false, errors: [{ code: "no_handoff", message: `no ${HANDOFF_FILE} in ${opened.dir}: the quick path wrote none, so there is nothing to resume` }] }, exit: 1 };
+          return { json: { action: "resume", ok: false, errors: [{ code: "no_handoff", dir: opened.dir }] }, exit: 1 };
         }
         // Preserve the quick path's confirmed edits when design reuses its Run.
         const prior = held.handoff ?? { references: [], edits: [], open_questions: [], written: [] };
@@ -257,19 +255,17 @@ export const command = {
         const feature = designData?.feature ?? edits[0]?.feature ?? null;
         const now = new Set(uncommittedKnowledge(/** @type {string} */ (root)));
         return {
-          json: {
-            action: "resume",
-            ok: true,
+          json: buildResumeJson({
             dir: opened.dir,
             feature,
             references,
             edits,
             open_questions: openQuestions,
-            ...(designData !== null && { design_questions: designData.questions }),
+            design_questions: designData?.questions ?? [],
             written,
             uncommitted: written.filter((file) => now.has(file)),
             next_step: designData !== null ? `/qa-deep-dive ${feature} --dir ${opened.dir}` : ["/qa-deep-dive", ...(feature ? [feature] : []), ...references].join(" "),
-          },
+          }),
           exit: 0,
         };
       },
@@ -284,19 +280,19 @@ export const command = {
         if (guard) return guard;
         const ctx = load(root);
         const [key, ...wanted] = args;
-        const json = { action: "amend", ...amendment(ctx, key, [...new Set(wanted)]) };
+        const json = amendment(ctx, key, [...new Set(wanted)]);
         return { json, exit: json.ok ? 0 : 1 };
       },
     },
 
     check: {
-      usage: "<key> --stdin [--confirm <link>,...] [--root <qa-dir>]",
+      usage: "<key> --input <path> [--confirm <link>,...] [--root <qa-dir>]",
       run(args, { root, stdin, confirm }) {
         if (args.length !== 1) throw new UsageError("deep-dive check takes exactly one <key>");
         if (!stdin) throw new UsageError("deep-dive check reads the drafted Feature file from --input <file> or --stdin");
         const guard = refuseSuiteSchema(/** @type {string} */ (root));
         if (guard) return guard;
-        const json = { action: "check", ...checkDraft(load(root), args[0], stdin(), confirmList(confirm)) };
+        const json = checkDraft(load(root), args[0], stdin(), confirmList(confirm));
         return { json, exit: json.ok ? 0 : 1 };
       },
     },
@@ -309,7 +305,7 @@ export const command = {
 /**
  * @param {DeepDiveContext} ctx
  * @param {string} key
- * @returns {{ status: "invalid" | "retired" | "succeeded", error: string } | null}
+ * @returns {{ status: "invalid" | "retired" | "succeeded", current?: string, error: string } | null}
  */
 function keyProblem(ctx, key) {
   if (!PATTERN.slug.test(key)) return { status: "invalid", error: `\`${key}\` is not a Feature key: a kebab-case slug (${PATTERN.slug})` };
@@ -318,7 +314,7 @@ function keyProblem(ctx, key) {
   }
   for (const [other, decls] of ctx.index.features) {
     if (other !== key && listOf(decls[0].file.data.formerly).includes(key)) {
-      return { status: "succeeded", error: `\`${key}\` is a former key of Feature \`${other}\`; re-run on \`${other}\` instead` };
+      return { status: "succeeded", current: other, error: `\`${key}\` is a former key of Feature \`${other}\`; re-run on \`${other}\` instead` };
     }
   }
   return null;
@@ -414,12 +410,12 @@ function featureIndex(ctx, key, reviews) {
  */
 function amendment(ctx, key, wanted) {
   const problem = keyProblem(ctx, key);
-  if (problem) return { ok: false, feature: key, errors: [{ code: problem.status, message: problem.error }] };
+  if (problem) return { action: "amend", ok: false, feature: key, errors: [{ code: problem.status, feature: key, ...(problem.current && { current: problem.current }) }] };
   const state = featureState(ctx, key);
-  if (state.status === "new") return { ok: false, feature: key, errors: [{ code: "no_feature", message: `no Feature \`${key}\`: amendment follows Rule edits to an existing Feature` }] };
+  if (state.status === "new") return { action: "amend", ok: false, feature: key, errors: [{ code: "no_feature", feature: key }] };
   const have = new Set(state.rules.map((r) => r.key));
   const missing = wanted.filter((r) => !have.has(r));
-  if (missing.length) return { ok: false, feature: key, errors: missing.map((rule) => ({ code: "unknown_rule", rule, message: `\`${rule}\` is no Rule of ${key}` })) };
+  if (missing.length) return { action: "amend", ok: false, feature: key, errors: missing.map((rule) => ({ code: "unknown_rule", rule, feature: key })) };
   const rules = state.rules.filter((r) => wanted.includes(r.key));
   const reviews = state.scenario_files.length ? reviewFreshness(scan(ctx.root, { feature: key })) : new Map();
   /** @type {Array<FeatureCaseIndexEntry & { feature: string, via: string[] }>} */
@@ -455,15 +451,14 @@ function amendment(ctx, key, wanted) {
   }
   cases.sort((a, b) => (a.feature === key ? 0 : 1) - (b.feature === key ? 0 : 1) || a.key.localeCompare(b.key));
   const own = cases.filter((c) => c.feature === key).length;
-  return {
-    ok: true,
+  return buildAmendJson({
     feature: key,
     rules,
     cases,
     omitted: { rules: state.rules.length - rules.length, cases: total - own },
-    ...(state.boundaries ? { boundaries: state.boundaries } : {}),
+    boundaries: state.boundaries,
     next_step: state.next_step,
-  };
+  });
 }
 
 // The scan's Review facts as Key → freshness, the computation the catalogue also reads.
@@ -532,22 +527,22 @@ function committedFeature(ctx, rel) {
  * @returns {{ ok: boolean, [key: string]: unknown }}
  */
 function checkDraft(ctx, key, text, confirmed = []) {
-  /** @type {Array<{ code: string, field?: string, line?: number | null, key?: string, ref?: string, link?: string, message: string }>} */
+  /** @type {Array<{ code: string, field?: string, line?: number | null, key?: string, ref?: string, link?: string, [key: string]: unknown }>} */
   const errors = [];
-  /** @type {Array<{ code: string, message: string, [key: string]: unknown }>} */
+  /** @type {Array<{ code: string, [key: string]: unknown }>} */
   const warnings = [];
   const problem = keyProblem(ctx, key);
   if (problem?.status === "invalid") {
-    return { ok: false, feature: key, status: "invalid", coverage_digest: coverageDigest(text), errors: [{ code: "feature_key", message: problem.error }], warnings };
+    return buildCheckJson({ ok: false, feature: key, status: "invalid", coverage_digest: coverageDigest(text), errors: [{ code: "feature_key", feature: key }], warnings });
   }
-  if (problem) warnings.push({ code: "retired_feature_key", message: problem.error });
+  if (problem) warnings.push({ code: "retired_feature_key", feature: key });
   /**
    * @param {string} code
-   * @param {string} message
+   * @param {Record<string, unknown>} [facts]
    * @param {number | null} [line]
    * @param {string} [field]
    */
-  const report = (code, message, line, field) => errors.push({ code, ...(field && { field }), ...(line && { line }), message });
+  const report = (code, facts = {}, line, field) => errors.push({ code, ...facts, ...(field && { field }), ...(line && { line }) });
 
   const state = featureState(ctx, key);
   const draft = parse(state.rel, text);
@@ -567,24 +562,24 @@ function checkDraft(ctx, key, text, confirmed = []) {
     ? ctx.files.map((f) => (!f.unreadable && f.type === "feature" && f.data.key === key ? draft : f))
     : [...ctx.files, draft];
   for (const problem of dependencyProblems(buildIndex(files), files, draft)) {
-    errors.push({ code: problem.code, ...(problem.line && { line: problem.line }), ...(problem.ref && { ref: problem.ref }), key: problem.key, message: problem.message });
+    errors.push({ code: problem.code, ...(problem.line && { line: problem.line }), ...(problem.ref && { ref: problem.ref }), key: problem.key });
   }
   const d = draft.data;
   const was = state.data;
   /** @param {string} k */
   const line = (k) => draft.keyLines[k] ?? draft.frontmatterLine;
 
-  if (d.key !== undefined && d.key !== key) report("key", `the draft's key \`${d.key}\` is not the Feature \`${key}\``, line("key"), "key");
+  if (d.key !== undefined && d.key !== key) report("key", { key: d.key, feature: key }, line("key"), "key");
 
   // Rules: a key stays, or moves to `retired:`; a Retired key never comes back.
   const draftRules = new Map(draft.rules.map((r) => [r.key, r]));
   const retiredNow = listOf(d.retired);
   for (const k of state.retired) {
-    if (!retiredNow.includes(k)) report("retired_removed", `\`${k}\` left \`retired:\`; a Retired key stays retired`, line("retired"), "retired");
+    if (!retiredNow.includes(k)) report("retired_removed", { key: k }, line("retired"), "retired");
   }
   for (const r of draft.rules) {
     if (retiredNow.includes(r.key) || state.retired.includes(r.key)) {
-      report("retired_reused", `\`${r.key}\` is a Retired key and cannot head a live Rule; mint a new key`, r.line, "rule");
+      report("retired_reused", { rule: r.key }, r.line, "rule");
     }
   }
   // A Rule that leaves lists every link that names it, across Features; each must be repaired in
@@ -601,15 +596,15 @@ function checkDraft(ctx, key, text, confirmed = []) {
       for (const l of links) {
         listedIds.add(l.id);
         if (l.resolution === "unrepaired") {
-          const error = { code: "link_unrepaired", link: l.id, line: l.line, field: "retired", message: `\`${r.key}\` is retiring but ${l.file}${l.line ? `:${l.line}` : ""} still names it (${l.kind}, ${l.owner}); repair the link, or confirm it with \`--confirm ${l.id}\`` };
+          const error = { code: "link_unrepaired", link: l.id, rule: r.key, kind: l.kind, owner: l.owner, file: l.file, feature: l.feature, line: l.line, field: "retired" };
           errors.push(error);
         }
       }
       retired.push({ key: r.key, statement: r.statement, covered_by: r.covered_by, links });
-    } else report("rule_dropped", `\`${r.key}\` is gone from the draft; a Rule leaves only by moving its key to \`retired:\``, undefined, "rule");
+    } else report("rule_dropped", { rule: r.key }, undefined, "rule");
   }
   for (const id of confirmedIds) {
-    if (!listedIds.has(id)) report("confirm_unknown", `\`${id}\` is not a link that names a retiring Rule; run the check without \`--confirm\` to list them`, undefined, "confirm");
+    if (!listedIds.has(id)) report("confirm_unknown", { link: id }, undefined, "confirm");
   }
   const before = new Map(state.rules.map((r) => [r.key, r]));
   // The same structural diff the Scan's history asks: one Rule entry's whole stripped text, so a
@@ -631,13 +626,13 @@ function checkDraft(ctx, key, text, confirmed = []) {
   // alone, whatever its form: removing it is not deep-dive's to do.
   const sources = listOf(d.sources);
   for (const s of state.sources) {
-    if (!sources.includes(s)) report("source_removed", `source \`${s}\` was removed; sources only grow`, line("sources"), "sources");
+    if (!sources.includes(s)) report("source_removed", { source: s }, line("sources"), "sources");
   }
-  if (Array.isArray(d.sources) && d.sources.length === 0) report("no_sources", "a Feature records at least one Reference in `sources`", line("sources"), "sources");
+  if (Array.isArray(d.sources) && d.sources.length === 0) report("no_sources", {}, line("sources"), "sources");
   const sourcesAdded = (Array.isArray(d.sources) ? d.sources : []).filter((s) => !state.sources.includes(s));
   for (const s of sourcesAdded) {
     const error = referenceShapeError(s, ctx);
-    if (error) report("reference", error, line("sources"), "sources");
+    if (error) report("reference", { source: s }, line("sources"), "sources");
   }
 
   // Bookkeeping is not deep-dive's to write. A new Feature may carry `mirror: {group, at}`.
@@ -647,42 +642,35 @@ function checkDraft(ctx, key, text, confirmed = []) {
    */
   const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
   for (const k of ["watermark", "watermark_digest", "finding", ...(was.suite_key !== undefined ? ["suite_key"] : [])]) {
-    if (!same(d[k], was[k])) report("bookkeeping", `\`${k}\` is Bookkeeping; deep-dive leaves it as it was`, line(k), k);
+    if (!same(d[k], was[k])) report("bookkeeping", { key: k }, line(k), k);
   }
   if (was.mirror !== undefined && !same(d.mirror, was.mirror)) {
-    report("bookkeeping", "`mirror` is Bookkeeping; deep-dive keeps an existing one as it was", line("mirror"), "mirror");
+    report("bookkeeping", { key: "mirror" }, line("mirror"), "mirror");
   }
   for (const k of listOf(was.formerly)) {
-    if (!listOf(d.formerly).includes(k)) report("bookkeeping", `\`${k}\` left \`formerly:\`; succession is never undone`, line("formerly"), "formerly");
+    if (!listOf(d.formerly).includes(k)) report("bookkeeping", { key: k }, line("formerly"), "formerly");
   }
 
   for (const h of ruleHeadingsOutsideRules(draft)) {
-    report("rule_outside_rules", "a Rule belongs under `## Rules`, as a `### rule_<key>: <statement>` heading or a numbered `1. **rule_<key>**: <statement>` item; a parked question is prose", h.line, "rule");
+    report("rule_outside_rules", {}, h.line, "rule");
   }
 
   const ok = errors.length === 0;
-  const out = {
+  const changeset = ok ? [state.file, ...runObservations(ctx, sources)] : undefined;
+  return buildCheckJson({
     ok,
     feature: key,
     status: state.status,
     file: state.file,
     path: state.path,
     coverage_digest: coverageDigest(text),
-    // The kept Proposed Rules the draft still holds (ADR-0067): a full inventory's gate needs none.
     proposed_rules_left: parseProposedRules(text),
     errors: errors.sort((a, b) => (a.line ?? 0) - (b.line ?? 0)),
     warnings,
     rules: { added, edited, retired },
     sources_added: sourcesAdded,
-  };
-  if (!ok) return out;
-  const changeset = [state.file, ...runObservations(ctx, sources)];
-  return {
-    ...out,
-    changeset,
-    commit: commitLine(changeset, `qa(${key}): /qa-deep-dive`),
-    next_step: state.next_step,
-  };
+    ...(ok && changeset ? { changeset, commit: commitLine(changeset, `qa(${key}): /qa-deep-dive`), next_step: state.next_step } : {}),
+  });
 }
 
 // The Observations this run made (ADR-0016): the draft's `file:` sources under

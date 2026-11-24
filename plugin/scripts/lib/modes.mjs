@@ -1,6 +1,6 @@
 // @ts-check
 // The CLI's modes (scripts/scan.mjs): each a command module, as lib/cli.mjs runs it.
-/** @import { CommandDefinition, CommandRegistry } from "./cli.mjs" */
+/** @import { CommandAction, CommandDefinition, CommandRegistry } from "./cli.mjs" */
 import { command as brief } from "./brief.mjs";
 import { command as bug } from "./bug.mjs";
 import { command as show } from "./show-page.mjs";
@@ -27,33 +27,68 @@ import { command as codegen } from "./codegen.mjs";
 import { command as fix } from "./fix.mjs";
 import { command as tester } from "./tester.mjs";
 
+/**
+ * Wraps a command definition so every invocation skips `.qa/` migration preflight scanning.
+ * @param {CommandDefinition} command
+ * @returns {CommandDefinition}
+ */
+export function omitAllMigration(command) {
+  return { ...command, omitMigration: true };
+}
+
+/**
+ * Wraps a multi-action command definition so only `allowedActions` run `.qa/` migration preflight
+ * scanning; every other own action gets `omitMigration: true` without mutating `command`.
+ * Throws synchronously at import time if `command.actions` is missing or an allowlisted action is absent.
+ * @param {CommandDefinition} command
+ * @param {readonly string[]} allowedActions
+ * @returns {CommandDefinition}
+ */
+export function allowMigration(command, allowedActions) {
+  if (!command.actions) throw new Error("allowMigration requires a command with actions");
+  for (const action of allowedActions) {
+    if (!Object.hasOwn(command.actions, action)) {
+      throw new Error(`allowMigration: unknown action "${action}"`);
+    }
+  }
+  const allowed = new Set(allowedActions);
+  /** @type {Record<string, CommandAction>} */
+  const actions = {};
+  for (const [name, actionDef] of Object.entries(command.actions)) {
+    actions[name] = allowed.has(name) ? actionDef : { ...actionDef, omitMigration: true };
+  }
+  return { ...command, actions };
+}
+
+const wrappedFix = allowMigration(fix, ["plan"]);
+
 /** @type {CommandRegistry} */
 export const MODES = {
-  "check-file": checkFile,
-  commit,
-  mint,
+  "check-file": omitAllMigration(checkFile),
+  commit: omitAllMigration(commit),
+  mint: omitAllMigration(mint),
   "migrate-keys": migrateKeys,
-  "migration-status": migrationStatus,
+  "migration-status": omitAllMigration(migrationStatus),
   scan,
   next,
   show,
   ask,
-  "deep-dive": deepDive,
-  brief,
-  "check-reply": checkReply,
-  sync,
-  publish: /** @type {CommandDefinition} */ (publish),
-  impact,
-  design,
-  delegate,
-  init,
-  train,
-  scout,
-  execute,
-  codegen,
-  bug,
-  tester,
-  codefix: fix,
+  "deep-dive": allowMigration(deepDive, ["refs", "feature", "roles", "resume"]),
+  brief: omitAllMigration(brief),
+  "check-reply": omitAllMigration(checkReply),
+  sync: allowMigration(sync, ["scope"]),
+  publish: allowMigration(/** @type {CommandDefinition} */ (publish), ["scope"]),
+  impact: allowMigration(impact, ["entry"]),
+  design: allowMigration(design, ["state", "resume"]),
+  delegate: omitAllMigration(delegate),
+  init: allowMigration(init, ["state", "add-role"]),
+  train: allowMigration(train, ["evidence"]),
+  scout: allowMigration(scout, ["brief"]),
+  execute: allowMigration(execute, ["plan", "follow-ups"]),
+  codegen: allowMigration(codegen, ["plan"]),
+  bug: allowMigration(bug, ["read", "discard"]),
+  tester: omitAllMigration(tester),
+  codefix: wrappedFix,
   // `/qa-fix`'s mode before the command was renamed `/qa-codefix`, kept for scripts that call it.
-  fix,
+  fix: wrappedFix,
 };

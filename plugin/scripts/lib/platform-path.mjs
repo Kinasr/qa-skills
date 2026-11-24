@@ -2,9 +2,17 @@
 // Windows (`win32`) PATH walk and `@playwright/cli` shim resolution.
 // POSIX callers bypass this module in `platform.mjs` and execute unchanged.
 import { accessSync, existsSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { win32 } from "node:path";
+import { join as nativeJoin, win32 } from "node:path";
+import { isContained } from "./paths.mjs";
 
 /** @import { NodeCliRequest, PlatformContext, PlatformFs, PlatformRefusal, PlatformRunnerOptions, PlatformSpawnResult } from "./platform.mjs" */
+
+/**
+ * Containment options for `isContained` when a win32 path must lie strictly inside its directory:
+ * Windows path rules on any host, and the directory itself does not count as inside.
+ * @type {{ path: typeof win32, strict: true }}
+ */
+export const STRICT_WIN32 = { path: win32, strict: true };
 
 /** Default `PATHEXT` precedence order used on `win32` when `PATHEXT` is unset or blank. */
 export const DEFAULT_WIN32_PATHEXT = [".COM", ".EXE", ".BAT", ".CMD"];
@@ -55,6 +63,69 @@ export function readEnv(env, name) {
 }
 
 /**
+ * The first of `names` that `readEnv` finds and that is not blank after trimming.
+ * @param {NodeJS.ProcessEnv | undefined} env
+ * @param {readonly string[]} names
+ * @returns {string | undefined}
+ */
+export function firstEnv(env = {}, names) {
+  for (const name of names) {
+    const value = readEnv(env, name);
+    if (value !== undefined && value.trim() !== "") return value;
+  }
+  return undefined;
+}
+
+/**
+ * Whether `p` is a rooted win32 path: a drive letter followed by `:\` or `:/`, or a UNC `\\host\share`.
+ * @param {string} p
+ * @returns {boolean}
+ */
+export function isRootedWin32(p) {
+  return /^[A-Za-z]:[\\/]/.test(p) || /^\\\\[^\\]+\\[^\\]+/.test(p);
+}
+
+/** Windows directory assumed when `SystemRoot` is unset or blank. */
+export const DEFAULT_SYSTEM_ROOT = "C:\\Windows";
+
+/**
+ * The win32 system root: `SystemRoot` when it is rooted, `DEFAULT_SYSTEM_ROOT` when it is unset or
+ * blank, else `null`.
+ * @param {NodeJS.ProcessEnv} env
+ * @returns {string | null}
+ */
+export function systemRoot(env) {
+  const raw = readEnv(env, "SystemRoot");
+  const root = raw !== undefined && raw.trim() !== "" ? raw.trim() : DEFAULT_SYSTEM_ROOT;
+  return isRootedWin32(root) ? root : null;
+}
+
+/**
+ * Join scratch path parts with `win32.join` when `root` is a rooted win32 path or contains `\`, and
+ * with the native `join` otherwise, so simulated win32 tests can use real POSIX temp folders.
+ * @param {string} root
+ * @param {...string} parts
+ * @returns {string}
+ */
+export function scratchJoin(root, ...parts) {
+  return (isRootedWin32(root) || root.includes("\\") ? win32.join : nativeJoin)(root, ...parts);
+}
+
+/**
+ * Whether `path` is a regular file: `statSync(path).isFile()`; any throw is `false`.
+ * @param {PlatformFs} fs
+ * @param {string} path
+ * @returns {boolean}
+ */
+export function isRegularFile(fs, path) {
+  try {
+    return fs.statSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Split `PATH` strictly on `;` for `win32` and strip surrounding quotes.
  * @param {NodeJS.ProcessEnv} env
  * @returns {string[]}
@@ -94,7 +165,7 @@ function pathExts(env) {
 function existingFile(fs, candidates, probe = "stat") {
   for (const path of new Set(candidates)) {
     try {
-      const ok = probe === "exists" ? fs.existsSync(path) : fs.statSync(path).isFile();
+      const ok = probe === "exists" ? fs.existsSync(path) : isRegularFile(fs, path);
       if (ok) return path;
     } catch {
       // Absent or unreadable entries continue the PATH walk.
@@ -152,17 +223,6 @@ export function findWin32CommandHit(fs, env, command, options = {}) {
     }
   }
   return null;
-}
-
-/**
- * Verify that `targetPath` resolves strictly inside `rootDir`.
- * @param {string} rootDir
- * @param {string} targetPath
- * @returns {boolean}
- */
-function isConfinedToDir(rootDir, targetPath) {
-  const rel = win32.relative(win32.resolve(rootDir), win32.resolve(targetPath));
-  return Boolean(rel) && rel !== ".." && !rel.startsWith("..\\") && !rel.startsWith("../") && !win32.isAbsolute(rel);
 }
 
 /**
@@ -245,7 +305,7 @@ function resolvePlaywrightCmdShim(request, fs, execPath, dir, hitPath) {
 
   const pkgResolved = win32.resolve(pkgDir);
   const resolvedEntry = win32.resolve(pkgResolved, binEntry);
-  if (!isConfinedToDir(pkgResolved, resolvedEntry)) {
+  if (!isContained(pkgResolved, resolvedEntry, STRICT_WIN32)) {
     return fail("refused", "unconfined_bin", `Refusing win32 shim ${hitPath}: bin entry escapes @playwright/cli package directory`, request.file, hitPath, resolvedEntry);
   }
   let realPkg;
@@ -256,13 +316,13 @@ function resolvePlaywrightCmdShim(request, fs, execPath, dir, hitPath) {
   } catch {
     // Missing targets fall through to existingFile below so they report unresolvable_shim.
   }
-  if (realPkg && realEntry && !isConfinedToDir(realPkg, realEntry)) {
+  if (realPkg && realEntry && !isContained(realPkg, realEntry, STRICT_WIN32)) {
     return fail("refused", "unconfined_bin", `Refusing win32 shim ${hitPath}: resolved bin symlink escapes @playwright/cli package directory`, request.file, hitPath, realEntry);
   }
   if (!existingFile(fs, [resolvedEntry])) {
     return fail("refused", "unresolvable_shim", `Refusing win32 shim ${hitPath}: bin entry ${resolvedEntry} does not exist`, request.file, hitPath, resolvedEntry);
   }
-  return { file: execPath, args: [resolvedEntry, ...request.args], options: request.options };
+  return { file: execPath, args: [realEntry ?? resolvedEntry, ...request.args], options: request.options };
 }
 
 /**

@@ -5,27 +5,27 @@
 /** @import { SummariesLookup } from "./labels.mjs" */
 /** @import { MigrationStatus } from "./migration-status.mjs" */
 /** @import { ParsedEntry, ParsedFile, ParsedRule, ProjectConfig, UnreadableFile } from "./knowledge-file.mjs" */
-/** @import { KeyDecl, KeyIndex } from "./qa-index.mjs" */
+/** @import { KeyDecl, KeyIndex, RuleCoverageIndex } from "./qa-index.mjs" */
 /** @import { ParkedQuestion } from "./parked-questions.mjs" */
-/** @import { RuleCoverageIndex } from "./rule-coverage.mjs" */
 /** @import { DependencyEnd, DependencyIndex } from "./rule-ref.mjs" */
 /** @import { FeatureClass, HistorySection } from "./scan-history.mjs" */
 /** @import { ScanOutput } from "./scan.mjs" */
 /** @import { HistoryDismissalsSource, StoredFinding } from "./stored-findings.mjs" */
+/** @import { ReportSection, SectionSpec } from "./report-sections.mjs" */
 import { basename, posix, resolve } from "node:path";
 import { UsageError } from "./cli.mjs";
-import { buildIndex, loadWorkingTree } from "./qa-index.mjs";
+import { buildIndex, casesCoveringRule, loadWorkingTree } from "./qa-index.mjs";
 import { checkFile, projectConfig } from "./knowledge-file.mjs";
 import { keyLabel, summaries } from "./labels.mjs";
 import { command as migrationStatus } from "./migration-status.mjs";
 import { SCHEMA_VERSION } from "./schema.mjs";
-import { casesCoveringRule } from "./rule-coverage.mjs";
 import { dependencyEnds, dependencyIndex } from "./rule-ref.mjs";
 import { command as scan } from "./scan.mjs";
 import { takesEscalation } from "./selection.mjs";
 import { storedCaseFindings } from "./stored-findings.mjs";
 import { parkedQuestions } from "./parked-questions.mjs";
 import { hasPublishTracker } from "./publish.mjs";
+import { buildSections } from "./report-sections.mjs";
 
 /**
  * A `.qa/` file the catalogue reads: the parsed file, or the one that could not be read, which
@@ -197,27 +197,43 @@ import { hasPublishTracker } from "./publish.mjs";
  */
 
 /**
- * The catalogue's global state: the key migration preflight, the schema state, the problems that
- * stop the catalogue, and the route for a subject with no Feature.
+ * The catalogue's global state: the key migration preflight, the schema state, and the problems
+ * that stop the catalogue.
  * @typedef {{
  *   migration: MigrationStatus,
  *   schema: CatalogueSchema,
  *   errors: CatalogueError[],
- *   routes: { no_feature: string[] },
  * }} CatalogueGlobal
  */
 
 /**
- * The catalogue the command prints: the global state, the Features it lists and the Rules it
- * lists.
+ * The catalogue the command prints: whether it is complete (`ok`), the key migration preflight,
+ * and ordered, labelled sections for schema compatibility, catalogue errors, Features, Rules, and
+ * the no-Feature route.
  * @typedef {{
- *   root: string,
- *   hint: string | null,
- *   global: CatalogueGlobal,
- *   features: CatalogueFeature[],
- *   rules: CatalogueRule[],
+ *   ok: boolean,
+ *   migration: MigrationStatus,
+ *   sections: ReportSection[],
  * }} CatalogueOutput
  */
+
+/**
+ * Ordered section registry for `ask`: every reported outcome belongs to one entry in reading order.
+ * @type {readonly SectionSpec[]}
+ */
+export const SECTION_ORDER = [
+  { id: "schema", label: "Schema compatibility" },
+  { id: "errors", label: "Catalogue errors" },
+  { id: "features", label: "Features" },
+  { id: "rules", label: "Rules" },
+  { id: "no_feature", label: "No-Feature route" },
+];
+
+/**
+ * Top-level keys allowed outside `sections`: adapter envelope, migration preflight, and boolean gate.
+ * @type {readonly string[]}
+ */
+export const ALLOWED_OUTSIDE = ["mode", "migration", "ok"];
 
 /**
  * The scan's facts, as the catalogue reads them: the scan's own output with the history section
@@ -339,7 +355,7 @@ function catalogueState(index, errors, root, location) {
     code: "migration_pending", file: location({ rel: declaration.file }), line: declaration.line,
     problems: [], message: "Key migration is pending; run migrate-keys on the default branch.",
   });
-  return { migration, schema, errors, routes: { no_feature: [deepDiveRoute()] } };
+  return { migration, schema, errors };
 }
 
 /**
@@ -453,7 +469,7 @@ export const command = {
       publishTracker: hasPublishTracker(index.project),
       dependencies: dependencyIndex(index, readable),
     };
-    const global = catalogueState(index, errors, /** @type {string} */ (root), location);
+    const { migration, schema, errors: globalErrors } = catalogueState(index, errors, /** @type {string} */ (root), location);
     /** @type {CatalogueFeature[]} */
     const features = [];
     /** @type {CatalogueRule[]} */
@@ -475,6 +491,18 @@ export const command = {
       features.push(featureEntry(feature, file, trust, liveRules, retired, context));
       rules.push(...liveRules.map((rule) => ruleEntry(rule, feature, file, trust, retired, context)));
     }
-    return { exit: 0, json: /** @type {CatalogueOutput} */ ({ root, hint, global, features, rules }) };
+    /** @type {CatalogueOutput} */
+    const json = {
+      ok: globalErrors.length === 0,
+      migration,
+      sections: buildSections(SECTION_ORDER, [
+        { id: "schema", items: schema.code === "current" ? [] : [schema] },
+        { id: "errors", items: globalErrors },
+        { id: "features", items: features },
+        { id: "rules", items: rules },
+        { id: "no_feature", items: [deepDiveRoute()] },
+      ]),
+    };
+    return { exit: 0, json };
   },
 };

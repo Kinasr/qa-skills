@@ -1,10 +1,23 @@
 // @ts-check
 // Key kinds and their patterns (ADR-0004).
+import { randomBytes } from "node:crypto";
 import { isMap } from "./dialect.mjs";
 
 // Lowercase Crockford base32: no i, l, o or u.
 /** @type {string} */
 export const ALPHABET = "0123456789abcdefghjkmnpqrstvwxyz";
+
+// `length` lowercase Crockford characters from `draw` (the CSPRNG by default). 256 is a multiple of
+// 32, so `byte & 31` picks each character uniformly. The Run id (lib/run-dir.mjs) is drawn the same
+// way.
+/**
+ * @param {number} length
+ * @param {(size: number) => Buffer} [draw]
+ * @returns {string}
+ */
+export function drawKey(length, draw = randomBytes) {
+  return [...draw(length)].map((b) => ALPHABET[b & 31]).join("");
+}
 
 /**
  * @typedef {{

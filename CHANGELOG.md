@@ -2,6 +2,89 @@
 
 ## Unreleased
 
+## [0.15.1] - 2026-11-24
+
+### Fixed
+
+- `probe-trust-core` no longer flags an absent idle-sibling `tester.json` as a read error (unblocking `artifact-placement` and hook-fault modes) and canonicalizes probe `stateDir`.
+- `guard-denial` now builds the linked sibling brief via `plant.mjs <state-dir> sibling-brief` and instructs the parent to run `plant.mjs` as standalone Bash calls.
+
+## [0.15.0] - 2026-11-24
+
+### Added
+
+- Windows support status Simulated: win32 code paths are tested by simulation only (ADR-0072). `docs/support.md` lists what simulation cannot prove and asks for a Windows report to move the row.
+
+### Changed
+
+- Path containment uses one helper per question, enforced by a guard test.
+- The release publisher takes file modes from the manifest on Windows and refuses the mapping file there.
+- `docs/support.md` no longer claims CI runs; Actions has not run since 2026-11-14.
+- On macOS and Linux, file names like `..foo` are accepted where `bug`, `init` and `pin-digest` refused them.
+- On macOS and Linux, a symlink whose target is exactly `..` is refused where `pr` accepted it.
+- On macOS and Linux, `..\x` and `C:/x` are refused as repo-relative paths in references, the edit guard and PR git checks.
+- On macOS and Linux, `a/../b` is refused where references, the edit guard and PR git checks normalised it to `b` and accepted it.
+- On macOS and Linux, a snapshot file owned by another user is refused with a typed `owner_mismatch` error instead of a raw `EPERM`.
+- Every `/qa-*` skill now reads its commands' reports as ordered, labelled sections and words each one in turn rather than naming internal report fields. A new report outcome reaches the engineer without a skill edit.
+- `/qa-codegen` and `/qa-codefix` no longer refuse on step order or on what the test asserts: running items in order, mapping each Expected sentence to an assertion, and leaving skips, sleeps and existing tests alone are now skill instructions a reviewer checks in the PR. The CLI still guards the paths a change may touch, credentials, the Key and `automates` write, and the proof that the tree it binds is the one its passing verify ran. `codegen done --expects` stores the mapping without checking it.
+- Code fix refuses an edit that adds a credential, with the same scan code gen uses, before anything is committed or pushed.
+- Every command's JSON carries `migration`, so the `/qa-*` skills warn about a pending migration from their first command instead of making a separate call. `migration-status` remains for other callers.
+- Every command's refusals carry a code and the facts behind it (paths, items, the next command, a link, the allowed values) instead of a fixed sentence, and each skill words them from those facts. `/qa-sync` was the first; `/qa-publish` and every other command now follow it.
+- A `/qa-*` close that names a next `/qa-*` command offers it once and runs it if the engineer says yes, and `/qa-next` offers its top step the same way. `/qa-ask` stays display-only. Each invoked command still shows its own Cards, checks and refusals.
+- `/qa-deep-dive`'s Invariants list only the run-wide guardrails; each step-specific rule now sits in the step it governs.
+- The CLI's printed synopses and the CLI reference show input as `--input <path>`. `--stdin` still works as the alternative.
+- Standalone `/qa-codefix` (`codefix plan`) now resolves the same scope tokens as `/qa-execute` and `/qa-codegen` (Feature keys, Suite keys, Test Scenario keys, Test Case keys, Tracker keys, `mirror.suite`, and `formerly` aliases), falling back to raw Automation IDs and refusing `retired_key` or `ambiguous_key`.
+- Knowledge page (`/qa-show`) HTML snapshots now consolidate the Show view into a single browser module and inline it only for Show pages, leaving Card page and Next steps page HTML outputs without the Show script.
+- `npm run lint:skills` now enforces structural skill contracts—frontmatter `name`, `## Invariants` precedence and safety rules, CLI modes/actions/options against `MODES`, `## The CLI` tables and inventory, `/qa-*` skill links, relative links, banned shell forms, and derived prohibited CLI codes minus per-skill allowlists—across all skills, references, agents, and `delegation.md`, printing per-skill word counts as info-only telemetry instead of word-budget caps or prose-substring snapshots.
+- Both live probe harnesses (`probe-delegate-isolation.mjs` and `probe-trust-core.mjs`) now share `scripts/lib/claude-probe.mjs` for headless `claude -p` execution, `--settings` isolation, `QA_LIVE_PROBE_TIMEOUT_MS` resolution, `CLAUDE_CONFIG_DIR` transcript lookup, `parseJson`, and `CI` refusal when `QA_LIVE_PROBE=1` (preserving the exit-0 skip on `probe-delegate-isolation.mjs` when `QA_LIVE_PROBE` is unset).
+- Trust-core hook fault modes (`hook-crash` and `hook-timeout`) are now built by one parameterized `createHookFaultMode(fault)` factory in `scripts/probe-trust-core/modes/hook-common.mjs`.
+- Coverage-category floor `FLOOR` now lives as typed JS data in `plugin/scripts/lib/category-file.mjs` with zero import-time markdown reads, checked against `plugin/skills/references/coverage-categories.md` by `npm run lint:skills`.
+- Runner defaults (`GRADLE_DEFAULT_TASK`, `defaultRunnerConfig`) and supported stack/runner protected-file deny lists now live in pure capability descriptors (`plugin/scripts/lib/runners/descriptors.mjs` and `plugin/scripts/lib/stacks/descriptors.mjs`) composed by `edit-guard.mjs`.
+- `settle-walk.mjs` consolidates all 8 settle actions into `SETTLE_ACTIONS` under `design`.
+- Only `/qa-*` skill entry commands and entry actions (`ask`, `next`, `show`, `scan`, `migrate-keys`, `bug read|discard`, `codefix plan`/`fix plan`, `codegen plan`, `deep-dive refs|feature|roles|resume`, `design state|resume`, `execute plan|follow-ups`, `impact entry`, `init state|add-role`, `publish scope`, `sync scope`, `train evidence`, `scout brief`) now run the `.qa/` migration preflight (`migration`); helper modes, inner-loop actions (`omitMigration`), and shared-parser usage errors omit `migration` without scanning `.qa/`, while preserving `MODES.codefix === MODES.fix` and top-level `migration` on `next` and `ask`.
+- CLI `UsageError`s (exit `2`), schema-version/suite-schema guards (`refuseUnreadSchema` / `refuseSuiteSchema`, exit `1`), and standalone `/qa-codefix` baseline state stops (exit `1`) now emit unified `{ ok: false, refusals: [{ code, ...facts }] }` envelopes with zero `text` or `error` fields and zero per-mode `command.refuse` overrides, with affected `/qa-*` skills and `delegation.md` wording `refusals` directly (`observe:` keeps a narrow `.error` fallback for deferred `scout` / `scout ingest` exit-1 refusals).
+- `delegate next` and `execute next` now return synchronously without in-process `sleep` waits: when queued units are in retry cooldown with nothing ready, in flight, or paused, both emit `{ wait_ms, next_ready_at }` so `delegation.md` and `/qa-execute` pause via a standalone `Atomics.wait` command before re-calling `next`.
+
+### Fixed
+
+- Windows ACL privacy check: Owner Rights and Creator Group SIDs, two-letter ACE flags, delete and write-attribute bits; refuses when no absolute scratch folder is set.
+- Windows Playwright and batch launchers: case-insensitive confinement, resolved script paths, directory launchers refused, ComSpec must be absolute, non-ASCII arguments refused with `non_ascii_argument`.
+- Every `git` query and commit in the CLI now runs through the shared `git` wrapper, scrubbing repository-routing `GIT_*` environment variables (`GIT_DIR`, `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_COMMON_DIR`, `GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`, `GIT_NAMESPACE`, `GIT_PREFIX`, `GIT_SUPER_PREFIX`) case-insensitively while honoring explicit per-call overrides (such as temporary PR indexes) and preserving `GIT_TRACE`, author/committer/config settings, hooks, and signing; `publish record` shares path-scoped index rollback with `commit`, and `/qa-codegen` resolves `mirror.suite` scopes and flags ambiguous suites.
+- Kotlin test parsing, code-sample shape and support discovery, and carrier `annotation class` detection now share one tokenizing scanner so single-expression `fun` bodies, chained `else`/`catch`/`finally`/`while` blocks, default-parameter lambdas, nested block comments, template braces, 4+-quote raw strings, bodyless supertypes, `as` import aliases, and `@Ann(...::class)` references are bounded accurately; `annotation class` declaration paths also verify containment and symlink safety before testing existence, and `/qa-codegen`/`/qa-codefix` credential scanning shares the full sensitive-literal matcher across `apikey`, quoted keys, `$password`, call syntax, and multi-assignment lines.
+- Run-directory JSON state files across commands now stage unique temporary files and clean them up on failure, and path-containment checks resolve ancestor symlinks and cross-drive boundaries consistently without false-positives on filenames such as `..foo.kt`.
+- `/qa-design <feature> --regenerate` now includes the Feature file in the closing report's changeset and commit line whenever replaced cases write `retired:` tombstones to it.
+- The Tester wrapper refuses a Run whose plan file cannot be read or is not the plan `execute plan` wrote (`plan_unreadable`), naming why (absent, unreadable or not JSON) and a fresh Run, instead of failing with a parse error.
+- Code gen and code fix no longer refuse an edit as `secret` for a credential line it left unchanged between two changed lines.
+- An Access-note privacy refusal from `execute open` reports its own code and message at `refusals[0]` instead of nesting them under the session's refusal.
+- `.qa/` mutations in `/qa-design`, `/qa-codegen`, `/qa-impact`, `/qa-bug`, and `migrate-keys` now stage atomic writes and refuse unreadable or newer `schema_version` values before writing.
+- `migrate-keys` schema 6 migration now preserves renamed Scenario files and carries `finding[].at_digest`.
+- `/qa-design` card pages reopen cases whose previous reply was dropped as `changed` or whose fingerprint changed after `rule-fix`.
+- `/qa-codegen` now guards and restores edits across the full repository tree and rolls back `.qa/` `automates` writes when a PR commit fails.
+- Concurrent `tester do` and `tester request` calls are serialized per Execution with unique temp files; Access-note `file:` and `login_state` paths must stay repo-relative and inside the checkout root; symlink targets are checked against the edit-guard deny list; git-tracking checks fail closed; and snapshot scrubbing skips symlinks and binary files.
+- Kotlin and Playwright adapters now escape regex metacharacters on rekey, handle multiline Kotlin annotations, header comments/raw strings, chained code blocks, and `@file:`/aliased imports; Knowledge page filters and rule/case links synchronously open collapsed sections in real browsers.
+- Live probe grading parses ADR-0071 `sections` unguarded offers and catches nested browser-named temp artifacts.
+- Playwright test parsing and binding now support shorthand `{ tag }` / `{ annotation }` and quoted property keys, propagate outer `describe.skip` across nested `describe` blocks, and preserve per-block metadata across sibling `describe` blocks sharing a title.
+- Codegen sampling and regression-dependent discovery now resolve runner and `tsconfig` files in single-segment `module_paths` (such as `e2e`) and tokenize comments and string literals together so `//` or `/*` inside strings does not corrupt imports or Kotlin references.
+- Card pages now fall back to default size limits when `model.limits` is omitted, stop Reply packing in walk order at the first overflowing case, and disable Copy Reply when zero cases fit.
+- `/qa-publish` validates `confirm` alongside `confirmed` for unknown or duplicate items, records `requires` when `create_bug` links a same-card `recover_case`, and checks `updated.ok` when storing published bugs.
+- `rule-fix` and `/qa-impact` checkpointing track Boundary edits alongside Rules and preserve newly added rules in `state.rule_fixes`; `/qa-impact` persists unselected same-file cases whose settled or symmetric `Conflict` findings changed.
+- Stored findings with `holds:` report `status: "holds"` rather than `"open"`, commit-pin digests deduplicate `besidePin` keys and honor `dismissed_case`, `scan` watermark reanchoring follows transitive upstream `Dependency` and `Reliance` files (ADR-0033), and `migrate-keys --levels` rejects `labels.retired_tags` mappings.
+- Dialect, markdown, and YAML parsing now reject inline tabs, anchor fence openers, avoid leading `---` collisions in `proseLines`, trap `render.line` formatting errors, and preserve indented YAML blocks across blank lines; `design unbind`, `.qa/` `project.md` / directory traversal, `scan` reanchoring, and `uncommittedUnder` fail closed on filesystem and git read errors.
+- Execution guard tab parsing now parses titles containing `]` up to `](url)` and fails closed on malformed tab output or unreadable/corrupt `guard.json`.
+- `execute open` separates local OS/ACL/CLI refusals from Access-note `no-access` pauses, cleans newly kept auth files and `uploads/` when open or a multi-session batch refuses, gates `guard.closed` on a clean `playwright-cli close`, and applies an explicit 60s timeout to `scout login` probes.
+- `tester-bind` surfaces unexpected binding failures on stderr and blocks (exit 2) while leaving empty/malformed hook JSON and non-Tester launches as silent no-ops.
+- Test runners fail closed when `resolveAuthHeaderEnv` refuses a missing credential instead of executing unauthenticated, partition cached Playwright version/root probes cleanly across platform contexts without caching failed probes, surface top-level Playwright `report.errors` even when instances matched, and default `runner.dir` to `"."`.
+- `execute.json` and `automation.json` now write atomically via `.tmp.<pid>` renames with `automation_retries` pinned at `execute plan`; `execute confirm` synopsis and `docs/cli.md` align on `(--dir <run-dir>)...`; `runDirRoot` prefers primary state JSON files over alphabetical fallbacks; and `publish` restores the git index if `git add`/`git commit --only` fails.
+- Playwright literal test selection consistently rejects `›`, `>`, `\r`, and `\n` across `execute`, `codefix regress`, and `runners/playwright`; JUnit XML parsing decodes XML entities, scans quoted `>` attributes, strips `<system-out>`/`<system-err>`/`CDATA` before outcome matching, and disambiguates duplicate `<testcase>` keys; and `/qa-bug` fails closed on unreadable drafts/records/`guard.json` or missing `HEAD` commits.
+- `/qa-show` now defaults `--root` to `.qa` in the CLI and threads host ACL privacy context (`platformContext`) into HTML snapshot writes.
+- `/qa-design`, `/qa-impact`, `/qa-codegen`, `/qa-train`, `/qa-execute`, `/qa-publish`, and `/qa-deep-dive` skill instructions now match the supported CLI subcommands and options (`design agree`, `design split --dir`, `train auth-ignore`, `codegen --stack`, repeatable `execute confirm --dir`, direct code-fix edits after `train check codefix`, `/qa-sync` merge handoff, running preflight migrations in order, keeping `--review` separate from `<scope>`, and keeping passive refusal codes out of `/qa-codegen`).
+- Live probe harnesses now refuse snapshot overwrites, downgrade passing sessions with log read errors to `INCONCLUSIVE` while preserving `FAIL`, verify sibling file invariance, `plant.mjs` setup, and host plugin conflicts in guard/hook probes, and pass plugin-disabling settings and `--allowedTools` in delegation isolation probes.
+- Public export, candidate-check, release-manifest, and change-flow token scripts now reject push-only flags or invalid manifests before touching outputs or mappings, flag non-public repository URLs and escaping relative links, enforce strict semver and full attestation or mapping bindings (`previous-version-update`), preserve nested exclusions, and clean temporary repositories in `finally`.
+- Standard `.qa/` writes and deletions across `/qa-init` (`add-role`), `/qa-design`, `/qa-impact`, `/qa-bug`, `/qa-codegen`, Observations, and Execution records now run through a single gated atomic transaction layer that checks schemas and files, fills commit-pin digests, creates new records exclusively, stages companion Run-state JSON atomically, and rolls back `.qa/` and Run state together on failure; `/qa-codegen`, `/qa-codefix`, and PR rollbacks now share one symlink-safe working-tree restore that handles directory-to-file replacements and prunes empty directories.
+- Omitted `--dir` errors on `design walk|triage|checkpoint|rule-fix|page|page-reply|propose|link` (including `design rule-fix`) now report `design <action>` instead of stale `impact <action>` while keeping the `impact plan` recovery hint, and `edit-guard.mjs` matches `mvnwDebug` case-insensitively through lowercased descriptor entries.
+- `codegen plan` and `execute plan` now guard missing or unreadable `project.md` before `checkFile` and check `schema_version` compatibility before reporting `invalid_project`; `schema_newer` emits `file: "project.md"` consistently across `schema-guard` and `/qa-show`, `schema_malformed` includes `declared` when present, and `input_unreadable`, `guard_unreadable`, and `git_history_failed` usage refusals retain structured `reason` diagnostics.
+- `execute next` no longer sleeps past paused Access notes or discards `applySkips` mutations and accumulated `blocked` / `paused` sections during retry cooldowns, and `delegate next` avoids creating `attempts/` or rewriting `dispatch.json` when no ready units launch.
+
 ## [0.14.1] - 2026-11-16
 
 ### Changed

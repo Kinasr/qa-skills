@@ -4,10 +4,26 @@
 // from lib/access.mjs, which reads `train/access.md` through lib/training.mjs, so that `check-file`
 // (reached from lib/knowledge-file.mjs, which lib/training.mjs loads files through) never imports back
 // into the readers of the working tree.
+import { posix } from "node:path";
 import { isMap } from "./dialect.mjs";
 
 /** @type {RegExp} */
 export const PASSWORD_VIA = /^(env:[A-Z_][A-Z0-9_]*|auth:[A-Z_][A-Z0-9_]*|file:\S+)$/;
+
+/**
+ * Whether `value` is a clean repo-relative POSIX path without leading slashes, drive prefixes,
+ * home tildes, backslashes, or `.` / `..` traversal segments.
+ * @param {unknown} value
+ * @returns {value is string}
+ */
+export function isRepoRelativePath(value) {
+  if (typeof value !== "string" || value.length === 0 || value.includes("\0") || value.trim() !== value) return false;
+  if (value.startsWith("/") || value.startsWith("\\") || value.includes("\\") || /^[A-Za-z]:/.test(value)) return false;
+  if (value === "~" || value.startsWith("~/")) return false;
+  if (value.split("/").some((segment) => segment === "." || segment === "..")) return false;
+  const normalized = posix.normalize(value);
+  return normalized !== "." && normalized !== "..";
+}
 
 /** @type {RegExp} */
 export const HEADER_TOKEN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;

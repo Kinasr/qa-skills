@@ -4,37 +4,44 @@ Every skill reaches one shared CLI, `node plugin/scripts/scan.mjs`, with each mo
 The entrypoint keeps its first name: `scan.mjs` runs every mode, and only its `scan` mode is the
 mechanical Scan.
 Each call prints one JSON object on stdout, `mode` first, and exits 0 on success; every refusal
-prints `{ok: false, ...}` and never writes. A usage error exits 2.
+prints `{mode, ok: false, ...}` and never writes. CLI `UsageError`s (exit 2), `schema-guard`
+rejections (exit 1), standalone codefix baseline stops (exit 1), and migrated commands emit unified
+`{mode, [migration,] ok: false, refusals: [{code, ...facts}]}` with zero `text` or `error` fields
+(quarantined deferred legacy shapes remain only on `scout`, `train`, `deep-dive`,
+`migrate-keys --levels` non-schema errors, and exit-0 `tester request` transport errors). Every
+allowlisted skill entry mode and entry action carries `migration` at the top level (including
+`no_qa_dir` refusals), while helper modes, inner-loop actions (`omitMigration`), and shared-parser
+usage errors omit it.
 
 ## The CLI
 
 ```
-node plugin/scripts/scan.mjs check-file <path> [--stdin] [--root <qa-dir>]
-node plugin/scripts/scan.mjs commit --stdin [--confirmed] [--root <qa-dir>]
+node plugin/scripts/scan.mjs check-file <path> [--input <path>] [--root <qa-dir>]
+node plugin/scripts/scan.mjs commit --input <path> [--confirmed] [--root <qa-dir>]
 node plugin/scripts/scan.mjs mint <tc|ts|su|aut|rule|boundary|bg> [--count <n>] [--root <qa-dir>] [--feature <key>] [--prefix <P>]
 node plugin/scripts/scan.mjs migrate-keys [--levels [--map-level <from=level+tag,...>]] [--root <qa-dir>]
 node plugin/scripts/scan.mjs migration-status [--root <qa-dir>]
 node plugin/scripts/scan.mjs scan [<feature>] [--target <ref>] [--root <qa-dir>]
 node plugin/scripts/scan.mjs next [<feature-key>] [--root <qa-dir>] [--page]
-node plugin/scripts/scan.mjs show [<feature-key>] --root <qa-dir>
+node plugin/scripts/scan.mjs show [<feature-key>] [--root <qa-dir>]
 node plugin/scripts/scan.mjs ask [--feature <key>] [--root <qa-dir>]
 node plugin/scripts/scan.mjs deep-dive refs <ref>... [--root <qa-dir>]
 node plugin/scripts/scan.mjs deep-dive feature <key> [--root <qa-dir>]
 node plugin/scripts/scan.mjs deep-dive roles <name>... [--root <qa-dir>]
-node plugin/scripts/scan.mjs deep-dive reconcile <key> --stdin [--dir <run-dir>] [--root <qa-dir>]
+node plugin/scripts/scan.mjs deep-dive reconcile <key> --input <path> [--dir <run-dir>] [--root <qa-dir>]
 node plugin/scripts/scan.mjs deep-dive resume --dir <run-dir> [--root <qa-dir>]
 node plugin/scripts/scan.mjs deep-dive amend <key> <rule>... [--root <qa-dir>]
-node plugin/scripts/scan.mjs deep-dive check <key> --stdin [--confirm <link>,...] [--root <qa-dir>]
+node plugin/scripts/scan.mjs deep-dive check <key> --input <path> [--confirm <link>,...] [--root <qa-dir>]
 node plugin/scripts/scan.mjs brief judge <scenario-key> [--target <ref>] [--cap <bytes>] [--change <change-json>] [--root <qa-dir>]
 node plugin/scripts/scan.mjs brief feature <feature-key> [--target <ref>] [--root <qa-dir>]
 node plugin/scripts/scan.mjs brief design <scenario-key> [--expand | --regenerate] [--agreement <file>] [--root <qa-dir>]
-node plugin/scripts/scan.mjs check-reply <judge|design> <reply-path | --stdin> --brief <brief-json>
+node plugin/scripts/scan.mjs check-reply <judge|design> <reply-path | --input <path>> --brief <brief-json>
 node plugin/scripts/scan.mjs sync scope [<feature>] [--dir <run-dir>] [--root <qa-dir>]
 node plugin/scripts/scan.mjs sync card [<feature>] --dir <run-dir> [--root <qa-dir>]
-node plugin/scripts/scan.mjs sync apply --dir <run-dir> --stdin [--root <qa-dir>]
+node plugin/scripts/scan.mjs sync apply --dir <run-dir> --input <path> [--root <qa-dir>]
 node plugin/scripts/scan.mjs publish scope [<feature>] [--dir <run-dir>] [--root <qa-dir>]
 node plugin/scripts/scan.mjs publish card [<feature>] --dir <run-dir> [--root <qa-dir>]
-node plugin/scripts/scan.mjs publish apply --dir <run-dir> --stdin [--root <qa-dir>]
+node plugin/scripts/scan.mjs publish apply --dir <run-dir> --input <path> [--root <qa-dir>]
 node plugin/scripts/scan.mjs publish record --dir <run-dir> [--root <qa-dir>]
 node plugin/scripts/scan.mjs impact plan [<feature>] [--target <ref>] [--persist [--review [<feature>]]] [--cap <bytes>] [--dir <run-dir>] [--root <qa-dir>]
 node plugin/scripts/scan.mjs impact report --dir <run-dir>
@@ -42,36 +49,36 @@ node plugin/scripts/scan.mjs impact persist --dir <run-dir>
 node plugin/scripts/scan.mjs impact escalate --dir <run-dir> --case <key> [--root <qa-dir>]
 node plugin/scripts/scan.mjs impact entry [<feature> [<ref>...]] [--persist] [--review [<feature>]] [--target <ref>] [--root <qa-dir>]
 node plugin/scripts/scan.mjs impact quick [--dir <run-dir>] [--root <qa-dir>]
-node plugin/scripts/scan.mjs impact quick-check <feature> --dir <run-dir> --stdin [--root <qa-dir>]
+node plugin/scripts/scan.mjs impact quick-check <feature> --dir <run-dir> --input <path> [--root <qa-dir>]
 node plugin/scripts/scan.mjs design state <feature> [<scenario>] [--expand | --regenerate] [--review] [--root <qa-dir>]
-node plugin/scripts/scan.mjs design agree <scope> --stdin [--root <qa-dir>]
-node plugin/scripts/scan.mjs design split <feature> --stdin [--dir <run-dir>] [--root <qa-dir>]
-node plugin/scripts/scan.mjs design override --stdin [--dir <run-dir>]
+node plugin/scripts/scan.mjs design agree <scope> --input <path> [--root <qa-dir>]
+node plugin/scripts/scan.mjs design split <feature> --input <path> [--dir <run-dir>] [--root <qa-dir>]
+node plugin/scripts/scan.mjs design override --input <path> [--dir <run-dir>]
 node plugin/scripts/scan.mjs design plan <feature> [<scenario>] [--expand | --regenerate] [--dir <run-dir>] [--root <qa-dir>]
 node plugin/scripts/scan.mjs design unbind --dir <run-dir> <case-key>
 node plugin/scripts/scan.mjs design resume --dir <run-dir> [--root <qa-dir>]
 node plugin/scripts/scan.mjs design report --dir <run-dir>
-node plugin/scripts/scan.mjs design keep --dir <run-dir> --stdin
+node plugin/scripts/scan.mjs design keep --dir <run-dir> --input <path>
 node plugin/scripts/scan.mjs design walk --dir <run-dir> [--by human:<name>] [--case <key>]
-node plugin/scripts/scan.mjs design triage --dir <run-dir> --stdin [--case <key>]
+node plugin/scripts/scan.mjs design triage --dir <run-dir> --input <path> [--case <key>]
 node plugin/scripts/scan.mjs design checkpoint --dir <run-dir>
-node plugin/scripts/scan.mjs design rule-fix <feature> --dir <run-dir> --stdin
-node plugin/scripts/scan.mjs design page --dir <run-dir> [--stdin]
-node plugin/scripts/scan.mjs design page-reply --dir <run-dir> --stdin
-node plugin/scripts/scan.mjs design propose --dir <run-dir> --stdin
-node plugin/scripts/scan.mjs design link --dir <run-dir> --case <key> --stdin
+node plugin/scripts/scan.mjs design rule-fix <feature> --dir <run-dir> --input <path>
+node plugin/scripts/scan.mjs design page --dir <run-dir> [--input <path>]
+node plugin/scripts/scan.mjs design page-reply --dir <run-dir> --input <path>
+node plugin/scripts/scan.mjs design propose --dir <run-dir> --input <path>
+node plugin/scripts/scan.mjs design link --dir <run-dir> --case <key> --input <path>
 node plugin/scripts/scan.mjs delegate resolve --cmd <impact|design> [--root <qa-dir>]
 node plugin/scripts/scan.mjs delegate start --dir <run-dir>
 node plugin/scripts/scan.mjs delegate next --dir <run-dir>
 node plugin/scripts/scan.mjs delegate record --dir <run-dir> --unit <id> --attempt <n> [--status <status>] [--wall-ms <ms>]
 node plugin/scripts/scan.mjs init state [--root <qa-dir>]
-node plugin/scripts/scan.mjs init card --stdin [--dir <run-dir>] [--root <qa-dir>]
-node plugin/scripts/scan.mjs init apply --dir <run-dir> --stdin [--root <qa-dir>]
+node plugin/scripts/scan.mjs init card --input <path> [--dir <run-dir>] [--root <qa-dir>]
+node plugin/scripts/scan.mjs init apply --dir <run-dir> --input <path> [--root <qa-dir>]
 node plugin/scripts/scan.mjs init smoke --model <label> [--reply <file>] [--dir <run-dir>]
 node plugin/scripts/scan.mjs init add-role <name>... [--root <qa-dir>]
 node plugin/scripts/scan.mjs train evidence [<target>] [<scenario-key>] [--diff <commit-ish>] [--stack <root>] [--from-code] [--relearn] [--facet <facet>[,<facet>]] [--root <qa-dir>]
-node plugin/scripts/scan.mjs train check [<target>] --stdin [--root <qa-dir>]
-node plugin/scripts/scan.mjs train check categories [--stdin] [--root <qa-dir>]
+node plugin/scripts/scan.mjs train check [<target>] --input <path> [--root <qa-dir>]
+node plugin/scripts/scan.mjs train check categories [--input <path>] [--root <qa-dir>]
 node plugin/scripts/scan.mjs train auth-ignore <line> [--root <qa-dir>]
 node plugin/scripts/scan.mjs scout brief ui <url> <request> [--signed-out] [--dir <run-dir>] [--root <qa-dir>]
 node plugin/scripts/scan.mjs scout brief tracker --dir <run-dir> [--root <qa-dir>]
@@ -81,7 +88,7 @@ node plugin/scripts/scan.mjs scout login-steps <url> <login_state> [--root <qa-d
 node plugin/scripts/scan.mjs scout password-steps <via> [--root <qa-dir>]
 node plugin/scripts/scan.mjs scout header-steps <header_via> [--root <qa-dir>]
 node plugin/scripts/scan.mjs execute plan [<scope>...] [tag:<name>...] [level:<name>...] [target:<slug>] [--root <qa-dir>]
-node plugin/scripts/scan.mjs execute confirm --dir <run-dir>... [--stdin]
+node plugin/scripts/scan.mjs execute confirm (--dir <run-dir>)... [--input <path>]
 node plugin/scripts/scan.mjs execute open --dir <run-dir> --execution <id> [--root <qa-dir>]
 node plugin/scripts/scan.mjs execute close --dir <run-dir> --execution <id>
 node plugin/scripts/scan.mjs execute brief --dir <run-dir> --execution <id> [--root <qa-dir>]
@@ -108,7 +115,7 @@ node plugin/scripts/scan.mjs tester request <execution-id> <role> <METHOD> <url>
 node plugin/scripts/scan.mjs codefix plan [<Automation-or-Case key>…] [target:<slug>] [--pr] [--flaky] [--dir <run-dir>] [--root <qa-dir>]
 node plugin/scripts/scan.mjs codefix start --dir <run-dir> --item <id> [--root <qa-dir>]
 node plugin/scripts/scan.mjs codefix verify --dir <run-dir> --item <id> --hypothesis <text> [--root <qa-dir>]
-node plugin/scripts/scan.mjs codefix done --dir <run-dir> --item <id> --summary <text> [--assertions-reduced <reason>] [--root <qa-dir>]
+node plugin/scripts/scan.mjs codefix done --dir <run-dir> --item <id> --summary <text> [--root <qa-dir>]
 node plugin/scripts/scan.mjs codefix fail --dir <run-dir> --item <id> --reason <reason> [--root <qa-dir>]
 node plugin/scripts/scan.mjs codefix handoff --dir <run-dir> --item <id> --cause <cause> [--root <qa-dir>]
 node plugin/scripts/scan.mjs codefix regress --dir <run-dir> [--root <qa-dir>]
@@ -122,9 +129,9 @@ node plugin/scripts/scan.mjs codefix pr-record --dir <run-dir> (--url <url> | --
 newer `schema_version` than this CLI reads, or a malformed one, is refused by every command that
 writes into the repository, writing nothing; `scan` runs on, warning of a newer one.
 
-Every action that takes `--stdin` also takes `--input <path>`, which reads the same bytes from a
-file; the two are never given together. The skills and the briefs the CLI writes use `--input`: the
-agent writes the input to a file outside the repository, then runs one plain
+Every action that takes `--input <path>` also takes `--stdin`, which reads the same bytes from
+standard input; the two are never given together. The skills and the briefs the CLI writes use
+`--input`: the agent writes the input to a file outside the repository, then runs one plain
 `node <plugin>/scripts/scan.mjs <mode> ... --input <path>` line, with absolute paths and no pipe,
 heredoc, `&&` or `;` chain, variable prefix or `cd`. So the one allow rule `Bash(node:*)` covers
 every call the skills make to the CLI. `npm run lint:skills` fails a skill that shows one of those
@@ -194,7 +201,14 @@ Writers declare a minimum schema and refuse below it with `schema_migration_requ
 the first migration to run. Design and execution require schema 4; Feature writers retain
 `suite_schema_required` for the Suite boundary, schema 3. Readers continue to read older projects.
 
-`migration-status` is the read-only startup check used by all fourteen skills. Its JSON holds
+`migration-status` is the read-only migration check; every allowlisted entry mode (`ask`, `next`,
+`show`, `scan`, `migrate-keys`) and entry action (`bug read`, `bug discard`, `codefix plan`,
+`fix plan`, `codegen plan`, `deep-dive refs`, `deep-dive feature`, `deep-dive roles`,
+`deep-dive resume`, `design state`, `design resume`, `execute plan`, `execute follow-ups`,
+`impact entry`, `init state`, `init add-role`, `publish scope`, `sync scope`, `train evidence`,
+`scout brief`) carries its result at the top level as `migration` (including allowlisted `no_qa_dir`
+refusals), so skills still read it from their first command instead of making a separate call, while
+helper modes, inner-loop actions, and shared-parser usage errors omit it (`lib/modes.mjs`). Its JSON holds
 `pending`, ordered `migrations: [{version, command}]`, `count` and `declarations: [{file, line, key}]` for live Case headings and Scenario
 frontmatter keys that need migration. A heading that disagrees with its YAML key is counted once
 and reported with `malformed: true` and `block_key` (null when missing), even if the heading is
@@ -315,7 +329,7 @@ after Rule edits is always a bare `/qa-design <feature>`.
 
 `reconcile` is the Rule-edit transition on an existing Feature. It diffs the Feature file in the
 working tree against the one HEAD committed (the same four-kind Rule diff as `check` and the Scan) and
-reads the confirmed Impact forecast from `--stdin` as `{"changes": [...], "may_change": [...],
+reads the confirmed Impact forecast from `--input <path>` as `{"changes": [...], "may_change": [...],
 "unaffected": [...]}` of local Rule keys (conversation-time; only the answer for an edited statement is
 recorded, as below). It lists the `edited` Rules
 with their `band`, the ones `outside_band` (forecast Unaffected, or in no band), the `unedited_changes`,
@@ -390,7 +404,7 @@ Card's prose and closing report and maps the engineer's free-form Reply to JSON 
   once that is empty, `card`: counts, labels, questions, allowed edits, dependencies and tables.
   Sections are annotation declarations, Mirror refresh, Tracker intake, Key prefixes and
   code repairs. A failed or missing payload omits the tracker sections and supplies a note.
-- `apply` reads JSON decisions on stdin (`{"take":"all","drop":[3],"edits":{"4":{"level":"ui"},"7":{"keep":1}}}`),
+- `apply` reads JSON decisions from the file `--input <path>` names (`{"take":"all","drop":[3],"edits":{"4":{"level":"ui"},"7":{"keep":1}}}`),
   rebuilds the Card and checks the run dir's digest, ids and values. `take: "all"` means explicit
   whole-Card acceptance; otherwise unaddressed items remain open. It returns factual refusals,
   `rebuild` when fresh answers are needed, or a report of the applied items, files and exact commit
@@ -502,7 +516,8 @@ Overreach is written on the Feature file, with the Rule as its subject. A Featur
 due once its Feature-level unit is judged too, and it advances at `persist` only when the walk has
 no case to settle; otherwise it waits for `checkpoint` (see below). `design walk` shows the
 triage walk one case at a time, its findings numbered and the answers it offers (none chosen), and
-stores the engineer's `--by` name once; `design triage` settles that case from JSON decisions on stdin
+stores the engineer's `--by` name once; `design triage` settles that case from JSON decisions in the
+file `--input <path>` names
 (`{"findings": [{"n": 1, "answer": "dismiss", "reason": "…", "ticket": "X"}], "review": "leave"}`,
 `decisionsOf` in lib/impact-json.mjs). A finding's answer is `dismiss`, `keep`, `fix` or, for a Stale
 only, `holds`: `holds` writes `holds: {by, at, commit}` on that Stale cause (refused while what it
@@ -516,7 +531,7 @@ earlier one. `design checkpoint` is checkpoint 2: refused with `walk_unfinished`
 with `persist_refused` while `.qa/` holds uncommitted knowledge; otherwise it advances each Watermark
 the persisted run held to HEAD (the commit the Reviews pin), prunes the Stale closed with `holds`, and
 prints `{ok, checkpoint: {commit, watermarks, pruned}, changeset, merge_rules, glossary}`. A Stale still
-open keeps its own baseline and target. `design rule-fix <feature> --dir <run-dir> --stdin` is a Rule fix on
+open keeps its own baseline and target. `design rule-fix <feature> --dir <run-dir> --input <path>` is a Rule fix on
 the walk: the engineer has edited a Rule of `<feature>` in the working tree (uncommitted) and pipes
 the confirmed forecast, as `deep-dive reconcile` reads it (lib/rule-fix.mjs, lib/settle-walk.mjs). It
 runs that Rule-edit transition and prints its Boundary check (`boundary_check`), downstream walk
@@ -549,8 +564,11 @@ has no invented Expected result and is not written as a Test Case. A question-on
 `awaiting_rules`; a mixed reply writes its settled cases. Questions and the brief's Rule claims stay
 in the Run's written record.
 
-`design report --dir <run-dir>` returns `questions` and `question_handoff`, and writes the Run's
-`design-questions.json`. `deep-dive resume --dir <run-dir>` reads this handoff as `design_questions`
+`design report --dir <run-dir>` returns `sections`: the non-empty ones, in a fixed order from
+`written` to `run_health`, each `{id, label, items}` or, for `written` and `declared_coverage`,
+`{id, label, markdown}`, with an optional `next` naming the command that section hands off to.
+Its `questions` section lists the held questions, `next` the deep-dive handoff, and the command
+writes the Run's `design-questions.json`. `deep-dive resume --dir <run-dir>` reads this handoff as `design_questions`
 and `open_questions`; deep-dive parks unanswered questions in the Feature's existing Open questions
 section. `design resume --dir <run-dir>` returns `held_cases`: `waiting` while Rule claims are
 unchanged or the question remains parked, otherwise `ready` with the proposal and a scoped `rerun`.
@@ -561,21 +579,21 @@ one. No new Finding kind is introduced.
 `check-reply design` also reads `check_gaps`: each `{case, needs}` names one of the reply's own
 cases by its summary and what checking its Expected result needs of the test environment. A
 malformed entry is `bad_check_gap`; one naming no case of the reply is `unknown_check_case`.
-`design report` returns them as `check_gaps` `[{scenario, label, key, case, needs}]`, `key` null
-when the Run wrote no such case, with `check_handoff` `/qa-train design`. They are never proposed
+`design report` lists them in its `check_gaps` section, items `{scenario, label, key, case, needs}`,
+`key` null when the Run wrote no such case, `next` `/qa-train design`. They are never proposed
 Rules: the behaviour is already a Rule's, and only how to check it is Training's.
 
-`design report --dir <run-dir>` lists `bindings`: each written bound case's `key`, `scenario`,
+The report's `bindings` section lists each written bound case's `key`, `scenario`,
 `file`, canonical `level` and `reason`. Reasons live only in the Run's `<scenario>.written.json`,
-never on the case. Cases are written to the working tree as replies arrive. `case_warnings` lists
-each written case the scan's `partial_permission_binding` warns about: its `key`, `scenario`, `file`
+never on the case. Cases are written to the working tree as replies arrive. Its `case_warnings`
+section lists each written case the scan's `partial_permission_binding` warns about: its `key`, `scenario`, `file`
 and `missing_levels`, so binding review shows it before Review. Before a case is kept
 by commit or Review, `design unbind --dir <run-dir> <case-key>` removes its `level` and records
 `unbound: true` beside its original binding and reason in the Run. Repeating it is safe. It refuses
 a case the Run did not write, a missing or ambiguous case, a committed or reviewed case, unreadable
 repository history, or an edit that fails file checking; refusals change nothing.
-`missing_levels` contains `agreed_level_without_cases` only for levels explicitly named in the
-agreement; omitting levels creates no such obligation.
+Its `missing_levels` section lists `agreed_level_without_cases` only for levels explicitly named
+in the agreement; omitting levels creates no such obligation.
 
 `design` briefs and reports carry the project's labels (ADR-0045). `brief design` adds `labels`
 `{tags, retiredTags, customFields}` and the brief text lists only the Tags that have a meaning and each
@@ -583,13 +601,14 @@ Custom field's description and active values. `check-reply design` reads a case'
 field under its own name apart from the claim: a Tag with no meaning, an unknown or retired Tag or value
 and a wrong shape are dropped from the case (`cases[].tags`, `cases[].custom` hold the rest) and listed
 in `dropped_labels` `[{case, field, value, code}]`, never a reason the reply is unusable. The codes are
-`label_shape`, `label_unknown`, `label_retired` and `label_unmeant`. `design report` lists them per
-written scenario as `scenarios[].dropped_labels` `[{key, label, field, value, code, line}]`. The Tag and
+`label_shape`, `label_unknown`, `label_retired` and `label_unmeant`. `design report` lists them in
+its `dropped_labels` section, items `{scenario, scenario_label, key, label, field, value, code, line}`. The Tag and
 Custom-field definitions join the agreement's `basis`, so changing one makes `design split` refuse a
 recorded agreement with `stale_agreement`. `--regenerate` lends a replaced case's Tags and Custom-field
 values to the regenerated case that covers the same Rules, and the filler's labels only add to them.
 A label it cannot lend is reported, never dropped silently: the write result and `design report`
-(`scenarios[].lost_labels` `[{key, label, field, value, code, line}]`, `key` the replaced case) list it
+(its `lost_labels` section, items `{scenario, scenario_label, key, label, field, value, code, line}`,
+`key` the replaced case) list it
 with `label_unmatched` (no regenerated case covers the same Rules) or `label_retired` (the Tag or value
 is retired, so it is not given to a new case).
 
@@ -634,7 +653,7 @@ dir an escalation named keeps its `change.json`) and prints `dir`, `design_dir` 
 design's own agreement, plan and unit briefs go, since `impact plan` and `design plan` each keep a
 `plan.json`), `threshold` `{limit, source}` and any `handoff` already there. One dir serves one change:
 `deep-dive reconcile --dir`, `impact escalate --dir`, `impact plan --persist --dir` and the settle walk
-(`design walk --dir`) all name it. `quick-check <feature> --dir <run-dir> --stdin` reads `{forecast:
+(`design walk --dir`) all name it. `quick-check <feature> --dir <run-dir> --input <path>` reads `{forecast:
 {changes, may_change, unaffected, widened?, by?}, references: [<URI>], open_questions?: [<text>]}`,
 runs the Rule-edit transition (`deep-dive reconcile`'s own function, and prints its output) and counts
 the threshold: `threshold` `{limit, source, rules, stale_cases, total, over}`, where `rules` is every
@@ -642,7 +661,7 @@ Rule added, edited or retired in the working tree against HEAD in any Feature (t
 confirmed, a downstream one included) and `stale_cases` the distinct cases the Scan's
 `history.stale_obligations` owes over the working tree, the downstream walk's cases among them. The
 limit is 10 or a Practice of `train/impact.md` reading "Quick path threshold: <n>" (the last one wins,
-`source` names it); the quick path stops when `total` is more than the limit. Below it, `changeset` `{paths, commit}` is Checkpoint 1's commit: the knowledge files differing from HEAD, for `commit --stdin` (ADR-0062); over it, `{paths: [], commit: null}`. Then it writes
+`source` names it); the quick path stops when `total` is more than the limit. Below it, `changeset` `{paths, commit}` is Checkpoint 1's commit: the knowledge files differing from HEAD, for `commit --input <path>` (ADR-0062); over it, `{paths: [], commit: null}`. Then it writes
 `<dir>/handoff.json`, `{v: 1, references, edits: [{feature, rule, band}], open_questions, written}`
 (`band` is the forecast band of an edit in `<feature>`, null outside the forecast, and `downstream` in
 another Feature; `written` the knowledge files differing from HEAD), prints its path as `handoff` and a
@@ -650,14 +669,14 @@ another Feature; `written` the knowledge files differing from HEAD), prints its 
 earlier call wrote and the `next_step` is checkpoint 1 followed by `impact plan --persist --dir`. It
 refuses `run_dir` (no such dir) and `quick_input`.
 
-`design propose --dir <run-dir> --stdin` records design's proposals in the run dir's `proposals.json`:
+`design propose --dir <run-dir> --input <path>` records design's proposals in the run dir's `proposals.json`:
 `{v: 1, items: {<case key>: {outcome?, reason?, covers?, relies_on?}}}`. `outcome` (`keep`, `fix` or
 `retire`) is for a case with an open Stale (`proposal_not_stale` otherwise); `covers` and `relies_on`
 name live Rules (`proposal_link`). A refusal writes nothing, and a later entry replaces the case's
 earlier one. `walk` prints the case's proposal as `case.proposal` beside `choices`, with the links the
 case holds now (`current`) and `confirmed` once it holds the proposed ones; the Card page prints it
 beside the case. A proposal answers nothing and writes nothing. `design link --dir <run-dir> --case
-<key> --stdin` writes the links the engineer confirmed, `{covers?, relies_on?}`: a list given replaces
+<key> --input <path>` writes the links the engineer confirmed, `{covers?, relies_on?}`: a list given replaces
 the case's own, every Rule must be live (`link_rule`), the file passes `check-file`, and the path joins
 the walk's changeset. Any case may be linked, an Uncited one included.
 
@@ -675,11 +694,16 @@ reply, contract}]}`) and hands its run directory over:
   missing). The label is passed to the subagent unchanged; `scout brief ui|tracker` names its
   Tier's model the same way (`tier`, `label`, `model`).
 - `start` resolves the Delegate once, before the first unit, and mints the 8-char Run id.
-- `next` hands the units back to spawn as subagents, with the fixed prompt that points at the
-  brief file (ADR-0011): 3 attempts per (unit, Delegate), kind-blind, each
-  retry at the back of the queue after 15 s × attempt; a breaker that trips on `quota`, on 3
-  consecutive failed retries or at once on a refused spawn, and moves the remaining units to the
-  Fallback with a fresh budget, stopping if the Fallback trips.
+- `next` hands the units back to spawn as subagents synchronously, with the fixed prompt that points at
+  the brief file (ADR-0011): 3 attempts per (unit, Delegate), kind-blind, each retry at the back of
+  the queue after 15 s × attempt; a breaker that trips on `quota`, on 3 consecutive failed retries or
+  at once on a refused spawn, and moves the remaining units to the Fallback with a fresh budget,
+  stopping if the Fallback trips. It never sleeps in-process or creates `attempts/` / rewrites
+  `dispatch.json` while waiting: when `dispatch` and `in_flight` are empty, `!done`, and queued
+  units are in cooldown (`not_before > now`), it emits `wait_ms` and `next_ready_at` (ISO-8601 UTC
+  timestamp) so `plugin/scripts/delegation.md` waits via standalone
+  `node -e "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, <wait_ms> + 25)"` before
+  re-calling `delegate next`.
 - `record` settles one attempt from its saved reply. A failure is classified `quota` or `other`.
 
 `QA_SKILLS_DISPATCH_SCALE` scales those times; only the tests set it.
@@ -733,18 +757,24 @@ exclusion, each case's Role to Access note mapping, blocked and skipped cases an
 directory, and the ingest command to run when the Run is over. On a host whose Tester guard cannot be verified
 (one that fails host admission for any check but the floor; Claude Code below the floor is refused
 `host_unverified` with an upgrade message instead) the plan carries `unguarded` and its confirm says so; `execute confirm` then refuses
-`unguarded_unacknowledged` unless `--stdin` carries the engineer's `{"acknowledge": "unguarded"}`,
+`unguarded_unacknowledged` unless `--input <path>` carries the engineer's `{"acknowledge": "unguarded"}`,
 and refuses `card_changed` when the plan or the host changed since the Card was shown (ADR-0057). `execute automation` runs each
 selected case's Automations once through the project's `test_runner`, with `automation_retries` from
 `train/execute.md`, one invocation per `<run>/automation/<n>/`, and writes their per-instance
 attempts to `<run>/automation.json`; `execute next` starts a Tester Execution only for a case whose
-aggregate Automation result is Failed or that has no Automation, and `execute ingest` records the
-Automation results and any `execution_skipped` reason in the same case block. `execute record`
+aggregate Automation result is Failed or that has no Automation, running synchronously without
+in-process sleeps: when `start` is empty, `in_flight` is `0`, `!done`, and no Access note is paused
+(`paused` section absent), any remaining retry cooldown returns `wait_ms` and `next_ready_at`
+alongside accumulated `sections` and optional `unguarded` so `/qa-execute` pauses via standalone
+`node -e "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, <wait_ms> + 25)"` before
+re-calling `execute next` (while paused Access notes suppress cooldown backoff so the engineer prompt
+runs first), and `execute ingest` records the Automation results and any `execution_skipped` reason
+in the same case block. `execute record`
 settles one attempt, and its optional `--reason-file <path>` is a file holding the Tester's reply,
 which it reads and removes; a record with no report shows that reply as its Why. `execute open` opens
 the application
 session for one Execution through the guarded `tester` wrapper, re-checking the host version first
-(see the [Claude Code row](https://github.com/Kinasr/qa-skills/blob/v0.14.1/docs/support.md#claude-code));
+(see the [Claude Code row](https://github.com/Kinasr/qa-skills/blob/v0.15.1/docs/support.md#claude-code));
 `tester do` and `tester request` are that wrapper's two commands, scrubbed by
 `plugin/scripts/lib/credentials.mjs`. `execute ingest` writes one Execution record at
 `.qa/executions/<date>-<run-id>.md` — outside the knowledge layer, uncommitted, and never
@@ -773,7 +803,7 @@ whose latest outcome did not fail; `--cause` selects the standalone fix-hand-off
 no `record` and needs none. `bug write --case <key>` writes that draft without a follow-up work list.
 `bug discard` deletes named drafts, refusing a published one. The storage and lifecycle of every
 store a Run creates is in
-[docs/support.md](https://github.com/Kinasr/qa-skills/blob/v0.14.1/docs/support.md#storage-and-lifecycle).
+[docs/support.md](https://github.com/Kinasr/qa-skills/blob/v0.15.1/docs/support.md#storage-and-lifecycle).
 
 
 ## Code generation
@@ -781,7 +811,7 @@ store a Run creates is in
 `codegen plan` is `/qa-codegen`'s plan step (`plugin/scripts/lib/codegen.mjs`): it refuses an
 unresolved Convention `ref`, a missing `test_runner`, and the same scope and
 Integrity refusals execute makes, then writes one item per eligible case to `<run>/codegen.json`.
-`train check codegen --stdin` accepts an `approaches` frontmatter list in `train/codegen.md`:
+`train check codegen --input <path>` accepts an `approaches` frontmatter list in `train/codegen.md`:
 each entry has `approach` (`api`, `mocked-ui` or `full-ui`), a project `level`, and a
 repository-relative `path` pattern. Only `/qa-train codegen` writes it. Patterns support `*`,
 `?` and whole-segment `**`. Scan reports each Automation's path-derived `level` in
@@ -814,10 +844,13 @@ is written. Feature existence is determined by directories under `features/`, in
 whose own file is unreadable. One scoped scan retains the full parsed index for cross-Feature
 lookups. No second scan is performed.
 
-The JSON returns `ok`, `knowledge_page: {path}` (or null), `migration`, `schema`, and `refusal`
-(null on success; otherwise `{code, message}`). Usage errors return `ok: false, error`, exit 2.
-A pending migration renders a banner and continues. Only `schema_newer` refuses compatibility,
-exit 1. Snapshot safety refusals also exit 1, with `refusal.code: snapshot_write`.
+The JSON returns `ok`, `knowledge_page: {path}` (or null), `migration`, and ordered `sections` on
+success (`Schema compatibility` when non-current), and `{ok: false, knowledge_page: null,
+migration, refusals: [{code, ...facts}], sections: []}` on exit-1 refusals. Usage errors return
+`{mode, [migration,] ok: false, refusals: [{code, ...facts}]}`, exit 2. A pending migration renders
+a banner and continues. Only `schema_newer` (`{version, supported, file: "project.md"}`) refuses
+compatibility, exit 1. Snapshot safety refusals also exit 1, under `refusals` (such as
+`snapshot_write`).
 
 The file is `$TMPDIR/qa-skills/show-<root hash>[-<feature-key>].html`, replaced on each run;
 its directory is private (0700), its file is private (0600), and symlinks are refused.

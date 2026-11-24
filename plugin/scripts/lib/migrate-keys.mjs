@@ -31,8 +31,7 @@
 /** @import { RefusalFact, RefusalResult } from "./refusal.mjs" */
 /** @import { ScanFinding, KnowledgeIndex } from "./scan-integrity.mjs" */
 /** @import { UnreadSchemaRefusal } from "./schema-guard.mjs" */
-import { mkdirSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import { writeAll } from "./changeset.mjs";
 import { scan } from "./scan.mjs";
 import { isMap } from "./dialect.mjs";
@@ -43,31 +42,24 @@ import { checkFile, edit, parse, projectConfig, ruleItem } from "./knowledge-fil
 import { planLevelMigration, planMigration } from "./migration-plan.mjs";
 import { backfill, digests, isMigratedPin, pinsOf, writtenDigest } from "./pin-digest.mjs";
 import { buildIndex, loadWorkingTree } from "./qa-index.mjs";
-import { refusalsFor } from "./refusal.mjs";
+import { refusalsWithoutLines } from "./refusal.mjs";
 import { refuseUnreadSchema } from "./schema-guard.mjs";
 import { ANY_SCHEMA_VERSION, LAYER_FREE_CASE_SCHEMA_VERSION, LEVEL_ON_CASE_SCHEMA_VERSION, RULE_LIST_SCHEMA_VERSION, SUITE_KEYS_SCHEMA_VERSION } from "./schema.mjs";
 import { mint } from "./mint.mjs";
 import { run as integrity } from "./scan-integrity.mjs";
 import { coverageDigest } from "./coverage.mjs";
 
-const NOTHING = "Nothing was written.";
-const { fact } = refusalsFor({
-  not_in_git: `\`.qa/\` is not inside a git repository, so an interrupted migration could not be undone. ${NOTHING}`,
-  dirty_tree: `\`.qa/\` has uncommitted changes. Commit or restore them, then run the migration again. ${NOTHING}`,
-  git_status_failed: `Git could not say whether \`.qa/\` has uncommitted changes. ${NOTHING}`,
-  not_default_branch: `Suite backfill runs only on the default branch, identified by origin/HEAD. If origin/HEAD is unset, run \`git remote set-head origin --auto\`. ${NOTHING}`,
-  identity_error: `The migrated tree has an identity error. Fix it before migrating. ${NOTHING}`,
-  no_project: `\`.qa/project.md\` is missing, so there is no schema version to bump. ${NOTHING}`,
-  unreadable_file: `The file cannot be read as a \`.qa/\` file, so it cannot be rewritten safely. Fix it, then run the migration again. ${NOTHING}`,
-  collision: `Entries would take the same Key, tracker key or tombstone. ${NOTHING}`,
-  invalid_override: `A \`migrate_as:\` is not a Key of its kind. ${NOTHING}`,
-  unresolved_ancestry: `An entry's \`new_…\` history does not resolve to one oldest ancestor. ${NOTHING}`,
-  rewrite_failed: `A rewrite of the file could not be applied. ${NOTHING}`,
-  rename_target_exists: `A Scenario file would be renamed onto another file. ${NOTHING}`,
-  rule_outside_section: `A Rule or Boundary heading outside \`## Rules\` or \`## Boundaries\` cannot become a list item there. Move it under its section, then run the migration again. ${NOTHING}`,
-  prose_in_section: `A \`## Rules\` or \`## Boundaries\` section has prose before its first entry, which the migration would leave outside every item. Move that prose above the section heading or into a Rule's elaboration, then run the migration again. ${NOTHING}`,
-  changed_tree: `\`.qa/\` changed while the migration ran, so its result would overwrite a newer edit. Run it again. ${NOTHING}`,
-});
+const { fact } = refusalsWithoutLines((code, data) => ({
+  wrote: false,
+  ...(code === "dirty_tree" && { fix: "commit or restore the changes" }),
+  ...(code === "not_default_branch" && { fix: "git remote set-head origin --auto" }),
+  ...(code === "identity_error" && { fix: "fix the identity error" }),
+  ...(code === "unreadable_file" && { fix: "fix the file" }),
+  ...(code === "rule_outside_section" && { fix: "move the heading under ## Rules or ## Boundaries" }),
+  ...(code === "prose_in_section" && { fix: "move the prose above the section heading or into a Rule's elaboration" }),
+  ...(code === "changed_tree" && { retry: true }),
+  ...data,
+}));
 // Refusals are states of the tree, not usage errors: exit 1.
 /**
  * @param {...RefusalFact} facts
@@ -220,11 +212,11 @@ export function migrateKeys(root, { levels = false, levelMap = "", currentTree }
       ["key", "suite_key", "tracker", "tracker_formerly", "retired", "retired_features", "formerly", "rule"].includes(/** @type {string} */ (e.field?.split(".").at(-1)))));
   if (errors.length) return refused(fact("identity_error", { errors }));
 
-  for (const [rel, text] of migrated.writes) {
-    mkdirSync(dirname(join(root, rel)), { recursive: true });
-    writeFileSync(join(root, rel), backfill(root, rel, text));
-  }
-  for (const { from } of migrated.renamed) unlinkSync(join(root, from));
+  const written = writeAll(root, {
+    writes: [...migrated.writes].map(([path, text]) => ({ path, text: backfill(root, path, text) })),
+    deletes: migrated.renamed.map(({ from }) => from).filter((from) => !migrated.writes.has(from)),
+  });
+  if (written.error) return refused(fact("write_failed", { reason: written.error }));
   return { exit: 0, json: {
     ok: true,
     changed: migrated.writes.size > 0,
@@ -277,10 +269,11 @@ export function introducedCheckErrors(before, after, rewritten) {
  * @returns {{ refusal: MigrationRefusal } | { result: Extract<MigrationOutcome, { writes: Map<string, string> }> }}
  */
 function migrateRuleList(root, files, applied, currentTree = () => loadWorkingTree(root)) {
+  const postFiles = /** @type {MigrationFile[]} */ (applied.after);
   /** @type {Map<string, string>} */
-  const texts = new Map(files.map((f) => [f.rel, applied.writes.get(f.rel) ?? f.text]));
+  const texts = new Map(postFiles.map((f) => [f.rel, applied.writes.get(f.rel) ?? f.text]));
   // 1. Rewrite every heading entry into an item, word for word.
-  for (const file of files) {
+  for (const file of postFiles) {
     if (file.type !== "feature") continue;
     const text = /** @type {string} */ (texts.get(file.rel));
     const done = rewriteFeatureRules(file.rel, text);
@@ -288,7 +281,7 @@ function migrateRuleList(root, files, applied, currentTree = () => loadWorkingTr
     if (done.text !== text) texts.set(file.rel, done.text);
   }
   // 2. Recompute each Feature's Coverage digest from the rewritten entries.
-  for (const file of files) {
+  for (const file of postFiles) {
     if (file.type !== "feature") continue;
     const current = parse(file.rel, /** @type {string} */ (texts.get(file.rel)));
     if (current.data.coverage_digest === undefined) continue;
@@ -301,10 +294,10 @@ function migrateRuleList(root, files, applied, currentTree = () => loadWorkingTr
 
   const afterRules = [...texts].map(([rel, text]) => parse(rel, text));
   const nowDigests = digests(afterRules);
-  const legacyNow = digests(files, { legacy: true });
+  const legacyNow = digests(postFiles, { legacy: true });
   const repo = /** @type {import("./git-tree.mjs").Repository} */ (repositoryOf(root));
-  const resolved = resolveCommits(root, files.flatMap((f) => pinsOf(f).map((p) => p.commit))).resolved;
-  const { pins, changes } = carryPins(files, { nowDigests, legacyNow, resolved, repo });
+  const resolved = resolveCommits(root, postFiles.flatMap((f) => pinsOf(f).map((p) => p.commit))).resolved;
+  const { pins, changes } = carryPins(postFiles, { nowDigests, legacyNow, resolved, repo });
 
   for (const [rel, edits] of changes) {
     const done = edit(parse(rel, /** @type {string} */ (texts.get(rel))), edits);
@@ -313,7 +306,7 @@ function migrateRuleList(root, files, applied, currentTree = () => loadWorkingTr
   }
 
   // 3. The schema marker moves with the format.
-  const project = files.find((f) => f.type === "project" && !f.unreadable);
+  const project = postFiles.find((f) => f.type === "project" && !f.unreadable);
   if (!project) return { refusal: { code: "no_project", data: { root } } };
   const marked = edit(parse(project.rel, /** @type {string} */ (texts.get(project.rel))), [{ set: { schema_version: RULE_LIST_SCHEMA_VERSION } }]);
   if (!marked.ok) return { refusal: { code: "rewrite_failed", data: { file: project.rel, errors: marked.errors } } };
@@ -321,7 +314,7 @@ function migrateRuleList(root, files, applied, currentTree = () => loadWorkingTr
 
   // 4. Nothing is written until every result reads: the rewrite may carry an error that was already
   // in the tree, as the earlier steps' `check.errors` do, but it may not introduce one.
-  const writes = new Map([...texts].filter(([rel, text]) => files.find((f) => f.rel === rel)?.text !== text));
+  const writes = new Map([...texts].filter(([rel, text]) => applied.writes.has(rel) || files.find((f) => f.rel === rel)?.text !== text));
   const beforeConfig = projectConfig(files.find((f) => f.type === "project"));
   const errorsBefore = files.flatMap((f) => checkFile(f, beforeConfig).errors.map((e) => ({ file: f.rel, ...e })));
   const after = [...texts].map(([rel, text]) => parse(rel, text));
@@ -362,15 +355,29 @@ function migrateRuleList(root, files, applied, currentTree = () => loadWorkingTr
  * @returns {{ pins: PinOutcome[], changes: Map<string, EditChange[]> }}
  */
 function carryPins(files, { nowDigests, legacyNow, resolved, repo }) {
-  /** @type {Map<string, { legacy: PinDigests, now: PinDigests }>} */
+  const aliases = { case: new Map(), scenario: new Map() };
+  /** @param {"case" | "scenario"} scope @param {unknown} key @param {Record<string, unknown>} data */
+  const recordAlias = (scope, key, data) => {
+    if (typeof key !== "string" || !Array.isArray(data.formerly)) return;
+    for (const old of data.formerly) if (typeof old === "string") aliases[scope].set(old, key);
+  };
+  for (const f of files) {
+    if (f.unreadable || f.type !== "scenario") continue;
+    recordAlias("scenario", f.data.key, f.data);
+    for (const c of f.cases) recordAlias("case", c.key, c.data);
+  }
+  /** @param {string} scope @param {string} field @param {unknown} v */
+  const identity = (scope, field, v) => (field === "key" ? (aliases[/** @type {"case" | "scenario"} */ (scope)]?.get(v) ?? v) : v);
+
+  /** @type {Map<string, { legacy: PinDigests, legacyAliased: PinDigests, now: PinDigests }>} */
   const byCommit = new Map();
   /** @param {string} commit */
   const at = (commit) => {
     if (!byCommit.has(commit)) {
       const qa = loadQaAt(repo, commit);
-      byCommit.set(commit, { legacy: digests(qa, { legacy: true }), now: digests(qa) });
+      byCommit.set(commit, { legacy: digests(qa, { legacy: true }), legacyAliased: digests(qa, { legacy: true, identity }), now: digests(qa) });
     }
-    return /** @type {{ legacy: PinDigests, now: PinDigests }} */ (byCommit.get(commit));
+    return /** @type {{ legacy: PinDigests, legacyAliased: PinDigests, now: PinDigests }} */ (byCommit.get(commit));
   };
   /** @param {unknown} commit @returns {string | null} */
   const full = (commit) => (typeof commit === "string" ? resolved.get(commit) ?? null : null);
@@ -385,9 +392,34 @@ function carryPins(files, { nowDigests, legacyNow, resolved, repo }) {
     /** @type {EditChange[]} */ (changes.get(rel)).push(change);
   };
 
+  /**
+   * Key and historical aliases of an entry, so renamed entries resolve pins at pre-migration commits.
+   * @param {string} key
+   * @param {Record<string, unknown>} data
+   * @returns {string[]}
+   */
+  const keyAliases = (key, data) => [
+    key,
+    ...(Array.isArray(data.formerly) ? data.formerly.filter((k) => typeof k === "string") : []),
+  ];
+  /**
+   * @template K, V
+   * @param {readonly K[]} keys
+   * @param {(key: K) => V | null} read
+   * @returns {V | null}
+   */
+  const firstNonNull = (keys, read) => {
+    for (const k of keys) {
+      const value = read(k);
+      if (value !== null) return value;
+    }
+    return null;
+  };
+
   for (const file of files) {
     if (file.unreadable) continue;
     const feature = file.type === "feature" ? /** @type {string} */ (file.data.key) : null;
+    const featureSlug = feature ?? (typeof file.data.feature === "string" ? file.data.feature : null);
     // The Watermark is a commit pin too: it carries the Feature digest the pin was taken at.
     if (file.type === "feature") {
       const raw = file.data.watermark;
@@ -426,7 +458,8 @@ function carryPins(files, { nowDigests, legacyNow, resolved, repo }) {
       /** @type {PinOutcome["status"]} */
       let status;
       if (R !== null && !isMigratedPin(review)) {
-        status = at(R).legacy.review(entry.key) !== null && at(R).legacy.review(entry.key) === legacyNow.review(entry.key) ? "carried" : "stale";
+        const atCommit = firstNonNull(keyAliases(entry.key, entry.data), (k) => at(R).legacyAliased.review(k));
+        status = atCommit !== null && atCommit === legacyNow.review(entry.key) ? "carried" : "stale";
       } else {
         const stored = writtenDigest(review.digest);
         status = stored === null ? "unverified" : stored === legacyNow.review(entry.key) ? "carried" : "stale";
@@ -434,13 +467,34 @@ function carryPins(files, { nowDigests, legacyNow, resolved, repo }) {
       pins.push({ file: file.rel, key: entry.key, pin: "review", status });
       if (status === "carried") change(file.rel, { at: entry.key, set: { review: { ...review, digest: nowDigests.review(entry.key), migrated: RULE_LIST_SCHEMA_VERSION } } });
     }
-    // Dismissals, Feature-level and case-level, by the same before/after rule.
+    // Dismissals, Feature-level and case-level, by the same before/after rule, plus `at_digest`.
     const owners = file.type === "feature" ? [{ key: null, data: file.data }] : file.type === "scenario" ? file.cases.map((c) => ({ key: c.key, data: c.data })) : [];
     for (const owner of owners) {
       if (!Array.isArray(owner.data.finding)) continue;
       let touched = false;
+      const ownerAliases = owner.key === null ? [null] : keyAliases(owner.key, owner.data);
       const finding = owner.data.finding.map((x) => {
-        if (!isMap(x) || !isMap(x.dismissed)) return x;
+        if (!isMap(x)) return x;
+        let next = x;
+        const storedAt = writtenDigest(x.at_digest);
+        if (x.at_commit !== undefined && x.at_commit !== null && storedAt !== null && featureSlug !== null) {
+          const A = full(x.at_commit);
+          /** @type {string | null} */
+          let updatedAt = null;
+          if (A !== null) {
+            if (storedAt === at(A).legacy.feature(featureSlug)) updatedAt = at(A).now.feature(featureSlug);
+            else if (storedAt === at(A).legacy.featureLocal(featureSlug)) updatedAt = at(A).now.featureLocal(featureSlug);
+          } else if (storedAt === legacyNow.feature(featureSlug)) {
+            updatedAt = nowDigests.feature(featureSlug);
+          } else if (storedAt === legacyNow.featureLocal(featureSlug)) {
+            updatedAt = nowDigests.featureLocal(featureSlug);
+          }
+          if (updatedAt !== null && updatedAt !== storedAt) {
+            next = { ...next, at_digest: updatedAt };
+            touched = true;
+          }
+        }
+        if (!isMap(x.dismissed)) return next;
         const key = owner.key ?? (typeof x.subject_key === "string" ? x.subject_key : typeof x.rule === "string" ? x.rule : null);
         const dismissed = x.dismissed;
         const D = full(dismissed.commit);
@@ -448,15 +502,16 @@ function carryPins(files, { nowDigests, legacyNow, resolved, repo }) {
         /** @type {PinOutcome["status"]} */
         let status;
         if (D !== null && !isMigratedPin(dismissed)) {
-          status = noText || at(D).legacy.dismissal(owner.key, x, feature) === legacyNow.dismissal(owner.key, x, feature) ? "carried" : "stale";
+          const atCommit = noText ? null : firstNonNull(ownerAliases, (k) => at(D).legacyAliased.dismissal(k, x, feature));
+          status = noText || (atCommit !== null && atCommit === legacyNow.dismissal(owner.key, x, feature)) ? "carried" : "stale";
         } else {
           const stored = writtenDigest(dismissed.digest);
           status = stored === null ? "unverified" : stored === legacyNow.dismissal(owner.key, x, feature) ? "carried" : "stale";
         }
         pins.push({ file: file.rel, key, pin: "dismissed", status });
-        if (status !== "carried") return x;
+        if (status !== "carried") return next;
         touched = true;
-        return { ...x, dismissed: { ...dismissed, digest: nowDigests.dismissal(owner.key, x, feature), migrated: RULE_LIST_SCHEMA_VERSION } };
+        return { ...next, dismissed: { ...dismissed, digest: nowDigests.dismissal(owner.key, x, feature), migrated: RULE_LIST_SCHEMA_VERSION } };
       });
       if (touched) change(file.rel, { at: owner.key === null ? undefined : owner.key, set: { finding } });
     }
@@ -671,7 +726,7 @@ export const command = {
 /**
  * @param {string} root
  * @param {string} levelMap
- * @returns {LevelMigrationResult}
+ * @returns {LevelMigrationResult | UnreadSchemaRefusal}
  */
 function migrateLevels(root, levelMap) {
   const guard = refuseUnreadSchema(root, ANY_SCHEMA_VERSION);

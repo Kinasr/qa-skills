@@ -1,8 +1,8 @@
 // @ts-check
-// Byte-offset edits to one text, the write side every stack adapter shares (lib/stack.mjs).
+// UTF-16 code-unit offset edits to one text, the write side every stack adapter shares (lib/stack.mjs).
 
 /**
- * An edit at a byte offset within a text: `del` characters at offset `at` replaced by `ins`.
+ * An edit at a UTF-16 code-unit offset within a text: `del` code units at offset `at` replaced by `ins`.
  * @typedef {{
  *   at: number,
  *   del: number,

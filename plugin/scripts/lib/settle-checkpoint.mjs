@@ -3,19 +3,18 @@
 // checkpoint` advances the Watermark once every case of the walk is settled and committed; `design
 // rule-fix` reopens the causes resting on a Rule the walk showed to be wrong (ADR-0043). Both read the
 // walk's run dir through the core's `load` and `current`.
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { terms } from "./labels.mjs";
-import { writeAll } from "./changeset.mjs";
 import { isMap } from "./dialect.mjs";
 import { isStrictAncestor, loadQaAt, repositoryOf, resolveRef } from "./git-tree.mjs";
 import { written } from "./impact-persist.mjs";
-import { backfillChangeset } from "./pin-digest.mjs";
 import { refuse } from "./impact-json.mjs";
 import { parseForecast, reconcile, snapshotOf } from "./rule-edit.mjs";
 import { editedSincePersist, reopenable, ruleFixRefuse } from "./rule-fix.mjs";
-import { checkFile, edit, parse } from "./knowledge-file.mjs";
-import { buildIndex, loadWorkingTree, rootConfig } from "./qa-index.mjs";
+import { buildIndex, loadWorkingTree } from "./qa-index.mjs";
+import { writeQa } from "./qa-write.mjs";
+import { ANY_SCHEMA_VERSION } from "./schema.mjs";
 import { STATE, closing, current, findingsOf, load, textWith, view } from "./settle-walk.mjs";
 import { unknown } from "./settle-page.mjs";
 /** @import { WalkCase, WalkFile, WalkFindingData, WalkLaid, WalkState } from "./settle-walk.mjs" */
@@ -50,7 +49,7 @@ export function checkpoint(dir, plan) {
   // `--target` certifies nothing past it.
   const to = plan.target.ref !== null ? /** @type {string} */ (plan.target.commit) : head;
   const unchecked = uncheckedRuleEdits(plan, laid, state, repo, now.files);
-  if (unchecked.length) return ruleFixRefuse("rules_edited_since_persist", { rules: unchecked }, 1);
+  if (unchecked.length) return ruleFixRefuse("rules_edited_since_persist", { rules: unchecked, next: "impact plan --persist" }, 1);
 
   /** @type {Map<string, string>} */
   const edits = new Map();
@@ -78,25 +77,27 @@ export function checkpoint(dir, plan) {
       if (text !== readFileSync(join(root, file.rel), "utf8")) edits.set(file.rel, text);
     }
   }
-  /** @type {Array<{ file: string, line: number | undefined, message: string }>} */
-  const errors = [];
-  const config = rootConfig(root);
-  for (const [rel, t] of edits) {
-    const checked = /** @type {{ errors: Array<{ line?: number, message: string }> }} */ (checkFile(parse(rel, t), config));
-    errors.push(...checked.errors.map((x) => ({ file: `${repo.prefix}${rel}`, line: x.line, message: x.message })));
+  /** @type {WalkState} */
+  const nextState = {
+    ...state,
+    written: [...new Set([...state.written, ...[...edits.keys()].map((rel) => `${repo.prefix}${rel}`)])].sort(),
+    merge: [...new Set([...state.merge, ...(advanced.length ? ["watermark"] : []), ...(pruned ? ["findings"] : [])])],
+    checkpoint: { commit: to, at: new Date().toISOString() },
+  };
+  const tx = writeQa({
+    root,
+    minSchema: ANY_SCHEMA_VERSION,
+    writes: [...edits].map(([path, text]) => ({ path, text })),
+    stage: [{ path: join(dir, STATE), value: nextState }],
+  });
+  if (!tx.ok) {
+    if (tx.kind === "schema") return tx.refusal;
+    if (tx.kind === "check") return refuse("check_file", { errors: tx.errors.map((x) => ({ file: `${repo.prefix}${x.rel}`, line: x.line, message: x.message })) });
+    throw new Error(`design checkpoint: ${tx.error ?? "failed"}${tx.kind !== "write" && !tx.rolledBack && tx.rollbackError ? `; rollback failed: ${tx.rollbackError}` : ""}`);
   }
-  if (errors.length) return refuse("check_file", { errors });
-  if (edits.size) {
-    const written = /** @type {{ error?: string }} */ (writeAll(root, backfillChangeset(root, root, { writes: [...edits].map(([path, text]) => ({ path, text })) })));
-    if (written.error) throw new Error(`design checkpoint: ${written.error}`);
-  }
-  state.written = [...new Set([...state.written, ...[...edits.keys()].map((rel) => `${repo.prefix}${rel}`)])].sort();
-  state.merge = [...new Set([...state.merge, ...(advanced.length ? ["watermark"] : []), ...(pruned ? ["findings"] : [])])];
-  state.checkpoint = { commit: to, at: new Date().toISOString() };
-  writeFileSync(join(dir, STATE), `${JSON.stringify(state, null, 2)}\n`);
   /** @type {Terms} */
   const t = terms();
-  const end = closing(plan, laid, state);
+  const end = closing(plan, laid, nextState);
   for (const r of end.merge_rules) t.add(r.rule === "watermark" ? "Watermark" : r.rule === "findings" ? "Finding" : "Review");
   t.add("Watermark");
   return { exit: 0, json: { ok: true, checkpoint: { commit: to, watermarks: advanced, pruned }, ...end, glossary: t.pieces() } };
@@ -124,11 +125,13 @@ function uncheckedRuleEdits(plan, laid, state, repo, files) {
   const refs = new Set((laid.checkpoint ?? []).flatMap((c) => editedSincePersist(then, now, c.feature, commit)));
   return [...refs].filter((ref) => {
     const at = ref.indexOf("/");
-    return state.rule_fixes?.[ref] !== (now.rules(ref.slice(0, at)).get(ref.slice(at + 1)) ?? "");
+    const feat = ref.slice(0, at);
+    const key = ref.slice(at + 1);
+    return state.rule_fixes?.[ref] !== (now.rules(feat).get(key) ?? now.boundaries(feat).get(key) ?? "");
   });
 }
 
-// `design rule-fix <feature> --dir --stdin` (ADR-0043): a Rule the walk shows to be wrong is fixed
+// `design rule-fix <feature> --dir --input <path>` (ADR-0043): a Rule the walk shows to be wrong is fixed
 // through deep-dive's Rule-edit transition. The engineer has edited the Rule in the working tree and
 // confirmed the forecast; `reconcile` answers the Boundary check and the downstream walk, and every
 // closed mechanical Stale cause resting on a fixed Rule is opened again (its `holds` or Dismissal
@@ -143,7 +146,7 @@ function uncheckedRuleEdits(plan, laid, state, repo, files) {
  * @returns {CommandResult}
  */
 export function ruleFix(dir, plan, args, stdin) {
-  if (args.length !== 1) return ruleFixRefuse("rule_fix_arguments");
+  if (args.length !== 1) return ruleFixRefuse("rule_fix_arguments", { takes: "rule-fix <feature> --dir <run-dir> --input <file>" });
   const feature = args[0];
   const loaded = load(dir, plan);
   if (loaded.refused) return loaded.refused;
@@ -158,13 +161,13 @@ export function ruleFix(dir, plan, args, stdin) {
   // Read first, record the widened Rules only once the edit is known: a refusal writes nothing.
   const probe = reconcile(ctx, feature, { ...forecast, widened: [] }, undefined);
   const found = /** @type {{ ok: boolean, errors?: Array<{ code: string, message: string }>, edited: Array<{ rule: string }>, added: string[], retired: Array<{ key: string }> }} */ (/** @type {unknown} */ (probe.json));
-  if (!found.ok) return { exit: 1, json: { ok: false, refusals: (found.errors ?? []).map(({ code, message, ...rest }) => ({ code, line: message, ...rest })) } };
-  if (!found.edited.length && !found.added.length && !found.retired.length) return ruleFixRefuse("no_rule_edit", { feature }, 1);
+  if (!found.ok) return { exit: 1, json: { ok: false, refusals: (found.errors ?? []).map(({ code, message, ...rest }) => ({ code, reason: message, ...rest })) } };
+  if (!found.edited.length && !found.added.length && !found.retired.length) return ruleFixRefuse("no_rule_edit", { feature, fix: "edit the Rule first" }, 1);
   const done = forecast.widened.length ? reconcile(ctx, feature, forecast, dir) : probe;
   const out = /** @type {Record<string, unknown> & { ok: boolean }} */ (done.json);
   if (!out.ok) return done;
 
-  const fixed = new Set([...found.edited.map((e) => e.rule), ...found.retired.map((r) => r.key)].map((rule) => `${feature}/${rule}`));
+  const fixed = new Set([...found.edited.map((e) => e.rule), ...found.added, ...found.retired.map((r) => r.key)].map((rule) => `${feature}/${rule}`));
   const reopen = reopenable(/** @type {import("./knowledge-file.mjs").ParsedFile[]} */ (files), (f) => index.featureOf(f), fixed);
   const repo = repositoryOf(root);
   const prefix = repo?.prefix ?? "";
@@ -187,33 +190,36 @@ export function ruleFix(dir, plan, args, stdin) {
     }
     edits.set(rel, text);
   }
-  /** @type {Array<{ file: string, line: number | undefined, message: string }>} */
-  const errors = [];
-  const config = rootConfig(root);
-  for (const [rel, t] of edits) {
-    const checked = /** @type {{ errors: Array<{ line?: number, message: string }> }} */ (checkFile(parse(rel, t), config));
-    errors.push(...checked.errors.map((x) => ({ file: `${prefix}${rel}`, line: x.line, message: x.message })));
-  }
-  if (errors.length) return refuse("check_file", { errors });
-  if (edits.size) {
-    const written = /** @type {{ error?: string }} */ (writeAll(root, backfillChangeset(root, root, { writes: [...edits].map(([path, text]) => ({ path, text })) })));
-    if (written.error) throw new Error(`rule-fix: ${written.error}`);
-  }
-
   // The Run's own record: the cases are unsettled again, the text of each fixed Rule is what
   // checkpoint 2 will find committed, and the Rule's own file is part of what the Run changed.
   const texts = snapshotOf(/** @type {Parameters<typeof snapshotOf>[0]} */ (/** @type {unknown} */ (files))).rules(feature);
   const reopened = [...new Set(reopen.map((r) => r.case))];
-  for (const key of reopened) delete state.settled[key];
-  state.reopened = [...(state.reopened ?? []).filter((c) => !reopened.includes(c.key)), ...reopened.flatMap((key) => {
-    const decl = index.cases.get(key)?.[0];
-    return decl ? [/** @type {WalkCase} */ ({ feature: decl.feature, scenario: decl.scenario, file: decl.file.rel, key, why: ["rule_fixed"] })] : [];
-  })];
-  state.rule_fixes = { ...state.rule_fixes, ...Object.fromEntries([...fixed].map((ref) => [ref, texts.get(ref.slice(feature.length + 1)) ?? ""])) };
+  const nextSettled = { ...state.settled };
+  for (const key of reopened) delete nextSettled[key];
   const featureFile = index.features.get(feature)?.[0]?.file.rel;
-  state.written = [...new Set([...state.written, ...[...edits.keys()].map((rel) => `${prefix}${rel}`), ...(featureFile ? [`${prefix}${featureFile}`] : [])])].sort();
-  if (reopen.length) state.merge = [...new Set([...state.merge, "findings"])];
-  writeFileSync(join(dir, STATE), `${JSON.stringify(state, null, 2)}\n`);
+  /** @type {WalkState} */
+  const nextState = {
+    ...state,
+    settled: nextSettled,
+    reopened: [...(state.reopened ?? []).filter((c) => !reopened.includes(c.key)), ...reopened.flatMap((key) => {
+      const decl = index.cases.get(key)?.[0];
+      return decl ? [/** @type {WalkCase} */ ({ feature: decl.feature, scenario: decl.scenario, file: decl.file.rel, key, why: ["rule_fixed"] })] : [];
+    })],
+    rule_fixes: { ...state.rule_fixes, ...Object.fromEntries([...fixed].map((ref) => [ref, texts.get(ref.slice(feature.length + 1)) ?? ""])) },
+    written: [...new Set([...state.written, ...[...edits.keys()].map((rel) => `${prefix}${rel}`), ...(featureFile ? [`${prefix}${featureFile}`] : [])])].sort(),
+    merge: reopen.length ? [...new Set([...state.merge, "findings"])] : state.merge,
+  };
+  const tx = writeQa({
+    root,
+    minSchema: ANY_SCHEMA_VERSION,
+    writes: [...edits].map(([path, text]) => ({ path, text })),
+    stage: [{ path: join(dir, STATE), value: nextState }],
+  });
+  if (!tx.ok) {
+    if (tx.kind === "schema") return tx.refusal;
+    if (tx.kind === "check") return refuse("check_file", { errors: tx.errors.map((x) => ({ file: `${prefix}${x.rel}`, line: x.line, message: x.message })) });
+    throw new Error(`rule-fix: ${tx.error ?? "failed"}${tx.kind !== "write" && !tx.rolledBack && tx.rollbackError ? `; rollback failed: ${tx.rollbackError}` : ""}`);
+  }
 
   const { action: _a, next_step: _n, ...facts } = out;
   /** @type {Terms} */

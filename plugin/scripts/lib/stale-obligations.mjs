@@ -11,7 +11,7 @@
 /** @import { AffectedRulesFacts } from "./affected-rules.mjs" */
 import { relianceOf } from "./reliance.mjs";
 import { digestOf } from "./pin-digest.mjs";
-import { formatRuleRef, parseRuleRef } from "./rule-ref.mjs";
+import { formatRuleRef, parseRuleRef, refUnder } from "./rule-ref.mjs";
 
 /**
  * One Stale the Scan owes a case, as `history.stale_obligations[]` publishes it.
@@ -36,7 +36,7 @@ import { formatRuleRef, parseRuleRef } from "./rule-ref.mjs";
  * @param {string} feature the case's Feature
  * @returns {string}
  */
-const spelled = (qualified, feature) => (qualified.startsWith(`${feature}/`) ? qualified.slice(feature.length + 1) : qualified);
+const spelled = (qualified, feature) => (refUnder(qualified, feature) ? qualified.slice(feature.length + 1) : qualified);
 
 /**
  * Whether a case already stores this change: a Stale with the same baseline and cause digest,

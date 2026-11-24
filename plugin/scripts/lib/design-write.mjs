@@ -17,8 +17,7 @@
 // engineer's stated reason says it is a distinct pass. A fill or expand writes the
 // reply's other cases; a regenerate refuses the whole reply, since a partial write would delete the
 // cases it replaces and write too few in their place.
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
 import { refusalLine, repeats, storedCases } from "./design-duplicates.mjs";
 import { digest, loadFeature } from "./design-unit.mjs";
 import { checkFile, edit, parse } from "./knowledge-file.mjs";
@@ -26,9 +25,10 @@ import { proseLines } from "./markdown.mjs";
 import { stripListMarker } from "./case-fields.mjs";
 import { carriedLabels, labelEntries, mergeLabels, storedLabels, withoutRetired } from "./case-labels.mjs";
 import { mint } from "./mint.mjs";
-import { backfill } from "./pin-digest.mjs";
 import { buildIndex, loadWorkingTree, qaRel, rootConfig } from "./qa-index.mjs";
+import { writeQa } from "./qa-write.mjs";
 import { line, role } from "./render.mjs";
+import { writeJsonAtomic } from "./run-dir.mjs";
 import { localDate } from "./scan.mjs";
 import { refuseUnreadSchema } from "./schema-guard.mjs";
 import { LAYER_FREE_CASE_SCHEMA_VERSION } from "./schema.mjs";
@@ -38,6 +38,7 @@ import { retiredWith, tombstonesOf } from "./tombstones.mjs";
 /** @import { CaseEntry, ParsedFile as QaFile } from "./knowledge-file.mjs"; */
 /** @import { DesignCase, DesignResult } from "./design-contract.mjs"; */
 /** @import { Override, Repeat } from "./design-duplicates.mjs"; */
+/** @import { SchemaRefusal } from "./schema-guard.mjs"; */
 
 /**
  * The outcome of the write of one unit's usable reply, before the unit's file names it, as design's
@@ -56,6 +57,7 @@ import { retiredWith, tombstonesOf } from "./tombstones.mjs";
  * @property {string[]} [not_automatable] - Keys written `automatable: false`
  * @property {string[]} [not_manual] - Keys written `manual: false`
  * @property {string[]} [replaced] - the Keys a regenerate's file lost
+ * @property {string} [retired_in] - the `.qa/`-relative Feature file written with those Keys' `retired:` tombstones
  * @property {Array<Omit<Override, "summary"> & { key: string }>} [overridden] - the written cases
  *   that repeat a stored case and the engineer stated why they are a distinct pass, by their minted Key
  * @property {Array<import("./case-labels.mjs").DroppedLabel & { key: string }>} [dropped_labels] - the
@@ -80,7 +82,7 @@ import { retiredWith, tombstonesOf } from "./tombstones.mjs";
  * label of the Delegate whose reply it is. A proposal-only reply records `awaiting_rules` and its
  * proposals and writes nothing: no case, no replacement and no retirement. Any other usable reply is
  * written as today. Returns the outcome, also saved as JSON at `written`:
- * `{outcome?, written, file, cases_written, keys, not_automatable?, replaced?, reason?, problems?,
+ * `{outcome?, written, file, cases_written, keys, not_automatable?, replaced?, retired_in?, reason?, problems?,
  * proposals?}`, `not_automatable` the keys written `automatable: false`, and `outcome` and
  * `proposals` present only on `awaiting_rules`. It never throws: an exception (an I/O failure, or a
  * fault in the framework) is the refusal `io` like any other, so the attempt's `call` line is still
@@ -106,7 +108,7 @@ export function writeFill(unit, accepted, { delegate, written }) {
   if (accepted.questions?.length) result = { ...result, questions: accepted.questions, question_basis: unit.rule_claims };
   result = /** @type {WrittenRecord} */ ({ scenario: unit.scenario, file: unit.file, ...result });
   try {
-    if (written) writeFileSync(written, `${JSON.stringify(result, null, 2)}\n`);
+    if (written) writeJsonAtomic(written, result);
   } catch {
     // The scenario file is the record that matters; `design report` reads the file state too.
   }
@@ -129,8 +131,13 @@ function fill(unit, accepted, delegate) {
    * @returns {FillOutcome}
    */
   const refused = (reason, problems, duplicates) => ({ written: false, cases_written: 0, keys: [], reason, problems, ...(duplicates && { duplicates }) });
+  /** @param {SchemaRefusal} r @returns {Error} */
+  const schemaError = (r) => {
+    const f = r.json.refusals[0];
+    return new Error(`${f.code}: ${JSON.stringify(f)}`);
+  };
   const schema = refuseUnreadSchema(unit.root, LAYER_FREE_CASE_SCHEMA_VERSION);
-  if (schema) throw new Error(schema.json.text);
+  if (schema) throw schemaError(schema);
   const current = existsSync(unit.path) ? readFileSync(unit.path, "utf8") : null;
   if (current === null) return refused("missing", [`${unit.file} no longer exists`]);
   if (digest(current) !== unit.digest) return refused("changed", [`${unit.file} changed after its brief was built; it is not written over`]);
@@ -171,19 +178,31 @@ function fill(unit, accepted, delegate) {
   const out = /** @type {EditResult} */ (entries.length ? edit(file, [...replace.map((key) => ({ remove: key })), ...entries.map((e) => ({ append: e }))]) : { ok: true, text: current, file });
   if (!out.ok) throw new Error(`${unit.file}: ${out.message}`);
   const text = out.text;
-  const config = rootConfig(unit.root);
-  /** @type {[string, QaFile][]} */
-  const checks = [[unit.file, out.file]];
+  /** @type {{ path: string, text: string }[]} */
+  const writes = [];
   // A replaced case is gone for good, so its Key (and each former Tracker key it held) goes on the
   // Feature's `retired:` too. The Feature file is written first, so no crash can leave a removed
   // case unrecorded.
-  if (tombstone) checks.push([tombstone.file.rel, tombstone.file]);
-  for (const [name, f] of checks) {
-    const checked = /** @type {import("./design-unit.mjs").CheckFileResult} */ (checkFile(f, config));
-    if (!checked.ok) throw new Error(`${name} would not pass its check: ${checked.errors.map((e) => (e.line ? `line ${e.line}: ${e.message}` : e.message)).join("; ")}`);
+  if (tombstone) writes.push({ path: tombstone.file.rel, text: tombstone.text });
+  if (text !== current) writes.push({ path: unit.file, text });
+  if (!writes.length) {
+    const checked = /** @type {import("./design-unit.mjs").CheckFileResult} */ (checkFile(out.file, rootConfig(unit.root)));
+    if (!checked.ok) throw new Error(`${unit.file} would not pass its check: ${checked.errors.map((e) => (e.line ? `line ${e.line}: ${e.message}` : e.message)).join("; ")}`);
+  } else {
+    const tx = writeQa({
+      root: unit.root,
+      minSchema: LAYER_FREE_CASE_SCHEMA_VERSION,
+      writes,
+    });
+    if (!tx.ok) {
+      if (tx.kind === "schema") throw schemaError(tx.refusal);
+      if (tx.kind === "check") {
+        const rel = tx.errors[0].rel;
+        throw new Error(`${rel} would not pass its check: ${tx.errors.filter((e) => e.rel === rel).map((e) => (e.line ? `line ${e.line}: ${e.message}` : e.message)).join("; ")}`);
+      }
+      throw new Error(tx.kind === "afterCommit" ? (tx.error ?? "write failed") : tx.error);
+    }
   }
-  if (tombstone) writeFileSync(join(unit.root, tombstone.file.rel), backfill(unit.root, tombstone.file.rel, tombstone.text));
-  if (text !== current) writeFileSync(unit.path, backfill(unit.root, unit.file, text));
   const droppedLabels = (accepted.dropped_labels ?? []).filter((d) => !dropped.has(d.case)).map(({ case: n, ...d }) => ({ key: minted.keys[place(n)], ...d }));
   const notAutomatable = minted.keys.filter((_, i) => proposals[i].automatable === false);
   const notManual = minted.keys.filter((_, i) => proposals[i].manual === false);
@@ -195,6 +214,7 @@ function fill(unit, accepted, delegate) {
     not_automatable: notAutomatable,
     not_manual: notManual,
     ...(replace.length && { replaced: replace }),
+    ...(tombstone && { retired_in: tombstone.file.rel }),
     ...(repeated.length && { duplicates: repeated }),
     ...(droppedLabels.length && { dropped_labels: droppedLabels }),
     ...(lostLabels.length && { lost_labels: lostLabels }),

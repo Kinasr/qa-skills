@@ -7,8 +7,9 @@ and optional frontmatter `setup_role`, `redaction_exempt` and `automation_retrie
 ## Gather evidence
 
 Run `train evidence execute` using the parent skill's CLI prefix. Read its `train.entries` in full,
-`roles`, `levels`, `execute_levels`, live `features`, `targets` and bare `fixtures` names.
-`execution_results` holds the latest Execution results that are Blocked `precondition`/`step` or
+`roles`, `levels`, `execute_levels`, `targets` and bare `fixtures` names, and word every section in
+order: the Features section names the live Features, and the `execution_results` section holds the
+latest Execution results that are Blocked `precondition`/`step` or
 carry interpretations (`/qa-next`'s reader): mine their `why`, `preconditions` and
 `interpretations` alongside the conversation. A withheld entry is
 a coherence finding to rewrite without the credential.
@@ -103,7 +104,7 @@ this declaration belongs here rather than in an Access note.
 Frontmatter may also add `automation_retries`, an integer from 0 to 5 that defaults to 2. It is the
 number of extra attempts a failing Automation gets in `/qa-execute`; a stack's own retry config can
 add attempts that still count. It is a fact about this project's tolerance, not a Practice.
-`train evidence execute` reports the effective value, and `automation_results` alongside
+`train evidence execute` reports the effective value, and the `automation_results` section sits beside
 `execution_results` so an Automation pass never reads as a manual pass.
 
 ## Gate and coherence

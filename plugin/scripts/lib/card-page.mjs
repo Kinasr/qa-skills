@@ -1,10 +1,18 @@
 // @ts-check
-// Shared renderer; the closed layout set contains Inbox and Next steps.
+// Shared renderer; the closed layout set contains Inbox, Show, and Next steps.
 import { readFileSync } from "node:fs";
 import { cardPageLayout } from "./card-page-client.mjs";
-import { PAGE_MODULES } from "./page-modules.mjs";
 
 /** @import {PageModel} from "./page.d.mts" */
+
+// The client module order. Neutral first, layout views next, composition entry last. Tests pin
+// this order to the entry's native imports.
+/** @type {readonly string[]} */
+export const PAGE_MODULES = Object.freeze([
+  "./card-page-client.mjs",
+  "./card-page-view-show.mjs",
+  "./card-page-dom.mjs",
+]);
 
 // Tests validate this deliberately small module syntax with the TypeScript
 // compiler: named unaliased imports and exported declarations. The CLI itself
@@ -19,7 +27,9 @@ function inlinePageModules(modules) {
     .replace(/^export\s+(?=(?:async\s+)?function\b|class\b|const\b|let\b|var\b)/gm, "")).join("\n;\n");
 }
 
-const client = inlinePageModules(PAGE_MODULES.map((path) => readFileSync(new URL(path, import.meta.url), "utf8")));
+const moduleSources = PAGE_MODULES.map((path) => readFileSync(new URL(path, import.meta.url), "utf8"));
+const showClient = inlinePageModules(moduleSources);
+const client = inlinePageModules(moduleSources.filter((_, index) => PAGE_MODULES[index] !== "./card-page-view-show.mjs"));
 
 // `source` is the inlined client; a closing script tag inside it would end its element early.
 /**
@@ -27,7 +37,7 @@ const client = inlinePageModules(PAGE_MODULES.map((path) => readFileSync(new URL
  * @param {string | readonly string[]} [source] - a script or ordered module sources
  * @returns {string}
  */
-export function renderCardPage(model, source = client) {
+export function renderCardPage(model, source = model.layout === "show" ? showClient : client) {
   source = typeof source === "string" ? source : inlinePageModules(source);
   const layout = cardPageLayout(/** @type {string} */ (model.layout));
   const data = JSON.stringify(model).replaceAll("<", "\\u003c").replaceAll(">", "\\u003e").replaceAll("&", "\\u0026").replaceAll("\u2028", "\\u2028").replaceAll("\u2029", "\\u2029");

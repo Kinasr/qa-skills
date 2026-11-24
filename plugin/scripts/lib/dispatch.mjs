@@ -33,6 +33,24 @@
 export const POLICY = { attempts: 3, cooldown_ms: 15000, trip_after: 3 };
 
 /**
+ * The factor `QA_SKILLS_DISPATCH_SCALE` gives the policy's cooldowns: a positive number, else 1.
+ * @param {Record<string, string | undefined>} env
+ * @returns {number}
+ */
+export function dispatchScale(env) {
+  const scale = Number(env.QA_SKILLS_DISPATCH_SCALE);
+  return Number.isFinite(scale) && scale > 0 ? scale : 1;
+}
+
+/**
+ * The policy's cooldown per attempt, scaled by `QA_SKILLS_DISPATCH_SCALE` and rounded to whole
+ * milliseconds: both drivers hand it to `settle`, so they time the same cooldown.
+ * @param {Record<string, string | undefined>} env
+ * @returns {number}
+ */
+export const scaledCooldown = (env) => Math.round(POLICY.cooldown_ms * dispatchScale(env));
+
+/**
  * Known reasons for tripping a breaker.
  * @typedef {"quota" | "consecutive_failed_retries" | "refused"} TripReason
  */
@@ -268,6 +286,22 @@ export function nextReadyAt(s) {
   if (s.stopped) return null;
   const times = queued(s).map((u) => u.not_before);
   return times.length ? Math.min(...times) : null;
+}
+
+/**
+ * Remaining cooldown backoff when the earliest queued unit is not yet ready, else null.
+ * @template [U=Record<string, unknown>]
+ * @param {DispatchState<U>} state
+ * @param {number} now
+ * @returns {{ wait_ms: number, next_ready_at: string } | null}
+ */
+export function cooldownBackoff(state, now) {
+  const at = nextReadyAt(state);
+  if (at === null || at <= now) return null;
+  return {
+    wait_ms: Math.max(1, Math.ceil(at - now)),
+    next_ready_at: new Date(Math.ceil(at)).toISOString(),
+  };
 }
 
 /**

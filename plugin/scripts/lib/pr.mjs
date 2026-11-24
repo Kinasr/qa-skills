@@ -7,18 +7,21 @@
 /** @import { CommandAction, CommandResult } from "./cli.mjs" */
 /** @import { PlatformContext } from "./platform.mjs" */
 /** @import { RefusalFact } from "./refusal.mjs" */
-import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { existsSync, lstatSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { join, relative, resolve, sep } from "node:path";
 import { noArguments, requireOption } from "./cli.mjs";
 import { scrubPageText } from "./credentials.mjs";
+import { denyReason } from "./edit-guard.mjs";
 import { uncommittedUnder } from "./git.mjs";
-import { within } from "./paths.mjs";
+import { isContained, within } from "./paths.mjs";
 import { defaultPlatformRunner, spawnNodeCli } from "./platform.mjs";
-import { refusalsFor } from "./refusal.mjs";
+import { refusalsWithoutLines } from "./refusal.mjs";
+import { writeJsonAtomic } from "./run-dir.mjs";
+import { addedCredential } from "./secret-scan.mjs";
 import {
-  committerIdentity, commitExists, commitFile, createRef, defaultBaseRef, diffTrees, headCommit,
-  isAncestor, itemCommit, originSlug, pathsChanged, prGit, refCommit, sameFile, snapshotPrTree,
-  symlinkEscapes, upstreamRef, workingFile, writeTreeFile,
+  committerIdentity, commitExists, commitFile, createRef, defaultBaseRef, diffTrees, fileText, headCommit,
+  isAncestor, itemCommit, originSlug, pathsChanged, prGit, refCommit, restoreTree, sameFile, snapshotPrTree,
+  symlinkEscapes, upstreamRef, workingFile,
 } from "./pr-git.mjs";
 
 // The item's `start` snapshots take this; callers should not reach into pr-git for it.
@@ -51,7 +54,6 @@ export { snapshotPrTree };
  *   summary?: string,
  *   error?: string,
  *   evidence?: string,
- *   assertions_reduced?: string,
  *   expects?: Record<string, string[]>,
  *   message?: string,
  * }} PrItemInput
@@ -126,19 +128,7 @@ export { snapshotPrTree };
 
 // A refusal of a call the state of the Run turns down (a moved HEAD, an occupied branch): exit 1. A
 // refusal of what the call itself carried (a path out of scope, a mixed record form): exit 2.
-const { fact } = refusalsFor({
-  out_of_scope: "The path is outside module_paths, or under .qa/ where only an ADR-named path of this caller may go.",
-  no_changes: "The item changed no file.",
-  pr_mode_not_planned: "The Run was planned for working-tree mode, so no branch can be prepared.",
-  head_moved: "HEAD moved since the Run was pinned.",
-  branch_exists: "A branch of that name already exists, and this Run did not prepare it.",
-  unexpected_content: "A path holds content this Run did not write, so nothing was overwritten.",
-  journal_invalid: "The preparation journal does not match this Run's item chain.",
-  no_state: "The Run's state file is missing.",
-  state_unreadable: "The Run's state file is not the JSON its planner wrote.",
-  not_prepared: "Run `pr-prepare` before `pr-record`.",
-  record_form: "`pr-record` takes exactly one of `--url`, `--pushed --error`, or `--error`.",
-});
+const { fact } = refusalsWithoutLines();
 
 /**
  * @param {string} code
@@ -318,10 +308,37 @@ export function commitPrItem(state, input, before) {
   const changes = diffTrees(before, snapshotPrTree(repo));
   if (Object.keys(changes).length === 0) return { failure: prRefuse("no_changes") };
   const roots = [...(state.options.modulePaths ?? []), ...(state.options.skill === "codegen" ? state.options.qaPaths ?? [] : [])];
+  /** @type {string | null} */
+  let repoReal = null;
+  const resolveRepoReal = () => (repoReal ??= realpathSync(repo));
   for (const path of Object.keys(changes)) {
     const problem = scopeProblem(state, path);
     if (problem) return { failure: prRefuse("out_of_scope", { path, reason: problem }) };
     if (symlinkEscapes(repo, path, roots)) return { failure: prRefuse("out_of_scope", { path, reason: "its target escapes module_paths" }) };
+    if (!within(path, ".qa")) {
+      const denied = denyReason(path);
+      if (denied) return { failure: prRefuse("out_of_scope", { path, reason: `the path is on the deny list (${denied.denied})` }) };
+    }
+    try {
+      const abs = join(repo, path);
+      if (lstatSync(abs).isSymbolicLink()) {
+        const targetReal = realpathSync(abs);
+        if (!isContained(resolveRepoReal(), targetReal, { strict: true })) {
+          return { failure: prRefuse("out_of_scope", { path, reason: "its target escapes the repository" }) };
+        }
+        const targetRel = relative(resolveRepoReal(), targetReal).split(sep).join("/");
+        const targetProblem = scopeProblem(state, targetRel);
+        if (targetProblem) return { failure: prRefuse("out_of_scope", { path, reason: targetProblem }) };
+        if (!within(targetRel, ".qa")) {
+          const targetDenied = denyReason(targetRel);
+          if (targetDenied) return { failure: prRefuse("out_of_scope", { path, reason: `its target is on the deny list (${targetDenied.denied})` }) };
+        }
+      }
+    } catch (e) {
+      if (/** @type {NodeJS.ErrnoException} */ (e).code !== "ENOENT") {
+        return { failure: prRefuse("out_of_scope", { path, reason: "its symlink target cannot be resolved" }) };
+      }
+    }
   }
   const message = messageOf(state, input);
   const parent = state.items.at(-1)?.commit ?? state.options.commit;
@@ -379,7 +396,6 @@ function renderBody(state, items) {
     if (item.evidence) lines.push("", "Passed Execution evidence:", "", item.evidence);
     if (item.expects) lines.push("", "Expected mapping:", "", ...Object.entries(item.expects).map(([sentence, at]) => `- ${sentence} → ${at.join(", ")}`));
     if (item.summary) lines.push("", "What changed:", "", item.summary);
-    if (item.assertions_reduced) lines.push("", `Assertions reduced: ${item.assertions_reduced}`);
     lines.push("");
   }
   return `${scrub(lines.join("\n")).trimEnd()}\n`;
@@ -449,8 +465,16 @@ export function preparePr(state, { dir, save }) {
     return prStop("branch_exists", { branch: state.branch });
   }
 
+  // Refuse a credential before the journal, the ref or the push argv exists (ADR-0057).
+  const paths = journal?.paths ?? journalPaths(repo, options.commit, items);
+  const secret = addedCredential(Object.entries(paths).map(([path, entry]) => ({
+    path,
+    before: fileText(repo, entry.restore),
+    after: fileText(repo, entry.final),
+  })));
+  if (secret) return prStop("secret", secret);
+
   if (!journal) {
-    const paths = journalPaths(repo, options.commit, items);
     let mode = state.mode;
     if (mode.kind === "pr") {
       const tool = options.codeHost?.tool;
@@ -491,11 +515,23 @@ export function preparePr(state, { dir, save }) {
   if (bodyExists && readFileSync(journal.bodyFile, "utf8") !== journal.body) {
     return prStop("unexpected_content", { path: journal.bodyFile });
   }
-  /** @type {[string, PrFile | null][]} */
+  const journalEntries = Object.entries(journal.paths);
+  /** @type {[string, PrFile | null, PrFile | null][]} */
   const restores = [];
-  for (const [path, entry] of Object.entries(journal.paths)) {
-    const current = workingFile(repo, path);
-    if (sameFile(current, entry.final)) restores.push([path, entry.restore]);
+  for (const [path, entry] of journalEntries) {
+    /** @type {PrFile | null} */
+    let current;
+    try {
+      current = workingFile(repo, path);
+    } catch (err) {
+      if (/** @type {NodeJS.ErrnoException} */ (err).code !== "EISDIR") throw err;
+      const expectedDir = journalEntries.some(([other, otherEntry]) =>
+        other !== path && within(other, path)
+        && ((entry.restore === null && otherEntry.restore !== null) || (entry.final === null && otherEntry.final !== null)));
+      if (!expectedDir) return prStop("unexpected_content", { path });
+      current = null;
+    }
+    if (sameFile(current, entry.final)) restores.push([path, entry.restore, entry.final]);
     else if (sameFile(current, entry.restore)) continue;
     else return prStop("unexpected_content", { path });
   }
@@ -506,7 +542,20 @@ export function preparePr(state, { dir, save }) {
     }
   }
   if (!bodyExists) writeFileSync(journal.bodyFile, journal.body);
-  for (const [path, file] of restores) writeTreeFile(repo, path, file);
+  if (restores.length > 0) {
+    /** @type {[string, PrFile | null][]} */
+    const targetEntries = [];
+    /** @type {[string, PrFile | null][]} */
+    const currentEntries = [];
+    /** @type {string[]} */
+    const restorePaths = [];
+    for (const [path, restore, final] of restores) {
+      targetEntries.push([path, restore]);
+      currentEntries.push([path, final]);
+      restorePaths.push(path);
+    }
+    restoreTree(repo, Object.fromEntries(targetEntries), Object.fromEntries(currentEntries), { paths: restorePaths });
+  }
   journal.prepared = true;
   save(state);
   return {
@@ -538,7 +587,7 @@ export function preparePr(state, { dir, save }) {
  * @returns {PrOutcome}
  */
 export function recordPr(state, { url, pushed, error }) {
-  if (!state.journal?.prepared) return prStop("not_prepared", { branch: state.branch });
+  if (!state.journal?.prepared) return prStop("not_prepared", { branch: state.branch, next: "pr-prepare" });
   const hasUrl = typeof url === "string" && url !== "";
   const hasError = typeof error === "string" && error !== "";
   if (hasUrl && pushed === undefined && error === undefined) {
@@ -553,7 +602,7 @@ export function recordPr(state, { url, pushed, error }) {
     state.record = { error: scrub(error) };
     return { ok: true, json: { record: state.record } };
   }
-  return prRefuse("record_form");
+  return prRefuse("record_form", { takes: ["--url", "--pushed --error", "--error"] });
 }
 
 /**
@@ -592,10 +641,7 @@ function readState(dir, file) {
  * @returns {void}
  */
 function saveState(dir, file, data) {
-  const path = join(dir, file);
-  const temporary = `${path}.tmp`;
-  writeFileSync(temporary, `${JSON.stringify(data, null, 2)}\n`);
-  renameSync(temporary, path);
+  writeJsonAtomic(join(dir, file), data);
 }
 
 /**

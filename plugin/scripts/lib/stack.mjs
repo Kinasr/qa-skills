@@ -40,7 +40,7 @@
 //                         handle}], prefix: [{cls, prefix}], header: [{prefix}]}, `header` a file's
 //                         Key prefix for a `fileKeyPrefix` adapter; `carrier` is {name, names, home, prefix: {name, home}}, the
 //                         carrier name to write, every name a key is read under, and where each is
-//                         declared (null while undeclared). Edits are byte-offset splices
+//                         declared (null while undeclared). Edits are UTF-16 code-unit splices
 //                         (`splice`), and the result is re-parsed to check every key landed. Each
 //                         error is `{kind, message}`: `stale` when the file no longer holds, where
 //                         the card saw it, the test or class a write is for; any other kind is the

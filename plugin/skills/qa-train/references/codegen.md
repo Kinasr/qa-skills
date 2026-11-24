@@ -12,14 +12,16 @@ they dictate.
 
 ## Read the evidence
 
-On the code-evidence branch, read `sample.files` in the order the CLI returns it: runner config;
-named exemplars and their support; the five highest in-degree support files; up to twelve sampled
-tests, at most three per directory, preferring files with Automation keys; then remaining support.
-The sample is bounded to 200 KB, with each file capped at 20 KB (imports, class or describe header,
-hooks, first three tests). Every cut is in `sample.truncated`, and the sample's text is scrubbed.
+On the code-evidence branch, read the Test Code Sample section's files in the order the CLI returns
+them: runner config; named exemplars and their support; the five highest in-degree support files; up
+to twelve sampled tests, at most three per directory, preferring files with Automation keys; then
+remaining support. The sample is bounded to 200 KB, with each file capped at 20 KB (imports, class or
+describe header, hooks, first three tests). Every cut is in the sample's `truncated` list, and its
+text is scrubbed.
 
-Read `corpus` for the CLI-computed counts: files per directory, Key-carrier form and position,
-test-name patterns, and the support import graph. Read `gate` before proposing:
+Read the Corpus Summary section for the CLI-computed counts: files per directory, Key-carrier form
+and position, test-name patterns, and the support import graph. Read the Gate Signals section before
+proposing:
 
 - a `corpus` label `X/N` is a CLI-computed count over all test files; `sampled` counts `x/k` over
   the sampled text;
@@ -131,6 +133,6 @@ fixture. It never names a runner or a verification command, and it never becomes
 
 ## Relearn and repair
 
-Read `upkeep` and `citation_context` at the gate. For a moved ref, use the CLI's current path and declaration listing to choose its replacement. Settle each warning; keep drift and broken citations visible when unresolved.
+Read the Training Upkeep and Citation Context sections at the gate. For a moved ref, use the CLI's current path and declaration listing to choose its replacement. Settle each warning; keep drift and broken citations visible when unresolved.
 
-On `--relearn`, present `gate.relearn` in order, comparing each Convention's existing `entry` with the sample. For every facet offer keep, replace under the same `cnv_` key, add, or remove. Recommend keep only when `proposal` says keep. Surface every `flags` entry, including unreachable citation commits and changed cited files. On a confirmed keep, write its `keep.sources` and `keep.signal`; an unmatched citation remains flagged and unchanged. Settle every facet before drafting.
+On `--relearn`, present the `gate.relearn` entries of the Gate Signals section, in order, comparing each Convention's existing `entry` with the sample. For every facet offer keep, replace under the same `cnv_` key, add, or remove. Recommend keep only when `proposal` says keep. Surface every `flags` entry, including unreachable citation commits and changed cited files. On a confirmed keep, write its `keep.sources` and `keep.signal`; an unmatched citation remains flagged and unchanged. Settle every facet before drafting.

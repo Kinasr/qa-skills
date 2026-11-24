@@ -1,11 +1,11 @@
 // @ts-check
 // The full Bug Card: field answers, screenshots, discards and the apply grammar.
 import { existsSync, statSync } from "node:fs";
-import { basename, isAbsolute, relative, resolve, sep } from "node:path";
-import { validateEdits } from "./decisions.mjs";
+import { basename, resolve } from "node:path";
 import { edit } from "./knowledge-file.mjs";
 import { readTrackerReference } from "./keys.mjs";
-import { object } from "./refusal.mjs";
+import { object, validateEdits } from "./refusal.mjs";
+import { isContained } from "./paths.mjs";
 import { digests } from "./pin-digest.mjs";
 /** @import { PublishContext, PublishCardItem, PublisherResult, PublishSkippedItem } from "./publish.mjs" */
 /** @import { CardRefusal, CardWrite } from "./card-run.mjs" */
@@ -363,8 +363,7 @@ function screenshots(ctx, key, metadata, access) {
   for (const path of paths) {
     const name = basename(path);
     const abs = resolve(path);
-    const rel = relative(runDir, abs);
-    const outside = isAbsolute(rel) || rel === ".." || rel.startsWith(`..${sep}`);
+    const outside = !isContained(runDir, abs);
     const size = existsSync(abs) ? statSync(abs).size : null;
     const reason = metadata.attachment?.enabled === false ? "attachments disabled"
       : meansOf(access) === "acli" || metadata.means === "acli" ? "acli"
@@ -518,7 +517,7 @@ export function bugCandidates(ctx, { cases = [], skipped = [] } = {}) {
       ...(ctx.execute_run ? {} : { attachments_note: "Screenshots are offered only with `--run`." }),
       needs: missing.map((field) => field.id), edits: answerable.map((field) => field.id),
       in_tracker: marked.has(key),
-      ...(sameCard && sameCard.code === "create_case" ? { requires: [Number(sameCard.n)] } : {}),
+      ...(sameCard ? { requires: [Number(sameCard.n)] } : {}),
     });
   }
   return { items, skipped: skippedBugs, refused: [] };
@@ -608,17 +607,18 @@ export function publishDecisions(input, items) {
   const discard = /** @type {number[]} */ (input.discard ?? []);
   const take = /** @type {number[]} */ (input.take === "all" ? items.filter((item) => item.takeable !== false && !drop.includes(/** @type {number} */ (item.n)) && !discard.includes(/** @type {number} */ (item.n))).map((item) => item.n) : input.take ?? []);
   const confirmed = /** @type {number[]} */ (input.confirmed ?? []);
+  const confirm = /** @type {number[]} */ (input.confirm ?? []);
   const edits = /** @type {Record<string, Record<string, unknown>>} */ (input.edits ?? {});
   const fields = /** @type {Record<string, Record<string, unknown>>} */ (input.fields ?? {});
   const attach = /** @type {Record<string, string[]>} */ (input.attach ?? {});
-  const decisions = { ...base, take, drop, discard, edits, fields, attach, confirmed, confirm: /** @type {number[]} */ (input.confirm ?? []), name: /** @type {Record<string, string>} */ (input.name ?? {}), merge: /** @type {Record<string, string>} */ (input.merge ?? {}) };
+  const decisions = { ...base, take, drop, discard, edits, fields, attach, confirmed, confirm, name: /** @type {Record<string, string>} */ (input.name ?? {}), merge: /** @type {Record<string, string>} */ (input.merge ?? {}) };
   const known = new Map(items.map((item) => [item.n, item]));
   const errors = decisions.errors;
-  for (const n of [...take, ...drop, ...discard, ...confirmed]) {
+  for (const n of [...take, ...drop, ...discard, ...confirmed, ...confirm]) {
     if (!known.has(n)) errors.push({ code: "unknown_item", item: n });
   }
   for (const n of new Set([...take, ...drop, ...discard])) if ([take, drop, discard].filter((list) => list.includes(n)).length > 1) errors.push({ code: "answer_conflict", item: n });
-  for (const list of [take, drop, discard, confirmed]) {
+  for (const list of [take, drop, discard, confirmed, confirm]) {
     for (const n of new Set(list)) if (list.filter((value) => value === n).length > 1) errors.push({ code: "duplicate_decision", item: n });
   }
   for (const n of discard) {
@@ -702,6 +702,7 @@ export function publishedBugs(ctx, items, results, at) {
     const result = /** @type {PublisherResult | undefined} */ (results.find((result) => result.n === item.n));
     const tracker = item.code === "recover_bug" ? item.tracker_key : result?.tracker_key;
     const updated = edit(bug.file, [{ set: { status: "published", tracker, published_at: at } }]);
+    if (!updated.ok) throw new Error(updated.message);
     return { path: ctx.repoPath(bug.rel), text: updated.text };
   });
 }

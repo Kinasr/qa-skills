@@ -1,7 +1,7 @@
 # Codefix Training
 
 For `/qa-train codefix`, use the Practices dialogue and gate in [practices.md](practices.md).
-Write `.qa/train/codefix.md` through `train check codefix` and `train apply codefix` only. A repo
+Write `.qa/train/codefix.md` directly once `train check codefix --input <file>` passes (to `path`, byte for byte). A repo
 that still holds `.qa/train/fix.md` (`key: fix`, from before the rename) keeps that file: the CLI
 reads and writes it, so a draft of it keeps `key: fix`, until the engineer renames it to
 `train/codefix.md` with `key: codefix`.

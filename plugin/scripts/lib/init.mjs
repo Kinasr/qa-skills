@@ -15,11 +15,13 @@
 //                    written into the run dir (made when `--dir` names none); with it, the reply the
 //                    agent saved judged and the outcome recorded there. Never writes in the
 //                    repository. `inherit` is never smoke-tested.
-//   card --stdin [--dir <run>]   the one card: the settings with their evidence, the test stack and
+//   card --input <path> [--dir <run>]
+//                    the one card: the settings with their evidence, the test stack and
 //                    the file the card would write (`project.md`), through `check-file`. It keeps the
 //                    proposal and the card's digest in the run dir (a fresh OS temp dir when `--dir`
 //                    names none). Never writes in the repository.
-//   apply --dir <run> --stdin   JSON decisions on stdin, validated against the card kept in the run
+//   apply --dir <run> --input <path>
+//                    JSON decisions from that file, validated against the card kept in the run
 //                    dir and applied: written in one write at the end, or not at all. Only
 //                    `.qa/project.md`; never code, `.gitignore` or agent instructions. It never
 //                    stages or commits, and a dirty tree is fine.
@@ -53,8 +55,8 @@
 //                              test in the run dir
 /**
  * @import { CardAdapter, CardApplyDone, CardApplyOut, CardChangeset, CardConfirm, CardContext, CardDecisions, CardLifecycle, CardRefusal, CardRefused } from "./card-run.mjs"
- * @import { CommandAction, CommandContext, CommandDefinition, CommandResult, OptionSpec, UsageError } from "./cli.mjs"
- * @import { InitCardData, InitCardItem, InitCheckError, InitDecisionError, InitDecisions, InitEvidence, InitFieldItem, InitFieldSource, InitGlossary, InitItem, InitMaintenanceData, InitMaintenanceItem, InitMaintenanceSource, InitMintingItem, InitMintingSource, InitNote, InitPickedTier, InitStack, InitStackItem, InitStackRow, InitStackSource, InitUnread } from "./init-json.mjs"
+ * @import { CommandAction, CommandContext, CommandDefinition, CommandResult, OptionSpec } from "./cli.mjs"
+ * @import { InitApplyJson, InitCardItem, InitCardJson, InitCheckError, InitConfirmJson, InitDecisionError, InitDecisions, InitEvidence, InitFieldItem, InitFieldSource, InitGlossary, InitItem, InitMaintenanceItem, InitMaintenanceSource, InitMintingItem, InitMintingSource, InitNote, InitPickedTier, InitStack, InitStackItem, InitStackRow, InitStackSource, InitUnread } from "./init-json.mjs"
  * @import { SmokeOutcome, SmokeRecord, SmokeStarted, SmokeState } from "./init-smoke.mjs"
  * @import { RefusalFact, RefusalResult } from "./refusal.mjs"
  * @import { NewRunDirResult, OpenRunDirResult } from "./run-dir.mjs"
@@ -66,20 +68,22 @@ import { isDeepStrictEqual } from "node:util";
 import { accessFor, trackerUri } from "./access.mjs";
 import { pointerFor } from "./agent-pointer.mjs";
 import { glossaryOf, summaries } from "./labels.mjs";
-import { commitLine, writeAll } from "./changeset.mjs";
+import { commitLine } from "./changeset.mjs";
 import { buildCodeIndex, keyPatterns } from "./code-index.mjs";
 import { DEFAULT_CONCURRENCY } from "./delegates.mjs";
 import { isMap } from "./dialect.mjs";
 import { findingData } from "./finding-data.mjs";
-import { decisionsOf, fact, noteOf, refusalOf, firstCardData, maintenanceCardData, NOTES, refuse, unreadData } from "./init-json.mjs";
+import { addRoleData, applyReportData, confirmData, decisionsOf, fact, noteOf, refusalOf, firstCardData, maintenanceCardData, NOTES, refuse, smokeResultData, smokeStartData, stateData, unreadData } from "./init-json.mjs";
 import { givenOption, MINTING, MINTING_FIELDS, settledOptions } from "./init-minting.mjs";
 import { judgeSmoke, smokeStarted, smokeState, startSmoke } from "./init-smoke.mjs";
 import { FALLBACK, isModelLabel, TIERS, trackerReference } from "./keys.mjs";
 import { checkFile, edit, parse, projectConfig } from "./knowledge-file.mjs";
 /** @import { PlatformContext } from "./platform.mjs" */
 import { probeOnPath } from "./on-path.mjs";
+import { isContained, within } from "./paths.mjs";
 import { playwrightCliVersion } from "./playwright-version.mjs";
 import { buildIndex, loadWorkingTree, locate, rootConfig } from "./qa-index.mjs";
+import { writeQa } from "./qa-write.mjs";
 import { block, inline, line, role } from "./render.mjs";
 import { newRunDir, openRunDir } from "./run-dir.mjs";
 import { localDate, scan } from "./scan.mjs";
@@ -434,19 +438,19 @@ const ACTIONS = {
      * @returns {CommandResult}
      */
     run(args, { root }) {
-      if (args.length) return refuse("state_arguments");
+      if (args.length) return refuse("state_arguments", { options: Object.keys(/** @type {OptionSpec} */ (ACTIONS.state.options)) });
       const abs = resolve(/** @type {string} */ (root));
       const index = /** @type {{ project?: { data?: { tracker?: unknown } } | null }} */ (buildIndex(loadWorkingTree(abs)));
       // With no tracker configured, only an unscoped `tracker:` Access note covers it.
       const uri = trackerUri(index.project?.data?.tracker) ?? trackerReference("");
-      return { json: { ok: true, train: trainFor(index, INIT_TRAIN_KEY), access: accessFor(index, [uri])[uri], pointer: pointerFor(dirname(abs)) }, exit: 0 };
+      return { json: stateData({ train: trainFor(index, INIT_TRAIN_KEY), access: accessFor(index, [uri])[uri], pointer: pointerFor(dirname(abs)) }), exit: 0 };
     },
   },
 
   // A first run and maintenance show different cards, so the path is settled first.
   card: {
     options: { root: "qa-dir?", stdin: "flag", dir: "value" },
-    usage: "--stdin [--dir <run-dir>] [--root <qa-dir>]",
+    usage: "--input <path> [--dir <run-dir>] [--root <qa-dir>]",
     /**
      * @param {string[]} args
      * @param {CommandContext} options
@@ -457,7 +461,7 @@ const ACTIONS = {
 
   apply: {
     options: { root: "qa-dir?", stdin: "flag", dir: "value" },
-    usage: "--dir <run-dir> --stdin [--root <qa-dir>]",
+    usage: "--dir <run-dir> --input <path> [--root <qa-dir>]",
     /**
      * @param {string[]} args
      * @param {CommandContext} options
@@ -484,21 +488,21 @@ const ACTIONS = {
      */
     run(args, { model, reply, dir }) {
       if (args.length) return refuse("smoke_arguments", { options: Object.keys(/** @type {OptionSpec} */ (ACTIONS.smoke.options)) });
-      if (model === undefined) return refuse("smoke_no_model");
+      if (model === undefined) return refuse("smoke_no_model", { flag: "--model <label>" });
       if (!isModelLabel(model)) return refuse("smoke_not_label", { model });
       if (model === FALLBACK) return refuse("smoke_fallback");
       if (reply === undefined) {
         const run = /** @type {InitNewRunDir} */ (newRunDir(dir, "qa-init-"));
         if (run.error) return refuse("run_dir", { reason: run.error });
         const at = (/** @type {() => string} */ (run.make))();
-        return { json: { ok: true, dir: at, model, ...startSmoke(at, model) }, exit: 0 };
+        return { json: smokeStartData(at, model, startSmoke(at, model)), exit: 0 };
       }
-      if (dir === undefined) return refuse("smoke_needs_dir", { model });
+      if (dir === undefined) return refuse("smoke_needs_dir", { model, flag: "--dir <run-dir>" });
       const run = /** @type {InitOpenRunDir} */ (openRunDir(dir, { cmd: "init", action: "smoke", from: "init smoke" }));
       if (run.error) return refuse("run_dir", { reason: run.error });
       if (!smokeStarted(/** @type {string} */ (run.dir), model)) return refuse("smoke_not_started", { model });
       const outcome = judgeSmoke(/** @type {string} */ (run.dir), model, resolve(reply));
-      return { json: { ok: outcome.ok, dir: run.dir, model, ...(!outcome.ok && { reason: outcome.reason, ...(outcome.excerpt !== undefined && { excerpt: outcome.excerpt }) }) }, exit: outcome.ok ? 0 : 1 };
+      return { json: smokeResultData(/** @type {string} */ (run.dir), model, outcome), exit: outcome.ok ? 0 : 1 };
     },
   },
 
@@ -513,7 +517,7 @@ const ACTIONS = {
      * @returns {CommandResult}
      */
     run(args, { root }) {
-      if (args.length === 0) return refuse("role_names");
+      if (args.length === 0) return refuse("role_names", { takes: "<name>..." });
       if (args.some((a) => !a.trim())) return refuse("blank_role");
       const ctx = load(root);
       const path = ctx.repoPath("project.md");
@@ -532,24 +536,25 @@ const ACTIONS = {
       const names = [...new Set(args.map((a) => a.trim()))];
       const added = names.filter((n) => !roles.includes(n));
       const already = names.filter((n) => roles.includes(n));
-      const written = { path, added, already };
-      if (!added.length) return { json: { ok: true, ...written, commit: null }, exit: 0 };
+      if (!added.length) return { json: addRoleData({ path, added, already, commit: null }), exit: 0 };
       const unwritable = added.filter((n) => line("roles", [n], { item: role }).error);
       if (unwritable.length) return refuse("role_unwritable", { path, names: unwritable }, 1);
       const text = editProject(current, new Map([["roles", [...roles, ...added]]]));
-      if (text.error) throw new Error(`init: roles cannot be written: ${text.error}`);
-      const check = checkAt(ctx, path, text.text);
-      if (!check.ok) return refuse("add_role_check_file", { path, errors: check.errors.map(checkError) }, 1);
-      const put = writeAll(ctx.repo, { writes: [{ path, text: text.text }] });
-      if (put.error) return refuse("add_role_write_failed", { reason: put.reason }, 1);
-      return { json: { ok: true, ...written, commit: commitLine([path], "qa: /qa-init --add-role") }, exit: 0 };
+      if (text.error !== undefined) throw new Error(`init: roles cannot be written: ${text.error}`);
+      const tx = writeQa({ root: ctx.root, minSchema: ANY_SCHEMA_VERSION, writes: [{ path: "project.md", text: text.text }] });
+      if (!tx.ok) {
+        if (tx.kind === "schema") return tx.refusal;
+        if (tx.kind === "check") return refuse("add_role_check_file", { path, errors: tx.errors.map(checkError) }, 1);
+        if (tx.kind === "write") return refuse("add_role_write_failed", { reason: tx.reason }, 1);
+        throw new Error(`init add-role: ${tx.error ?? tx.kind}`);
+      }
+      return { json: addRoleData({ path, added, already, commit: commitLine([path], "qa: /qa-init --add-role") }), exit: 0 };
     },
   },
 };
 
-// Every refusal is `init`'s own, its usage errors included.
 /** @type {CommandDefinition} */
-export const command = { actions: ACTIONS, refuse: (e) => refuse(/** @type {string} */ (e.detail.code), e.detail) };
+export const command = { actions: ACTIONS };
 
 
 // The existing `project.md`, parsed (lib/knowledge-file.mjs), or `{problem}` (a refusal's `{code,
@@ -806,9 +811,7 @@ function stackRows(ctx, proposal, modulePaths, problem, { ask = false } = {}) {
     }
   }
   if (pick && Array.isArray(modulePaths)) {
-    /** @param {string} p @param {string} root */
-    const under = (p, root) => root === "." || p === root || p.startsWith(`${root}/`);
-    const outside = modulePaths.filter((p) => typeof p === "string" && !under(posix.normalize(p), pick.root));
+    const outside = modulePaths.filter((p) => typeof p === "string" && !within(posix.normalize(p), pick.root));
     if (outside.length) {
       problem("module_path_outside_stack", "module_paths", { root: pick.root, outside });
     }
@@ -827,7 +830,7 @@ function stackRows(ctx, proposal, modulePaths, problem, { ask = false } = {}) {
 function quotes(ctx, g) {
   if (!isMap(g) || typeof g.file !== "string" || typeof g.quote !== "string" || !g.quote.trim()) return false;
   const abs = resolve(ctx.repo, g.file);
-  if (relative(ctx.repo, abs).startsWith("..") || !existsSync(abs) || !statSync(abs).isFile()) return false;
+  if (!isContained(ctx.repo, abs) || !existsSync(abs) || !statSync(abs).isFile()) return false;
   /** @param {string} s */
   const flat = (s) => s.replace(/\s+/g, " ").trim();
   const text = readFileSync(abs, "utf8");
@@ -1223,7 +1226,7 @@ function lifecycle(maintenance, platformContext) {
     decisions: (ctx, built, input) => { const decisions = decisionsOf(JSON.stringify(input), (/** @type {FirstBuildCardResult} */ (built)).items, maintenance); return { ...decisions, errors: (/** @type {InitDecisionError[]} */ (decisions.errors)).map(refusalOf) }; },
     apply(ctx, built, decisions, proposal) {
       const out = maintenance ? maintenanceApply(ctx, (/** @type {MaintenanceBuildCardResult} */ (built)), /** @type {InitDecisions} */ (decisions), proposal) : firstApply(ctx, (/** @type {FirstBuildCardResult} */ (built)), /** @type {InitDecisions} */ (decisions), proposal);
-      return /** @type {CardApplyOut<Record<string, unknown>>} */ ({ ...out, message: "qa: /qa-init", data: out.refused ? (out.cause ? { cause: out.cause } : {}) : { applied: out.applied, dropped: out.dropped } });
+      return /** @type {CardApplyOut<Record<string, unknown>>} */ ({ ...out, message: "qa: /qa-init", data: out.refused && out.cause ? { cause: out.cause } : {} });
     },
   }));
 }
@@ -1253,10 +1256,10 @@ const refusals = (problems, items) => problems.map((p) => situate(p, items));
 
 // A check error of a file, its setting named by label and its line kept apart from the factual line.
 /**
- * @param {{ code: string, field: string, line?: number, message: string }} param0
+ * @param {{ code: string, field?: string, line?: number | null, message: string }} param0
  * @returns {InitCheckError}
  */
-const checkError = ({ code, field, line: at, message }) => ({ code, ...(FIELD.has(field) && { label: fieldLabelOf(field) }), ...(at !== undefined && { at_line: at }), message });
+const checkError = ({ code, field, line: at, message }) => ({ code, ...(field !== undefined && FIELD.has(field) && { label: fieldLabelOf(field) }), ...(at !== undefined && at !== null && { at_line: at }), message });
 
 // The cards shown say when the machine has no `playwright-cli`, or one too old for `/qa-execute`,
 // which it and the UI scout behind `/qa-deep-dive`'s `observe:` drive. Only a card shows it, so
@@ -1288,7 +1291,7 @@ const withNotes = (notes, platformContext) => [...notes, ...playwrightNotes(plat
  * @returns {CommandResult}
  */
 function showCard(args, { root, stdin, dir, env, platformContext }, maintenance) {
-  if (args.length) return refuse("bad_arguments", { action: "card" });
+  if (args.length) return refuse("bad_arguments", { action: "card", takes: ACTIONS.card.usage });
   // The proposal is read from stdin only with `--stdin`.
   if (!stdin) return refuse("no_proposal");
   let proposal;
@@ -1301,26 +1304,40 @@ function showCard(args, { root, stdin, dir, env, platformContext }, maintenance)
   if (run.error) return refuse("run_dir", { reason: run.error });
   const platform = platformContext ?? (env ? { env } : undefined);
   const { exit, ...json } = lifecycle(maintenance, platform).card(load(/** @type {string} */ (root), run.dir), /** @type {string | (() => string)} */ (run.dir ?? run.make), proposal);
-  if (!json.ok) delete (/** @type {{ rebuild?: boolean }} */ (json)).rebuild;
-  return { exit, json };
+  if (!json.ok) {
+    delete (/** @type {{ rebuild?: boolean }} */ (json)).rebuild;
+    return { exit, json };
+  }
+  const { card: shownCard, ...rest } = /** @type {{ ok: true, dir: string, card: InitCardJson }} */ (/** @type {unknown} */ (json));
+  return { exit, json: { ...rest, ...shownCard } };
 }
 
 // Apply decisions against the sealed Card, then return the write report or pending confirmation.
 /**
  * @param {string[]} args
- * @param {{ root?: string, dir?: string, stdin?: (() => string) | null }} param1
+ * @param {{ root?: string, dir?: string, stdin?: (() => string) | null, env?: Record<string, string | undefined>, platformContext?: PlatformContext }} param1
  * @param {boolean} maintenance
  * @returns {CommandResult}
  */
-function keptCard(args, { root, dir, stdin }, maintenance) {
-  if (args.length) return refuse("bad_arguments", { action: "apply" });
-  if (dir === undefined) return refuse("needs_dir");
+function keptCard(args, { root, dir, stdin, env, platformContext }, maintenance) {
+  if (args.length) return refuse("bad_arguments", { action: "apply", takes: ACTIONS.apply.usage });
+  if (dir === undefined) return refuse("needs_dir", { dir: "--dir <run-dir>" });
   if (!stdin) return refuse("apply_needs_stdin");
   const run = /** @type {InitOpenRunDir} */ (openRunDir(dir, { cmd: "init", action: "apply", from: "init card" }));
   if (run.error) return refuse("run_dir", { reason: run.error });
-  const { exit, ...json } = lifecycle(maintenance).apply(load(root, run.dir), /** @type {string} */ (run.dir), stdin());
+  const platform = /** @type {PlatformContext | undefined} */ (platformContext) ?? (env ? { env } : undefined);
+  const { exit, ...json } = lifecycle(maintenance, platform).apply(load(root, run.dir), /** @type {string} */ (run.dir), stdin());
   if (exit === 2) return { exit, json: { ok: false, refusals: (/** @type {CardRefused} */ (json)).refusals } };
-  return { exit, json: { dir: run.dir, ...(!json.ok && { confirm: false, rebuild: false }), ...json } };
+  if (!json.ok) {
+    return {
+      exit,
+      json: "confirm" in json
+        ? { dir: run.dir, rebuild: false, ...json }
+        : { dir: run.dir, confirm: false, ...json },
+    };
+  }
+  const { report: reportBody, ...rest } = /** @type {{ ok: true, report: InitApplyJson }} */ (/** @type {unknown} */ (json));
+  return { exit, json: { dir: run.dir, ...rest, ...reportBody } };
 }
 
 // Whether taken `item` already holds the answer for `field` as the suggested value the card shows:
@@ -1381,11 +1398,20 @@ function firstApply(ctx, built, d, input) {
   }
   const stack = { language: (/** @type {{ value: string }} */ (final.items.find((i) => i.field === "stack.language"))).value, framework: (/** @type {{ value: string }} */ (final.items.find((i) => i.field === "stack.framework"))).value };
   const notes = [...final.notes, { code: "commit_before_persist" }];
+  const applied = built.items.filter((i) => !d.drop.includes(i.n)).map((i) => i.n);
   return {
-    applied: built.items.filter((i) => !d.drop.includes(i.n)).map((i) => i.n),
+    applied,
     dropped: d.drop,
     changeset: { writes: final.files.map(({ path, text }) => ({ path, text })) },
-    report: (commit) => ({ files: final.files.map((f) => f.path), commit, snippet: final.snippet && { ...final.snippet, ...stack }, notes: notes.map(noteOf), glossary: glossaryOf(notes.flatMap((n) => NOTES[n.code].term ?? [])) }),
+    report: (commit) => applyReportData({
+      applied,
+      dropped: d.drop,
+      files: final.files.map((f) => f.path),
+      commit,
+      snippet: final.snippet && { ...final.snippet, ...stack },
+      notes: notes.map(noteOf),
+      glossary: glossaryOf(notes.flatMap((n) => NOTES[n.code].term ?? [])),
+    }),
   };
 }
 
@@ -1735,7 +1761,7 @@ function confirmation(ctx, pending, d) {
   const s = qaSummaries(ctx);
   const changes = pending.map((c) => ({ n: c.item.n, label: c.item.label, answer: c.answer, ...(c.answer !== "drop" && { value: c.value }), errors: c.effect.errors.map((e) => findingData(/** @type {Record<string, unknown>} */ (e), s)), unread: c.effect.unread.map(unreadData), ...(c.described?.length && { described: c.described }) }));
   const terms = pending.flatMap((c) => (c.described ?? []).map((d) => (d.kind === "tag" ? "Tag" : d.kind === "field" ? "Custom field" : "Role")));
-  return { changes, words: currentWords(ctx), glossary: glossaryOf(["Integrity error", ...terms]), decisions: { ...d.input, confirm: [...new Set([...d.confirm, ...pending.map((c) => c.item.n)])].sort((a, b) => a - b) } };
+  return confirmData({ changes, words: currentWords(ctx), glossary: glossaryOf(["Integrity error", ...terms]), decisions: { ...d.input, confirm: [...new Set([...d.confirm, ...pending.map((c) => c.item.n)])].sort((a, b) => a - b) } });
 }
 
 // The words of the stack `project.md` names now (lib/stack.mjs `wordsOf`): a maintenance change's
@@ -1911,6 +1937,15 @@ function writeReply(ctx, built, reply, { files, heads, next }, changes) {
   return {
     ...done,
     changeset: { writes: files.map(({ path, text }) => ({ path, text })) },
-    report: (commit) => ({ files: files.map((f) => f.path), commit, todo: { errors: todo.errors.map((e) => findingData(/** @type {Record<string, unknown>} */ (e), s)), unread: todo.unread.map(unreadData) }, words: currentWords(ctx), snippet, ...(notes.length && { notes }), glossary: glossaryOf(todo.errors.length ? ["Integrity error"] : []) }),
+    report: (commit) => applyReportData({
+      ...done,
+      files: files.map((f) => f.path),
+      commit,
+      todo: { errors: todo.errors.map((e) => findingData(/** @type {Record<string, unknown>} */ (e), s)), unread: todo.unread.map(unreadData) },
+      words: currentWords(ctx),
+      snippet,
+      notes,
+      glossary: glossaryOf(todo.errors.length ? ["Integrity error"] : []),
+    }),
   };
 }

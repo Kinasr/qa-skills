@@ -1,10 +1,10 @@
 // @ts-check
 // `execute ingest --dir <run-dir> [--root <qa-dir>]`: the end of a Run. It turns the plan, each Execution's guard log and each Tester's
 // report into one Execution record under `.qa/executions/<date>-<run-id>.md`, written once, and
-// prints the CLI-written summary the skill relays verbatim.
+// emits ordered, labelled `sections` for the skill to word.
 //
 // The evidence settles into blocks in `execute-blocks.mjs`; this module sweeps the Run's login
-// state and sessions, writes those blocks as the record, and words the text: the counts header, one
+// state and sessions, writes those blocks as the record, and builds sections: the counts header, one
 // chain line per case that didn't plainly pass, the groups (each capped at 20 lines), the leftover
 // `created` labels per case and Role, the warning for Executions that acted without a valid report,
 // and the follow-ups footer. The footer's counts come from `workList`, the same function `execute
@@ -16,18 +16,20 @@
 //
 // Refusals, each writing nothing: `no_run` (no readable plan), `not_confirmed`, `record_exists` (the
 // record is written once, `wx`), `execution_invalid` (the record would fail `check-file`).
-import { existsSync, readFileSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { noArguments, orThrow } from "./cli.mjs";
 import { checkExecution, edit, parse } from "./knowledge-file.mjs";
-import { buildBlocks, localIso, readPlan } from "./execute-blocks.mjs";
-import { clearReplies } from "./execute-dispatch.mjs";
+import { buildBlocks, localIso } from "./execute-blocks.mjs";
+import { readPlan } from "./execute-plan.mjs";
+import { clearReplies } from "./execute-state.mjs";
 import { resumeCommand, workList } from "./follow-ups.mjs";
 import { openActions } from "./execute-open.mjs";
 import { resultHint } from "./execution-results.mjs";
 import { AUTH_DIR } from "./execute-auth.mjs";
 import { REPORT_FILE, executionDir } from "./execution-guard.mjs";
-import { refusalsFor } from "./refusal.mjs";
+import { refusalsWithoutLines } from "./refusal.mjs";
+import { writeQa } from "./qa-write.mjs";
 import { LOGIN_STATE_FILE } from "./scout-login.mjs";
 import { LEVEL_ON_CASE_SCHEMA_VERSION, oneLine } from "./schema.mjs";
 import { refuseUnreadSchema } from "./schema-guard.mjs";
@@ -35,12 +37,14 @@ import { openRunDir } from "./run-dir.mjs";
 import { readCredentialValues } from "./used-credentials.mjs";
 import { maskCredentialText, maskCredentialValue } from "./header-credential.mjs";
 import { quote } from "./render.mjs";
+import { buildSections } from "./report-sections.mjs";
 
 /**
  * @import { CommandAction, CommandContext, CommandResult } from "./cli.mjs"
- * @import { ExecuteExcluded, ExecutePlan, ExecuteSelection, ExecuteSkipped } from "./execute.mjs"
+ * @import { ExecuteExcluded, ExecutePlan, ExecuteSelection, ExecuteSkipped } from "./execute-plan.mjs"
  * @import { ExecutionBlock } from "./execute-blocks.mjs"
  * @import { WorkBlock, WorkList } from "./follow-ups.mjs"
+ * @import { ReportSection, SectionSpec } from "./report-sections.mjs"
  */
 
 /**
@@ -60,13 +64,7 @@ import { quote } from "./render.mjs";
  * }} ExecutionRecordFront
  */
 
-const { stop } = refusalsFor({
-  credential_values_unreadable: "The Run's retained credential values could not be read; repair them before retrying ingest.",
-  no_run: "The run dir holds no plan `execute plan` wrote; there is nothing to ingest.",
-  not_confirmed: "The Run was never confirmed; nothing ran.",
-  record_exists: "This Run's record is already written and is never rewritten.",
-  execution_invalid: "The record the Run would write fails `check-file`; nothing was written.",
-});
+const { stop } = refusalsWithoutLines();
 
 // Each summary group lists at most this many lines, then says how many more the record holds.
 const GROUP_CAP = 20;
@@ -249,6 +247,24 @@ function group(title, lines, record) {
   return [title, ...shown, ...(lines.length > GROUP_CAP ? [`  and ${lines.length - GROUP_CAP} more${record ? `: see \`${record}\`` : ""}`] : [])];
 }
 
+/** @type {readonly SectionSpec[]} */
+export const INGEST_SECTION_ORDER = [
+  { id: "summary", label: "Summary" },
+  { id: "unguarded", label: "Unguarded Run" },
+  { id: "failed", label: "Failed" },
+  { id: "fix_coming", label: "Fix coming" },
+  { id: "fix_suppressed", label: "Passed Execution, fix suppressed" },
+  { id: "unresolved", label: "Unresolved Automations" },
+  { id: "blocked", label: "Blocked" },
+  { id: "skipped", label: "Skipped" },
+  { id: "not_run", label: "Not run" },
+  { id: "warnings", label: "Warnings" },
+  { id: "record", label: "Record" },
+  { id: "created", label: "Created entities left in the app" },
+  { id: "report_problems", label: "Report problems" },
+  { id: "follow_ups", label: "Follow-ups" },
+];
+
 /**
  * @param {ExecutePlan} plan
  * @param {ExecutionBlock[]} blocks
@@ -257,9 +273,10 @@ function group(title, lines, record) {
  * @param {WorkList} work
  * @param {string} dir
  * @param {{ count: number, keys: string[] }} unreported
- * @returns {string}
+ * @param {Array<{ execution: string, problems: string[] }>} problems
+ * @returns {ReportSection[]}
  */
-function summaryText(plan, blocks, notRun, record, work, dir, unreported) {
+function ingestSections(plan, blocks, notRun, record, work, dir, unreported, problems) {
   const count = (/** @type {string} */ result) => blocks.filter((b) => b.data.result === result).length;
   const [passed, failed, blocked] = ["passed", "failed", "blocked"].map(count);
   const automations = automationCounts(blocks);
@@ -281,31 +298,37 @@ function summaryText(plan, blocks, notRun, record, work, dir, unreported) {
   const suppressed = [...new Set(work.suppressed.flatMap((entry) => entry.cases))];
   const unresolved = work.unresolved.map((entry) => `  ${entry.automation}: ${entry.result}${entry.reason ? `: ${entry.reason}` : ""}; ${entry.cases.map((c) => `${c.key} ${c.state}`).join(", ")}`);
   const stopped = notRun.length > 0 || notRunBlocks.length > 0;
-  const header = [
-    `Automations: ${automations.total} (${automations.passed} passed, ${automations.failed} failed, ${automations.flaky} flaky, ${automations.blocked} blocked); Executions: ${executed} (${passed} passed, ${failed} failed, ${blocked} blocked, ${skippedBlocks.length} execution-skipped); ${plan.skipped.length} skipped, ${notRun.length} not run.`,
-  ];
+  const header = `Automations: ${automations.total} (${automations.passed} passed, ${automations.failed} failed, ${automations.flaky} flaky, ${automations.blocked} blocked); Executions: ${executed} (${passed} passed, ${failed} failed, ${blocked} blocked, ${skippedBlocks.length} execution-skipped); ${plan.skipped.length} skipped, ${notRun.length} not run.`;
+  const caseOutcomes = `Case outcomes: ${["passed", "failed", "blocked", "incomplete"].map((result) => `${[...work.outcomes.values()].filter((o) => o.result === result).length} ${result}`).join(", ")}.`;
   const skippedLines = [
     ...plan.skipped.map((s) => `  ${s.key} (${s.reasons.join(", ")})`),
     ...skippedBlocks.map((b) => `  ${b.key}: ${b.summary} (${designSkips(b).join(", ")})${incomplete(b) ? "; complete the case with \`/qa-design\`" : ""}`),
   ];
-  return [
-    ...header,
-    `Case outcomes: ${["passed", "failed", "blocked", "incomplete"].map((result) => `${[...work.outcomes.values()].filter((o) => o.result === result).length} ${result}`).join(", ")}.`,
-    ...(plan.unguarded?.acknowledged ? ["Unguarded Run: acknowledged on the pre-run Card; no verified Tester guard held it."] : []),
-    ...group(`Failed (${failed}):`, blocks.filter((b) => b.data.result === "failed").map(chainOf), record),
-    ...group(`Fix coming (${fixed.length}):`, fixed.flatMap((key) => byKey(key) ? [chainOf(/** @type {ExecutionBlock} */ (byKey(key)))] : []), record),
-    ...group(`Passed Execution, fix suppressed (${suppressed.length}):`, suppressed.flatMap((key) => byKey(key) ? [chainOf(/** @type {ExecutionBlock} */ (byKey(key)))] : []), record),
-    ...group(`Unresolved Automations (${work.unresolved.length}):`, unresolved, record),
-    ...group(`Blocked (${blocked}):`, blocks.filter((b) => b.data.result === "blocked").map(chainOf), record),
-    ...group(`Skipped (${skippedLines.length}):`, skippedLines, record),
-    ...group(`Not run (${notRun.length + notRunBlocks.length}), the Run ended before they started, so their previous result stays the latest:`, [...notRun.map(line), ...notRunBlocks.map(line)], record),
-    ...blocks.filter((b) => b.data.result === "passed" && b.atLogin).map((b) => `Warning: ${b.key} passed but met a sign-in page (at_login); check the Access note's login is current.`),
-    record ? `Record: ${record} (written, uncommitted).` : "No record written: no Execution ran and none was Blocked before dispatch.",
-    ...group(`Created entities left in the app (${created}, tagged \`qa-${plan.run}\` where free-text fields allowed):`, leftovers, record),
-    ...(unreported.count ? [`Warning: ${unreported.count} Execution${unreported.count === 1 ? "" : "s"} acted without a valid report; anything ${unreported.count === 1 ? "it" : "they"} created is unlisted: ${unreported.keys.join(", ")}.`] : []),
-    `Follow-ups: ${work.counts.fix} fix, ${work.counts.bug} bug.`,
-    ...(stopped ? [`The Run stopped: follow-ups do not start. Resume with \`${resumeCommand({ items: work.items }, dir)}\`.`] : []),
-  ].join("\n");
+  const warningItems = [
+    ...blocks.filter((b) => b.data.result === "passed" && b.atLogin).map((b) => `${b.key} passed but met a sign-in page (at_login); check the Access note's login is current.`),
+    ...(unreported.count ? [`${unreported.count} Execution${unreported.count === 1 ? "" : "s"} acted without a valid report; anything ${unreported.count === 1 ? "it" : "they"} created is unlisted: ${unreported.keys.join(", ")}.`] : []),
+  ];
+
+  return buildSections(INGEST_SECTION_ORDER, [
+    { id: "summary", markdown: `${header}\n${caseOutcomes}` },
+    { id: "unguarded", markdown: plan.unguarded?.acknowledged ? "Acknowledged on the pre-run Card; no verified Tester guard held it." : null },
+    { id: "failed", markdown: group(`Failed (${failed}):`, blocks.filter((b) => b.data.result === "failed").map(chainOf), record).join("\n") },
+    { id: "fix_coming", markdown: group(`Fix coming (${fixed.length}):`, fixed.flatMap((key) => byKey(key) ? [chainOf(/** @type {ExecutionBlock} */ (byKey(key)))] : []), record).join("\n") },
+    { id: "fix_suppressed", markdown: group(`Passed Execution, fix suppressed (${suppressed.length}):`, suppressed.flatMap((key) => byKey(key) ? [chainOf(/** @type {ExecutionBlock} */ (byKey(key)))] : []), record).join("\n") },
+    { id: "unresolved", markdown: group(`Unresolved Automations (${work.unresolved.length}):`, unresolved, record).join("\n") },
+    { id: "blocked", markdown: group(`Blocked (${blocked}):`, blocks.filter((b) => b.data.result === "blocked").map(chainOf), record).join("\n") },
+    { id: "skipped", markdown: group(`Skipped (${skippedLines.length}):`, skippedLines, record).join("\n") },
+    { id: "not_run", markdown: group(`Not run (${notRun.length + notRunBlocks.length}), the Run ended before they started, so their previous result stays the latest:`, [...notRun.map(line), ...notRunBlocks.map(line)], record).join("\n") },
+    { id: "warnings", items: warningItems },
+    { id: "record", markdown: record ? `${record} (written, uncommitted).` : "No record written: no Execution ran and none was Blocked before dispatch." },
+    { id: "created", markdown: group(`Created entities left in the app (${created}, tagged \`qa-${plan.run}\` where free-text fields allowed):`, leftovers, record).join("\n") },
+    { id: "report_problems", items: problems },
+    {
+      id: "follow_ups",
+      markdown: `${work.counts.fix} fix, ${work.counts.bug} bug.${stopped ? " The Run stopped: follow-ups do not start." : ""}`,
+      next: stopped ? resumeCommand({ items: work.items }, dir) : null,
+    },
+  ]);
 }
 
 /**
@@ -319,7 +342,7 @@ function ingest(args, { dir, root, env }) {
   if (schema) return schema;
   const opened = orThrow(openRunDir(dir, { cmd: "execute", action: "ingest", from: "execute plan" }));
   const plan = readPlan(opened.dir);
-  if (!plan) return stop("no_run");
+  if (!plan) return stop("no_run", { next: "execute plan" });
   if (!plan.confirmed) return stop("not_confirmed", { run: plan.run });
 
   const values = readCredentialValues(opened.dir);
@@ -347,7 +370,6 @@ function ingest(args, { dir, root, env }) {
   /** @type {Record<string, number>} */
   const counts = { passed: 0, failed: 0, blocked: 0, skipped: plan.skipped.length, not_run: notRun.length };
   for (const b of blocks) if (b.data.result) counts[b.data.result] += 1;
-  const automations = automationCounts(blocks);
 
   let record = null;
   if (blocks.length) {
@@ -363,20 +385,31 @@ function ingest(args, { dir, root, env }) {
     const path = join(qa, rel);
     if (existsSync(path)) return stop("record_exists", { record: relative(dirname(qa), path).split(sep).join("/") });
     scrubReports();
-    mkdirSync(dirname(path), { recursive: true });
-    try {
-      writeFileSync(path, /** @type {string} */ (written.text), { flag: "wx" });
-    } catch (e) {
-      if (/** @type {{ code?: string }} */ (e).code === "EEXIST") return stop("record_exists", { record: relative(dirname(qa), path).split(sep).join("/") });
-      throw e;
+    const tx = writeQa({
+      root: qa,
+      minSchema: LEVEL_ON_CASE_SCHEMA_VERSION,
+      writes: [{ path: rel, text: /** @type {string} */ (written.text), absent: true }],
+    });
+    if (!tx.ok) {
+      if (tx.kind === "schema") return tx.refusal;
+      if (tx.kind === "check") {
+        return stop("execution_invalid", {
+          errors: tx.errors.map(({ code, field, line, message }) => ({ code, field, line, message })),
+        });
+      }
+      if (tx.kind === "write" && tx.code === "EEXIST") {
+        return stop("record_exists", { record: relative(dirname(qa), path).split(sep).join("/") });
+      }
+      throw new Error(`execute ingest: ${tx.error ?? "failed"}`);
     }
     record = relative(dirname(qa), path).split(sep).join("/");
   }
   if (!blocks.length) scrubReports();
   clearReplies(opened.dir);
   sweep(opened.dir, plan, env);
-  const text = summaryText(plan, blocks, notRun, record, work, opened.dir, unreported);
-  return { exit: 0, json: maskCredentialValue({ action: "ingest", ok: true, run: plan.run, record, counts, automations, created: blocks.reduce((n, b) => n + b.created, 0), unreported_acted: unreported.count, not_run: notRun.map((n) => n.key), ...(problems.length && { report_problems: problems }), text }, values) };
+  /** @type {ReportSection[]} */
+  const sections = ingestSections(plan, blocks, notRun, record, work, opened.dir, unreported, problems);
+  return { exit: 0, json: maskCredentialValue({ action: "ingest", ok: true, run: plan.run, record, counts, sections }, values) };
 }
 
 /** @type {Record<string, CommandAction>} */

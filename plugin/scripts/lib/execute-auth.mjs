@@ -20,7 +20,8 @@ import { createPrivacyRefusalError, ensurePrivateDir, isPrivacyRefusalError, mov
 
 export { isPrivacyRefusalError };
 
-/** @import { ExecuteDispatchState, ExecuteExecution, ExecuteSession } from "./execute.mjs" */
+/** @import { ExecuteExecution, ExecuteSession } from "./execute-plan.mjs" */
+/** @import { ExecuteDispatchState } from "./execute-state.mjs" */
 /** @import { CaseFieldEntry } from "./case-fields.mjs" */
 /** @import { PrivacyContext } from "./platform-privacy.mjs" */
 

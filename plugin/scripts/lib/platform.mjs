@@ -21,8 +21,13 @@ export {
   BATCH_EXTENSIONS,
   DEFAULT_PLATFORM_FS,
   EXE_EXTENSION,
+  firstEnv,
+  isRegularFile,
+  isRootedWin32,
   mergePlatformFs,
   NODE_SCRIPT_EXTENSIONS,
+  scratchJoin,
+  systemRoot,
 } from "./platform-path.mjs";
 
 /**
@@ -94,6 +99,8 @@ export {
  *   | "unconfined_bin"
  *   | "disallowed_wrapper"
  *   | "disallowed_metachar"
+ *   | "comspec_not_absolute"
+ *   | "non_ascii_argument"
  *   | "acl_unreadable"
  *   | "acl_not_private"
  *   | "secret_target_unwritable"
@@ -109,9 +116,28 @@ export {
  *   file?: string,
  *   source?: string,
  *   char?: string,
+ *   index?: number,
  *   command?: string,
+ *   os_error?: string,
+ *   target_kind?: "symlink" | "directory" | "file",
+ *   suggest_dir?: boolean,
+ *   cause?: string,
+ *   owner_sid?: string,
+ *   grant_sid?: string,
  * }} PlatformRefusal
  */
+
+/**
+ * Extract structured data facts from a `PlatformRefusal`, stripping prose (`message`) and
+ * internal envelope fields (`outcome`, `code`).
+ * @param {PlatformRefusal} refusal
+ * @param {Record<string, unknown>} [extra]
+ * @returns {Record<string, unknown>}
+ */
+export function platformRefusalFacts(refusal, extra = {}) {
+  const { outcome: _outcome, code: _code, message: _message, ...facts } = refusal;
+  return { ...facts, ...extra };
+}
 
 /**
  * Resolved child-process invocation ready for `spawnSync` / `spawn`.

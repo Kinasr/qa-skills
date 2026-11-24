@@ -4,12 +4,12 @@ import { join } from 'node:path';
 import { buildCodeIndex, keyPatterns } from './code-index.mjs';
 import { resolveAdapter } from './stack.mjs';
 import { proveSelection } from './test-proof.mjs';
-import { diffTrees, writeTreeFile } from './pr-git.mjs';
+import { diffTrees, restoreTree } from './pr-git.mjs';
 import { rebuildPrChain, rollbackUntilPassing } from './regress-chain.mjs';
 /** @import { ProjectConfig } from './knowledge-file.mjs' */
 /** @import { AutomationSelection } from './test-runner.mjs' */
 /** @import { FollowUps, FixItem } from './follow-ups.mjs' */
-/** @import { ExecutePlan } from './execute.mjs' */
+/** @import { ExecutePlan } from './execute-plan.mjs' */
 
 /** @param {string} repo @param {ProjectConfig} config @returns {AutomationSelection[]} */
 export function fixSelections(repo, config) {
@@ -18,7 +18,7 @@ export function fixSelections(repo, config) {
   return buildCodeIndex(repo, config.modulePaths, config.annotationMap, adapter, keyPatterns(config)).functions.map(fn => {
     const titles = [...fn.classes.map(cls => cls.name), fn.name];
     return { id: fn.automationKeys[0]?.key ?? `${fn.file}:${fn.line}`, stack: config.stack?.root ?? '.', file: fn.file, line: fn.line, titles, package: fn.package,
-      literal: !fn.parameterised && titles.every(title => title.length > 0 && title.trim() === title && !/[›\r\n]|\$\{/.test(title)), tagged: fn.automationKeys.length > 0 && (config.annotationMap?.automation_key ?? []).includes('tag') };
+      literal: !fn.parameterised && titles.every(title => title.length > 0 && title.trim() === title && !/[›>\r\n]|\$\{/.test(title)), tagged: fn.automationKeys.length > 0 && (config.annotationMap?.automation_key ?? []).includes('tag') };
   });
 }
 
@@ -54,7 +54,7 @@ export function regressFix({ state, pinned, root, repo, dir, selections, refresh
     const work = state.fix?.items[id];
     const item = itemOf(id);
     if (!item) return;
-    if (work?.verified) for (const path of Object.keys(diffTrees(work.before, work.verified))) writeTreeFile(repo, path, work.before[path] ?? null);
+    if (work?.verified) restoreTree(repo, work.before, work.verified, { paths: Object.keys(diffTrees(work.before, work.verified)) });
     if (state.pr?.mode.kind !== 'working-tree' && state.pr) rebuildPrChain(state.pr, id);
     item.state = 'failed'; item.reason = 'regressed'; item.next = `Review ${item.file} and run /qa-execute again.`;
     if (work) { work.passed = false; delete work.verified; }

@@ -212,9 +212,10 @@ export function prepareReply(model, selections = {}, comment = "") {
   const items = [];
   for (const item of reply.items) {
     if (fencedReply({ ...reply, count: items.length + 1, items: [...items, item] }).length <= max) items.push(item);
+    else break;
   }
   return {
-    block: commentTooLarge ? null : fencedReply({ ...reply, count: items.length, items }),
+    block: commentTooLarge || items.length === 0 ? null : fencedReply({ ...reply, count: items.length, items }),
     length: block.length,
     taken: items.length,
     left: reply.items.length - items.length,

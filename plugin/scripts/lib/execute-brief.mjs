@@ -16,7 +16,7 @@
 // `node <plugin>/scripts/scan.mjs tester do|request …`, each word bare or single-quoted.
 /**
  * @import { CommandAction, CommandResult } from "./cli.mjs"
- * @import { ExecuteExecution, ExecutePlan } from "./execute.mjs"
+ * @import { ExecuteExecution, ExecutePlan } from "./execute-plan.mjs"
  * @import { ExecuteTrainingEntry } from "./execute-training.mjs"
  * @import { ExecutionGuard, ExecutionSession } from "./execution-guard.mjs"
  * @import { ParsedEntry, ParsedFile, ParsedRule } from "./knowledge-file.mjs"
@@ -28,14 +28,14 @@ import { realpathSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 import { SCAN_CLI, noArguments, requireOption } from "./cli.mjs";
 import { redactCredentials, shownKey } from "./credentials.mjs";
-import { execution } from "./execute-open.mjs";
+import { execution } from "./execute-plan.mjs";
 import { executeTraining } from "./execute-training.mjs";
 import { GUARD_STOPS, REPORT_FILE, executionDir, readGuard } from "./execution-guard.mjs";
 import { REPORT_EXAMPLES } from "./execution-report.mjs";
 import { repositoryOf } from "./git-tree.mjs";
 import { TESTER_REASONS } from "./check-file.mjs";
 import { buildIndex, loadWorkingTree } from "./qa-index.mjs";
-import { refusalsFor } from "./refusal.mjs";
+import { refusalsWithoutLines } from "./refusal.mjs";
 import { EXECUTE_TRAIN_KEY } from "./schema.mjs";
 import { TESTER_ALLOWED } from "./tester-command.mjs";
 import { bindingLine } from "./tester-guard.mjs";
@@ -83,9 +83,7 @@ import { trainFile } from "./training.mjs";
  * }} BriefContext
  */
 
-const { stop } = refusalsFor({
-  not_open: "The Execution is not open; run `execute open` for it before building its brief.",
-});
+const { stop } = refusalsWithoutLines();
 
 // One shell word the Tester hook admits: bare when it is only safe characters, else single-quoted.
 /**
@@ -469,7 +467,7 @@ export function executionBrief(dir, id, { root }) {
   if (found.refusal) return found;
   const { pinned, ex } = found;
   const guard = readGuard(executionDir(found.runDir, id));
-  if (!guard) return { refusal: stop("not_open", { execution: id }) };
+  if (!guard) return { refusal: stop("not_open", { execution: id, next: "execute open" }) };
   const runDir = realpathSync(found.runDir);
   const files = loadWorkingTree(root);
   const index = buildIndex(files);

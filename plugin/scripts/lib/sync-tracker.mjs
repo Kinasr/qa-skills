@@ -212,7 +212,7 @@ import { allowsLayerFree, LAYER_FREE_CASE_SCHEMA_VERSION, LEVEL_ON_CASE_SCHEMA_V
 /**
  * @typedef {{
  *   code: string,
- *   message: string,
+ *   message?: string,
  *   why?: string,
  *   error?: string,
  *   access_note?: string,
@@ -1321,7 +1321,7 @@ export const intake = {
     const T = /** @type {Extract<TrackerState, { ok: true }>} */ (ctx.tracker);
     if (item.code === "intake_scenario") {
       if (typeof item.feature !== "string" || !ctx.index.features.has(item.feature)) {
-        return { code: "needs_edit", message: `name the Feature that holds scenario \`${item.key}\` (edit item ${item.n} with \`feature\`)` };
+        return { code: "needs_edit", field: "feature" };
       }
       const permanent = /** @type {{ key: string, error?: string }} */ (plan.permanentKey("ts", item.permanent_key));
       if (permanent.error) return { code: "mint", item: item.n, message: permanent.error };
@@ -1336,20 +1336,20 @@ export const intake = {
       plan.intaken.push({ kind: "scenario", key: permanent.key, tracker: item.key, reused: Boolean(item.permanent_key) });
       return null;
     }
-    if (item.needs.includes("prose")) return { code: "prose_not_fetched", message: `fetch \`${item.key}\`'s preconditions, steps and expected result, then build the card again` };
+    if (item.needs.includes("prose")) return { code: "prose_not_fetched", keys: [item.key] };
     // A tracker level is an offer: the item stays Layer-free until the engineer answers `level`
     // with a binding, or with an empty string to decline it.
-    if (item.needs.includes("level") && (item.level === null || item.level === undefined)) return { code: "needs_edit", message: `confirm \`${item.key}\`'s tracker level as a binding, or leave it empty to take the case in Layer-free (edit item ${item.n} with \`level\`)` };
+    if (item.needs.includes("level") && (item.level === null || item.level === undefined)) return { code: "needs_edit", field: "level" };
     const answered = item.level === undefined || item.level === null || (typeof item.level === "string" && !item.level.trim()) ? null : normalizeCaseLevel(/** @type {CaseLevel} */ (item.level));
     const schema = ctx.config.schemaVersion ?? 0;
-    if (answered === null && schema >= LEVEL_ON_CASE_SCHEMA_VERSION && !allowsLayerFree(schema)) return { code: "needs_edit", message: `a Layer-free case needs schema ${LAYER_FREE_CASE_SCHEMA_VERSION}: run \`migrate-keys\`, or name \`${item.key}\`'s level (edit item ${item.n} with \`level\`)` };
+    if (answered === null && schema >= LEVEL_ON_CASE_SCHEMA_VERSION && !allowsLayerFree(schema)) return { code: "needs_edit", field: "level", next: "migrate-keys", reason: "layer_free_schema" };
     // Below the level-on-case schema an absent case level inherits its Scenario's; writing it there
     // is Layer-free only when the Scenario carries none.
-    if (answered === null && schema < LEVEL_ON_CASE_SCHEMA_VERSION && typeof (/** @type {{ data?: { level?: unknown } } | undefined} */ (item.file ? ctx.files.find((f) => f.rel === item.file) : undefined))?.data?.level === "string") return { code: "needs_edit", message: `\`${item.scenario}\` carries a legacy Scenario level that an absent case level inherits: name \`${item.key}\`'s level (edit item ${item.n} with \`level\`), or run \`migrate-keys --levels\` and then \`migrate-keys\` to make it Layer-free` };
-    if (Array.isArray(answered) && !allowsLayerFree(schema)) return { code: "needs_edit", message: `a list of levels needs schema ${LAYER_FREE_CASE_SCHEMA_VERSION}: run \`migrate-keys\`, or name one level for \`${item.key}\`` };
+    if (answered === null && schema < LEVEL_ON_CASE_SCHEMA_VERSION && typeof (/** @type {{ data?: { level?: unknown } } | undefined} */ (item.file ? ctx.files.find((f) => f.rel === item.file) : undefined))?.data?.level === "string") return { code: "needs_edit", field: "level", next: "migrate-keys", reason: "scenario_level_inherited" };
+    if (Array.isArray(answered) && !allowsLayerFree(schema)) return { code: "needs_edit", field: "level", next: "migrate-keys", reason: "level_list_schema" };
     if (answered !== null) {
       const chosen = Array.isArray(answered) ? answered : [answered];
-      if (!chosen.length || new Set(chosen).size !== chosen.length || chosen.some((level) => typeof level !== "string" || !ctx.config.levels.has(level))) return { code: "bad_level", message: `\`${chosen.join(", ")}\` is not a list of distinct \`project.stack.levels\`: ${[...ctx.config.levels].join(", ")}` };
+      if (!chosen.length || new Set(chosen).size !== chosen.length || chosen.some((level) => typeof level !== "string" || !ctx.config.levels.has(level))) return { code: "bad_level", allowed: [...ctx.config.levels] };
     }
     const roles = badRoles(ctx, /** @type {Extract<IntakeItem, { code: "intake_case" }>} */ (item));
     if (roles) return roles;
@@ -1376,17 +1376,17 @@ export const intake = {
 /**
  * @param {SyncTrackerContext} ctx
  * @param {Extract<IntakeItem, { code: "intake_case" }>} item
- * @returns {{ code: string, message: string } | null}
+ * @returns {{ code: "bad_roles" | "needs_edit", allowed: string[], field?: string, roles?: string[], next?: string } | null}
  */
 function badRoles(ctx, item) {
-  if (!Array.isArray(item.roles) || item.roles.some((r) => typeof r !== "string")) return { code: "bad_roles", message: "`roles` is a list of role names" };
+  const allowed = [...ctx.config.roles];
+  if (!Array.isArray(item.roles) || item.roles.some((r) => typeof r !== "string")) return { code: "bad_roles", allowed };
   const unknown = item.roles.filter((r) => !ctx.config.roles.has(r));
   if (!unknown.length) return null;
   const asFetched = JSON.stringify(item.roles) === JSON.stringify(item.mirror.roles ?? []);
-  const which = unknown.map((r) => `\`${r}\``).join(", ");
   return asFetched
-    ? { code: "needs_edit", message: `${which} ${unknown.length === 1 ? "is" : "are"} not in \`project.roles\`: add ${unknown.length === 1 ? "it" : "them"} with \`/qa-init --add-role\` and build the card again, or edit item ${item.n}'s \`roles\`` }
-    : { code: "bad_roles", message: `${which} ${unknown.length === 1 ? "is" : "are"} not in \`project.roles\`` };
+    ? { code: "needs_edit", field: "roles", roles: unknown, allowed, next: "/qa-init --add-role" }
+    : { code: "bad_roles", roles: unknown, allowed };
 }
 
 // Case and Scenario Divergences the fetch shows (vanished, moved), for the card to print.

@@ -331,21 +331,20 @@ const REPAIRS = {
     apply(ctx, item, plan) {
       const { keep, functions } = /** @type {{ keep: number | null | undefined, functions: DuplicateFunctionProposal[] }} */ (item);
       if (keep === null || keep === undefined) {
-        return { code: "undecided", message: `git blame cannot say which function keeps \`${item.key}\`: edit item ${item.n} with \`keep\` (1 to ${functions.length})` };
+        return { code: "undecided", field: "keep", range: [1, functions.length] };
       }
-      if (!Number.isInteger(keep) || keep < 1 || keep > functions.length) return { code: "bad_keep", message: `\`keep\` must be 1 to ${functions.length}` };
+      if (!Number.isInteger(keep) || keep < 1 || keep > functions.length) return { code: "bad_keep", field: "keep", range: [1, functions.length] };
       const bad = badFreshKey(functions, keep);
       if (bad) {
         const problems = prefixProblems(functions);
         const onlyKeep = problems.length === 1 ? functions.indexOf(problems[0]) + 1 : null;
-        const hint = onlyKeep ? `; keeping \`${functions[onlyKeep - 1].name}\` instead would work` : `; ${noKeepWorks(problems)}`;
         return {
           code: "bad_prefix",
           item: item.n,
           badFunction: bad.name,
           onlyKeep,
           keeperName: onlyKeep ? functions[onlyKeep - 1].name : null,
-          message: `\`${bad.name}\` cannot get a fresh key: ${/** @type {NonNullable<typeof bad.key_prefix>} */ (bad.key_prefix).problem}${hint}`,
+          problem: /** @type {NonNullable<typeof bad.key_prefix>} */ (bad.key_prefix).problem,
         };
       }
       const keeper = functions[keep - 1];
@@ -567,9 +566,9 @@ export const prefixes = {
   },
   apply(ctx, item, plan) {
     const recipe = /** @type {MintRecipe} */ (ctx.config.autRecipe);
-    if (item.prefix === null || item.prefix === undefined) return { code: "needs_edit", message: `name the Key prefix of \`${item.class?.path ?? item.file}\` (edit item ${item.n} with \`prefix\`)` };
+    if (item.prefix === null || item.prefix === undefined) return { code: "needs_edit", field: "prefix" };
     if (!prefixFits(item.prefix, recipe)) {
-      return { code: "bad_prefix", item: item.n, prefix: item.prefix, message: `\`${item.prefix}\` does not fit \`automation_key_mint\`: ${prefixRule(recipe)}` };
+      return { code: "bad_prefix", item: item.n, prefix: item.prefix, rule: prefixRule(recipe) };
     }
     if (item.class) plan.keyPrefix(item.class, item.prefix);
     else plan.fileKeyPrefix(item.file, item.prefix);
@@ -617,11 +616,11 @@ export const code = {
 /**
  * @param {SyncCodeContext} ctx
  * @param {string[]} bind
- * @returns {{ code: string, message: string } | null}
+ * @returns {{ code: string, cases: string[] } | null}
  */
 function badBind(ctx, bind) {
   const unknown = bind.filter((k) => !ctx.index.cases.has(k));
-  if (unknown.length) return { code: "unknown_case", message: `no case ${unknown.map((k) => `\`${k}\``).join(", ")} in \`.qa/\`` };
+  if (unknown.length) return { code: "unknown_case", cases: unknown };
   return null;
 }
 

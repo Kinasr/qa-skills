@@ -13,6 +13,7 @@
 //     which is Blocked `runner-error`, never a stale pass.
 import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync } from "node:fs";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
+import { isContained } from "../paths.mjs";
 import { attemptRules } from "../test-runner.mjs";
 /** @import { AutomationAttempt, AutomationSelection, RunnerResult } from "../test-runner.mjs" */
 /** @import { TestRunner } from "../knowledge-file.mjs" */
@@ -28,10 +29,88 @@ import { attemptRules } from "../test-runner.mjs";
  * @typedef {{ pkg: string, classPath: string, method: string, fqcn: string, outer: string }} JvmTarget
  */
 
-/** @param {string} text @param {string} name @returns {string} */
+const XML_ENTITIES = /** @type {const} */ ({
+  "&amp;": "&",
+  "&lt;": "<",
+  "&gt;": ">",
+  "&quot;": "\"",
+  "&apos;": "'",
+});
+
+/**
+ * Decode standard XML named and numeric character references in a single pass.
+ * @param {string} text
+ * @returns {string}
+ */
+function decodeXmlEntities(text) {
+  return text.replace(/&(?:amp|lt|gt|quot|apos|#\d+|#x[\da-fA-F]+);/g, (entity) => {
+    if (Object.hasOwn(XML_ENTITIES, entity)) return XML_ENTITIES[/** @type {keyof typeof XML_ENTITIES} */ (entity)];
+    const code = entity.startsWith("&#x") ? parseInt(entity.slice(3, -1), 16) : parseInt(entity.slice(2, -1), 10);
+    return Number.isInteger(code) && code >= 0 && code <= 0x10ffff ? String.fromCodePoint(code) : entity;
+  });
+}
+
+/**
+ * Find the closing `>` index of an XML tag starting at `openIndex`, ignoring `>` inside quotes.
+ * @param {string} xml
+ * @param {number} openIndex
+ * @returns {number}
+ */
+function findTagEnd(xml, openIndex) {
+  /** @type {string | null} */
+  let quote = null;
+  for (let i = openIndex + 1; i < xml.length; i++) {
+    const ch = xml[i];
+    if (quote !== null) {
+      if (ch === quote) quote = null;
+    } else if (ch === "\"" || ch === "'") {
+      quote = ch;
+    } else if (ch === ">") {
+      return i;
+    }
+  }
+  return -1;
+}
+
+/**
+ * Remove named XML elements (self-closing or paired) using quote-aware tag boundaries.
+ * @param {string} xml
+ * @param {readonly string[]} tags
+ * @returns {string}
+ */
+function stripElements(xml, tags) {
+  const pattern = new RegExp(`<(?:${tags.join("|")})(?=\\s|\\/?\\>)`, "g");
+  let out = "";
+  let cursor = 0;
+  let match;
+  while ((match = pattern.exec(xml))) {
+    if (match.index < cursor) continue;
+    const tagName = match[0].slice(1);
+    const tagEnd = findTagEnd(xml, match.index);
+    if (tagEnd === -1) break;
+    out += xml.slice(cursor, match.index);
+    if (xml[tagEnd - 1] === "/") {
+      cursor = tagEnd + 1;
+    } else {
+      const closeRe = new RegExp(`<\\/${tagName}\\s*>`, "g");
+      closeRe.lastIndex = tagEnd + 1;
+      const closeMatch = closeRe.exec(xml);
+      cursor = closeMatch ? closeMatch.index + closeMatch[0].length : tagEnd + 1;
+    }
+    pattern.lastIndex = cursor;
+  }
+  return out + xml.slice(cursor);
+}
+
+/**
+ * Decode an XML attribute value cleanly, avoiding `-name` false matches.
+ * @param {string} text
+ * @param {string} name
+ * @returns {string}
+ */
 function attribute(text, name) {
-  const match = new RegExp(`\\b${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)')`).exec(text);
-  return match ? match[1] ?? match[2] ?? "" : "";
+  const match = new RegExp(`(?:^|\\s)${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)')`).exec(text);
+  return match ? decodeXmlEntities(match[1] ?? match[2] ?? "") : "";
 }
 
 /**
@@ -41,31 +120,50 @@ function attribute(text, name) {
  * @returns {JUnitCase[] | null}
  */
 export function junitCases(text) {
-  const body = text.trim();
-  if (!/<testsuite\b/.test(body)) return null;
-  if (!/<\/testsuite\s*>\s*$/.test(body) && !/<testsuite\b[^>]*\/>\s*$/.test(body)) return null;
+  const stripped = text.trim()
+    .replace(/<!\[CDATA\[[\s\S]*?\]\]>/g, "")
+    .replace(/<!--[\s\S]*?-->/g, "");
+  const suiteStart = /<testsuite(?=\s|\/?>)/.exec(stripped);
+  if (!suiteStart) return null;
+  const suiteEnd = findTagEnd(stripped, suiteStart.index);
+  if (suiteEnd === -1) return null;
+  const suiteClosed = stripped[suiteEnd - 1] === "/"
+    ? stripped.slice(suiteEnd + 1).trim() === ""
+    : /<\/testsuite\s*>\s*$/.test(stripped);
+  if (!suiteClosed) return null;
+  const body = stripElements(stripped, ["system-out", "system-err"]);
   /** @type {JUnitCase[]} */
   const cases = [];
-  const start = /<testcase\b([^>]*)>/g;
+  const start = /<testcase(?=\s|\/?>)/g;
   let match;
   while ((match = start.exec(body))) {
-    const raw = match[1];
+    const tagEnd = findTagEnd(body, match.index);
+    if (tagEnd === -1) return null;
+    const raw = body.slice(match.index + "<testcase".length, tagEnd);
     const selfClosing = /\/\s*$/.test(raw);
     const attrs = raw.replace(/\/\s*$/, "");
     let inside = "";
-    let end = match.index + match[0].length;
+    let end = tagEnd + 1;
     if (!selfClosing) {
-      const close = body.indexOf("</testcase>", end);
-      if (close === -1) return null;
-      inside = body.slice(end, close);
-      end = close + "</testcase>".length;
-      start.lastIndex = end;
+      const closeRe = /<\/testcase\s*>/g;
+      closeRe.lastIndex = end;
+      const closeMatch = closeRe.exec(body);
+      if (!closeMatch) return null;
+      inside = body.slice(end, closeMatch.index);
+      end = closeMatch.index + closeMatch[0].length;
     }
+    start.lastIndex = end;
     /** @type {{ kind: string, message: string }[]} */
     const children = [];
-    const child = /<(failure|error|flakyFailure|flakyError|rerunFailure|rerunError|skipped)\b([^>]*)>/g;
+    const child = /<(failure|error|flakyFailure|flakyError|rerunFailure|rerunError|skipped)(?=\s|\/?>)/g;
     let part;
-    while ((part = child.exec(inside))) children.push({ kind: part[1], message: attribute(part[2], "message") });
+    while ((part = child.exec(inside))) {
+      const childEnd = findTagEnd(inside, part.index);
+      if (childEnd === -1) return null;
+      const childAttrs = inside.slice(part.index + 1 + part[1].length, childEnd).replace(/\/\s*$/, "");
+      child.lastIndex = childEnd + 1;
+      children.push({ kind: part[1], message: attribute(childAttrs, "message") });
+    }
     cases.push({ name: attribute(attrs, "name"), classname: attribute(attrs, "classname"), children });
   }
   return cases;
@@ -113,7 +211,13 @@ export function parseJUnitReport(text, { module }) {
   const parsed = { instances: {}, diagnostics: [] };
   for (const testcase of cases) {
     if (!testcase.name && !testcase.classname) continue;
-    const id = `${module}:${testcase.classname}#${testcase.name}`;
+    const baseId = `${module}:${testcase.classname}#${testcase.name}`;
+    let id = baseId;
+    if (Object.hasOwn(parsed.instances, id)) {
+      let n = 2;
+      while (Object.hasOwn(parsed.instances, `${baseId}#${n}`)) n++;
+      id = `${baseId}#${n}`;
+    }
     parsed.instances[id] = attemptsOf(testcase, id, parsed.diagnostics);
   }
   return parsed;
@@ -180,7 +284,7 @@ export function mavenSelector(selection) {
 export function jvmModule(repo, runnerDir, file, buildNames) {
   const root = resolve(repo, runnerDir);
   let dir = dirname(join(repo, file));
-  while (dir.startsWith(`${root}${sep}`)) {
+  while (isContained(root, dir, { strict: true })) {
     if (buildNames.some((name) => existsSync(join(dir, name)))) return relative(root, dir).split(sep).join("/") || ".";
     const parent = dirname(dir);
     if (parent === dir) break;

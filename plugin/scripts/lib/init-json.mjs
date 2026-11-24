@@ -1,10 +1,15 @@
 // @ts-check
 // Init output data and refusals for the model to word.
-import { validateEdits } from "./decisions.mjs";
-import { refusalsFor, object, parseDecisions } from "./refusal.mjs";
+/**
+ * @import { AgentPointer } from "./agent-pointer.mjs"
+ * @import { SmokeOutcome, SmokeStarted } from "./init-smoke.mjs"
+ * @import { ReportSection, SectionSpec } from "./report-sections.mjs"
+ */
+import { refusalsWithoutLines, object, readDecisions } from "./refusal.mjs";
 import { glossaryOf } from "./labels.mjs";
 import { MINTING } from "./init-minting.mjs";
 import { line } from "./render.mjs";
+import { buildSections } from "./report-sections.mjs";
 
 /**
  * The evidence a value came from: what was read in the repository or the tracker, what was asked,
@@ -170,17 +175,26 @@ import { line } from "./render.mjs";
  */
 
 /**
- * The first-run card, as `init` prints it.
- * @typedef {object} InitCardData
- * @property {{ items: number, questions: number }} counts
- * @property {readonly InitItem[]} items
- * @property {readonly InitPickedTier[]} picked_tiers
- * @property {readonly InitStack[]} stacks
- * @property {"inherit"} fallback
- * @property {readonly { path: string, frontmatter: string }[]} files
- * @property {readonly InitNote[]} notes
- * @property {InitFields} fields
+ * The first-run or maintenance card JSON output (`init card`).
+ * @typedef {object} InitCardJson
+ * @property {ReportSection[]} sections
  * @property {readonly InitGlossary[]} glossary
+ */
+
+/**
+ * The apply report JSON output (`init apply` on `ok: true`).
+ * @typedef {object} InitApplyJson
+ * @property {string | null} commit
+ * @property {readonly InitGlossary[]} glossary
+ * @property {ReportSection[]} sections
+ */
+
+/**
+ * The confirmation JSON output (`init apply` on `confirm: true`).
+ * @typedef {object} InitConfirmJson
+ * @property {Record<string, unknown>} decisions
+ * @property {readonly InitGlossary[]} glossary
+ * @property {ReportSection[]} sections
  */
 
 /**
@@ -223,96 +237,114 @@ import { line } from "./render.mjs";
  */
 
 /**
- * The maintenance card, as `init` prints it.
- * @typedef {object} InitMaintenanceData
- * @property {{ items: number, disagree: number }} counts
- * @property {readonly InitCheckError[]} check
- * @property {readonly InitMaintenanceItem[]} items
- * @property {readonly InitNote[]} notes
- * @property {InitFields} fields
- * @property {readonly InitGlossary[]} glossary
- */
-
-/**
- * A problem with the decisions, as a refusal fact.
- * @typedef {{ code: string, item?: number | string, field?: string, reason?: string }} InitDecisionError
- */
-
-/**
- * The decisions read from the agent's JSON, checked against the items the card showed.
- * @typedef {object} InitDecisions
- * @property {Record<string, unknown>} input
- * @property {number[]} take
- * @property {number[]} drop
- * @property {Record<string, Record<string, unknown>>} edits
- * @property {number[]} confirm
- * @property {InitDecisionError[]} errors
- */
-
-/**
  * An unread key annotation, as the report shows it.
  * @typedef {{ role: string, place: string, key: string, name: string }} InitUnread
  */
 
 // Stable refusal codes carry facts; the model supplies the explanation and the next step.
-/** @type {Record<string, string>} */
-export const REFUSALS = {
-  // A call that cannot be made.
-  bad_arguments: "The action takes no positional argument.",
-  no_proposal: "The proposal is read from a file or stdin: pass --input <file> or --stdin.",
-  proposal_not_json: "The proposal on stdin is not JSON.",
-  needs_dir: "The action needs the run dir `init card` printed.",
-  apply_needs_stdin: "Apply needs JSON decisions from a file or stdin: pass --input <file> or --stdin.",
-  no_card: "No Card is kept in the run dir.",
-  card_changed: "The proposal's evidence, `.qa/` or the date changed since the Card was shown.",
-  write_failed: "The write failed and was rolled back.",
-  unknown_action: "The init step does not exist.",
-  state_arguments: "`init state` takes options only.",
-  // A proposal that cannot become a Card, and a Card that cannot be written.
-  shape: "The proposal is not in the shape the Card reads.",
-  unknown_field: "The proposal names a setting the Card does not have.",
-  missing: "A required setting has no value.",
-  no_evidence: "A setting's evidence is missing or unfit.",
-  roles_from_code: "Roles come from the tracker or the engineer, never from test code.",
-  role_meaning_missing: "A non-empty Role list needs one line saying what it means.",
-  tracker_partial: "A tracker needs provider, project and key shape, or none.",
-  stack_evidence: "A test stack lacks its language, framework, count or sample.",
-  guidance_unquoted: "A guidance quote is not a line of the named file.",
-  module_path_outside_stack: "Module paths must be test roots of the chosen stack.",
-  stack_not_chosen: "Several test stacks are listed and none is chosen.",
-  not_smoke_tested: "A Tier model label has no passing smoke test in the run dir.",
-  check_file: "`.qa/project.md` would not pass its check.",
-  unusable_carrier: "The Automation key's carrier is not one the stack's adapter writes.",
-  project_unreadable: "`.qa/project.md` cannot be edited in place.",
-  unwritable: "A detected value cannot be written in `.qa/project.md`.",
-  // The JSON decisions.
-  edit_dropped: "A dropped item also has an answer.",
-  edit_field: "The item does not accept that answer.",
-  not_droppable: "The item cannot be dropped.",
-  unaddressed: "The decisions leave items open.",
-  needs_edit: "An accepted item's question is unanswered.",
-  no_such_stack: "The answer names no test stack of the Card.",
-  no_such_option: "The answer names no option of who mints Automation keys.",
-  minting_unsettled: "The option was not settled in the interview.",
-  nothing_to_adopt: "The item has no detected value to adopt.",
-  label_removed: "A Tag or Custom-field value is retired, never removed, renamed or reused: move it to the retired list instead.",
-  // `init smoke`.
-  smoke_arguments: "`init smoke` takes options only.",
-  smoke_no_model: "`init smoke` needs --model <label>.",
-  smoke_not_label: "The model is not a label: a label is not empty and holds no space.",
-  smoke_fallback: "`inherit` is never smoke-tested.",
-  smoke_needs_dir: "Judging a reply needs the run dir the smoke test started in.",
-  smoke_not_started: "No smoke test of the model was started in the run dir.",
-  // `init add-role`.
-  role_names: "`init add-role` takes one or more Role names.",
-  blank_role: "A Role name is not blank.",
-  no_project: "`.qa/project.md` does not exist.",
-  add_role_check_file: "`.qa/project.md` would not pass its check.",
-  role_unwritable: "A Role name cannot be written in `.qa/project.md`.",
-  add_role_write_failed: "The write failed and was rolled back.",
-};
+export const { fact, refuse, refusalOf } = refusalsWithoutLines((code, data) => ({
+  ...(code === "no_proposal" || code === "apply_needs_stdin" ? { input: "--input <path> | --stdin" } : {}),
+  ...data,
+}));
 
-export const { fact, refuse, refusalOf } = refusalsFor(REFUSALS);
+/**
+ * Ordered section registry for `init state`.
+ * @type {readonly SectionSpec[]}
+ */
+export const STATE_SECTION_ORDER = [
+  { id: "agent_pointer", label: "Agent pointer" },
+];
+
+/**
+ * Top-level keys allowed outside `sections` on `init state`.
+ * @type {readonly string[]}
+ */
+export const STATE_ALLOWED_OUTSIDE = ["mode", "migration", "ok", "train", "access"];
+
+/**
+ * `init state` JSON output: working inputs (`train`, `access`) outside, and the Agent pointer inside `sections`.
+ * @param {{ train: unknown, access: unknown, pointer: AgentPointer }} data
+ * @returns {{ ok: true, train: unknown, access: unknown, sections: ReportSection[] }}
+ */
+export function stateData({ train, access, pointer }) {
+  /** @type {ReportSection[]} */
+  const sections = buildSections(STATE_SECTION_ORDER, [
+    { id: "agent_pointer", items: [pointer] },
+  ]);
+  return { ok: true, train, access, sections };
+}
+
+/**
+ * Ordered section registry for `init smoke`.
+ * @type {readonly SectionSpec[]}
+ */
+export const SMOKE_SECTION_ORDER = [
+  { id: "smoke_failure", label: "Smoke-test failure" },
+];
+
+/**
+ * Top-level keys allowed outside `sections` on `init smoke`.
+ * @type {readonly string[]}
+ */
+export const SMOKE_ALLOWED_OUTSIDE = ["mode", "migration", "ok", "dir", "model", "brief", "prompt", "reply"];
+
+/**
+ * `init smoke` start JSON output: handoff paths outside and empty `sections`.
+ * @param {string} dir
+ * @param {string} model
+ * @param {SmokeStarted} started
+ * @returns {{ ok: true, dir: string, model: string, brief: string, prompt: string, reply: string, sections: ReportSection[] }}
+ */
+export function smokeStartData(dir, model, started) {
+  return { ok: true, dir, model, ...started, sections: buildSections(SMOKE_SECTION_ORDER, []) };
+}
+
+/**
+ * `init smoke --reply` JSON output: failure details inside `sections` when `ok: false`.
+ * @param {string} dir
+ * @param {string} model
+ * @param {SmokeOutcome} outcome
+ * @returns {{ ok: boolean, dir: string, model: string, sections: ReportSection[] }}
+ */
+export function smokeResultData(dir, model, outcome) {
+  /** @type {ReportSection[]} */
+  const sections = buildSections(SMOKE_SECTION_ORDER, [
+    {
+      id: "smoke_failure",
+      items: outcome.ok ? [] : [{ reason: outcome.reason, ...(outcome.excerpt !== undefined && { excerpt: outcome.excerpt }) }],
+    },
+  ]);
+  return { ok: outcome.ok, dir, model, sections };
+}
+
+/**
+ * Ordered section registry for `init add-role`.
+ * @type {readonly SectionSpec[]}
+ */
+export const ADD_ROLE_SECTION_ORDER = [
+  { id: "added", label: "Added roles" },
+  { id: "already", label: "Already present" },
+];
+
+/**
+ * Top-level keys allowed outside `sections` on `init add-role`.
+ * @type {readonly string[]}
+ */
+export const ADD_ROLE_ALLOWED_OUTSIDE = ["mode", "migration", "ok", "path", "commit"];
+
+/**
+ * `init add-role` JSON output: path and commit command outside, and added/already roles inside `sections`.
+ * @param {{ path: string, added: readonly string[], already: readonly string[], commit: string | null }} data
+ * @returns {{ ok: true, path: string, commit: string | null, sections: ReportSection[] }}
+ */
+export function addRoleData({ path, added, already, commit }) {
+  /** @type {ReportSection[]} */
+  const sections = buildSections(ADD_ROLE_SECTION_ORDER, [
+    { id: "added", items: added },
+    { id: "already", items: already },
+  ]);
+  return { ok: true, path, commit, sections };
+}
 
 // What a note says, with the glossary term it uses.
 /** @type {Record<string, InitNoteText>} */
@@ -349,6 +381,129 @@ const notesOf = (notes, terms) => notes.map((note) => {
   return noteOf(note);
 });
 
+/**
+ * A problem with the decisions, as a refusal fact.
+ * @typedef {{ code: string, item?: number | string, field?: string, reason?: string }} InitDecisionError
+ */
+
+/**
+ * The decisions read from the agent's JSON, checked against the items the card showed.
+ * @typedef {object} InitDecisions
+ * @property {Record<string, unknown>} input
+ * @property {number[]} take
+ * @property {number[]} drop
+ * @property {Record<string, Record<string, unknown>>} edits
+ * @property {number[]} confirm
+ * @property {InitDecisionError[]} errors
+ */
+
+/**
+ * Ordered section registry for `init card` (first run and maintenance).
+ * @type {readonly SectionSpec[]}
+ */
+export const CARD_SECTION_ORDER = [
+  { id: "counts", label: "Summary" },
+  { id: "check", label: "Project check errors" },
+  { id: "notes", label: "Notes" },
+  { id: "items", label: "Card items" },
+  { id: "picked_tiers", label: "Picked Tiers" },
+  { id: "fallback", label: "Fallback" },
+  { id: "stacks", label: "Test stacks" },
+  { id: "files", label: "Files to write" },
+  { id: "answer_fields", label: "Allowed answer fields" },
+];
+
+/**
+ * Top-level keys allowed outside `sections` on `init card`.
+ * @type {readonly string[]}
+ */
+export const CARD_ALLOWED_OUTSIDE = ["mode", "migration", "ok", "dir", "glossary"];
+
+/**
+ * Ordered section registry for `init apply` (`ok: true`).
+ * @type {readonly SectionSpec[]}
+ */
+export const APPLY_SECTION_ORDER = [
+  { id: "applied", label: "Applied items" },
+  { id: "dropped", label: "Dropped items" },
+  { id: "files", label: "Written files" },
+  { id: "notes", label: "Notes" },
+  { id: "snippet", label: "Automation-key declaration" },
+  { id: "todo_errors", label: "Integrity errors introduced" },
+  { id: "todo_unread", label: "Unread key annotations" },
+  { id: "words", label: "Key annotation terms" },
+];
+
+/**
+ * Top-level keys allowed outside `sections` on `init apply` (`ok: true`).
+ * @type {readonly string[]}
+ */
+export const APPLY_ALLOWED_OUTSIDE = ["mode", "migration", "ok", "dir", "commit", "glossary"];
+
+/**
+ * Ordered section registry for `init apply` (`confirm: true`).
+ * @type {readonly SectionSpec[]}
+ */
+export const CONFIRM_SECTION_ORDER = [
+  { id: "changes", label: "Changes needing confirmation" },
+  { id: "words", label: "Key annotation terms" },
+];
+
+/**
+ * Top-level keys allowed outside `sections` on `init apply` (`confirm: true`).
+ * @type {readonly string[]}
+ */
+export const CONFIRM_ALLOWED_OUTSIDE = ["mode", "migration", "ok", "confirm", "rebuild", "dir", "decisions", "glossary"];
+
+/**
+ * `init apply` report JSON output: `commit` and `glossary` outside, and outcomes inside `sections`.
+ * @param {{
+ *   applied: readonly number[],
+ *   dropped: readonly number[],
+ *   files: readonly string[],
+ *   commit: string | null,
+ *   notes?: readonly InitNote[],
+ *   snippet: Record<string, unknown> | null,
+ *   todo?: { errors: readonly unknown[], unread: readonly InitUnread[] },
+ *   words?: unknown,
+ *   glossary: readonly InitGlossary[],
+ * }} data
+ * @returns {InitApplyJson}
+ */
+export function applyReportData({ applied, dropped, files, commit, notes = [], snippet, todo, words, glossary }) {
+  /** @type {ReportSection[]} */
+  const sections = buildSections(APPLY_SECTION_ORDER, [
+    { id: "applied", items: applied },
+    { id: "dropped", items: dropped },
+    { id: "files", items: files },
+    { id: "notes", items: notes },
+    { id: "snippet", items: snippet ? [snippet] : [] },
+    { id: "todo_errors", items: todo?.errors ?? [] },
+    { id: "todo_unread", items: todo?.unread ?? [] },
+    { id: "words", items: words !== undefined ? [words] : [] },
+  ]);
+  return { commit, glossary, sections };
+}
+
+/**
+ * `init apply` confirmation JSON output: `decisions` and `glossary` outside, and changes/terms inside `sections`.
+ * @param {{
+ *   changes: readonly unknown[],
+ *   words: unknown,
+ *   glossary: readonly InitGlossary[],
+ *   decisions: Record<string, unknown>,
+ * }} data
+ * @returns {InitConfirmJson}
+ */
+export function confirmData({ changes, words, glossary, decisions }) {
+  /** @type {ReportSection[]} */
+  const sections = buildSections(CONFIRM_SECTION_ORDER, [
+    { id: "changes", items: changes },
+    { id: "words", items: words !== undefined ? [words] : [] },
+  ]);
+  return { decisions, glossary, sections };
+}
+
 // The first-run card: every setting with the evidence it came from, the test stack, who mints keys,
 // and the file it would write.
 /**
@@ -360,7 +515,7 @@ const notesOf = (notes, terms) => notes.map((note) => {
  *   notes: readonly { code: string, overlaps?: string[] }[],
  * }} card
  * @param {(field: string) => string} fieldLabelOf
- * @returns {InitCardData}
+ * @returns {InitCardJson}
  */
 export function firstCardData({ items, picked_tiers, stacks, files, notes }, fieldLabelOf) {
   const terms = new Set(["Tier", "Fallback"]);
@@ -382,19 +537,20 @@ export function firstCardData({ items, picked_tiers, stacks, files, notes }, fie
       if (i.options.includes(3)) terms.add("Key prefix");
       Object.assign(out, { choice: i.choice, options: MINTING.map((o) => ({ k: o.k, label: o.label, settled: i.options.includes(o.k) })), given: Object.entries(i.given).map(([f, g]) => ({ label: fieldLabelOf(f), ...g })) });
     }
-    return /** @type {InitCardData["items"][number]} */ (out);
+    return /** @type {InitItem} */ (out);
   });
-  return {
-    counts: { items: items.length, questions: items.filter((i) => i.question).length },
-    items: shown,
-    picked_tiers,
-    stacks: stacks.map(({ chosen, ...s }) => s),
-    fallback: "inherit",
-    files: files.map(({ path, text }) => ({ path, frontmatter: text.slice(0, text.indexOf("\n---\n", 4) + 4) })),
-    notes: notesOf(notes, terms),
-    fields: FIELDS,
-    glossary: glossaryOf(terms),
-  };
+  /** @type {ReportSection[]} */
+  const sections = buildSections(CARD_SECTION_ORDER, [
+    { id: "counts", items: [{ items: items.length, questions: items.filter((i) => i.question).length }] },
+    { id: "notes", items: notesOf(notes, terms) },
+    { id: "items", items: shown },
+    { id: "picked_tiers", items: picked_tiers },
+    { id: "fallback", items: ["inherit"] },
+    { id: "stacks", items: stacks.map(({ chosen, ...s }) => s) },
+    { id: "files", items: files.map(({ path, text }) => ({ path, frontmatter: text.slice(0, text.indexOf("\n---\n", 4) + 4) })) },
+    { id: "answer_fields", items: [FIELDS] },
+  ]);
+  return { sections, glossary: glossaryOf(terms) };
 }
 
 // The maintenance card: every setting as `project.md` holds it, with fresh detection beside it where it disagrees.
@@ -404,7 +560,7 @@ export function firstCardData({ items, picked_tiers, stacks, files, notes }, fie
  *   check: readonly InitCheckError[],
  *   notes: readonly { code: string, overlaps?: string[] }[],
  * }} card
- * @returns {InitMaintenanceData}
+ * @returns {InitCardJson}
  */
 export function maintenanceCardData({ items, check, notes }) {
   const terms = new Set();
@@ -431,7 +587,15 @@ export function maintenanceCardData({ items, check, notes }) {
     };
   });
   if (items.some((i) => i.effect && i.effect.errors + i.effect.unread > 0)) terms.add("Integrity error");
-  return { counts: { items: items.length, disagree: items.filter((i) => i.adopt).length }, check, items: shown, notes: notesOf(notes, terms), fields: FIELDS, glossary: glossaryOf(terms) };
+  /** @type {ReportSection[]} */
+  const sections = buildSections(CARD_SECTION_ORDER, [
+    { id: "counts", items: [{ items: items.length, disagree: items.filter((i) => i.adopt).length }] },
+    { id: "check", items: check },
+    { id: "notes", items: notesOf(notes, terms) },
+    { id: "items", items: shown },
+    { id: "answer_fields", items: [FIELDS] },
+  ]);
+  return { sections, glossary: glossaryOf(terms) };
 }
 
 /**
@@ -474,22 +638,17 @@ const TYPES = { value: (item) => /** @type {{ type?: string }} */ (item).type, s
  */
 export function decisionsOf(text, items, maintenance) {
   const lead = maintenance ? "adopt" : "take";
-  const parsed = /** @type {{ errors?: InitDecisionError[], input: Record<string, unknown> }} */ (parseDecisions(text));
-  if (parsed.errors) return /** @type {{ errors: InitDecisionError[] }} */ (parsed);
-  const { input } = parsed;
   const allowed = [lead, "drop", "edits", ...(maintenance ? ["confirm"] : [])];
-  /**
-   * @param {string} k
-   * @returns {boolean}
-   */
-  const listed = (k) => input[k] === undefined || Array.isArray(input[k]) || (k === "take" && input.take === "all");
-  if (!object(input) || Object.keys(input).some((k) => !allowed.includes(k)) || !allowed.filter((k) => k !== "edits").every(listed) || (input.edits !== undefined && !object(input.edits))) return { errors: [{ code: "invalid_decisions" }] };
-  const drop = /** @type {number[]} */ (input.drop ?? []);
-  const take = /** @type {number[]} */ (input.take === "all" ? items.filter((i) => !drop.includes(i.n)).map((i) => i.n) : input[lead] ?? []);
-  const edits = /** @type {Record<string, Record<string, unknown>>} */ (input.edits ?? {});
-  const confirm = /** @type {number[]} */ (input.confirm ?? []);
-  // `decisions.mjs` is not adopted yet, so its `confirm` is inferred as `never[]`; the numbers the
-  // decisions confirm are cast to it at this call, and nothing else of it is changed.
-  const errors = validateEdits(items, take, drop, edits, { confirm: /** @type {never[]} */ (confirm), maintenance, unknownFirst: true, badValue: (/** @type {InitCardItem} */ item, /** @type {string} */ field, /** @type {unknown} */ value) => badValue(TYPES[field](item), value) });
-  return { input, take, drop, edits, confirm, errors };
+  return readDecisions(text, items, {
+    keys: allowed,
+    lists: [lead, "drop", ...(maintenance ? ["confirm"] : [])],
+    maps: [],
+    drop: "drop",
+    edits: "edits",
+    confirm: "confirm",
+    all: lead,
+    allLiteral: !maintenance,
+    maintenance,
+    unknownFirst: true,
+  }, (item, field, value) => badValue(TYPES[field](item), value));
 }

@@ -5,8 +5,8 @@
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { join as nativeJoin, win32 as win32Path } from "node:path";
-import { readEnv } from "./platform-path.mjs";
+import { posix as posixPath, win32 as win32Path } from "node:path";
+import { firstEnv, isRootedWin32, scratchJoin, systemRoot } from "./platform-path.mjs";
 
 /** @import { PlatformContext, PlatformRefusal, PlatformRunner, PlatformRunnerOptions } from "./platform.mjs" */
 
@@ -72,14 +72,16 @@ export function isPrivacyRefusalError(error) {
 const SYSTEM_SID = "S-1-5-18";
 const BUILTIN_ADMINS_SID = "S-1-5-32-544";
 const CREATOR_OWNER_SID = "S-1-3-0";
-const CREATOR_GROUP_OWNER_SID = "S-1-3-4";
+const OWNER_RIGHTS_SID = "S-1-3-4";
+const CREATOR_GROUP_SID = "S-1-3-1";
 
 /** @type {Record<string, string>} */
 const SDDL_SID_ALIASES = {
   SY: SYSTEM_SID,
   BA: BUILTIN_ADMINS_SID,
   CO: CREATOR_OWNER_SID,
-  OW: CREATOR_GROUP_OWNER_SID,
+  OW: OWNER_RIGHTS_SID,
+  CG: CREATOR_GROUP_SID,
   WD: "S-1-1-0",
   AU: "S-1-5-11",
   IU: "S-1-5-4",
@@ -103,11 +105,14 @@ const EXPOSED_SDDL_RIGHT_TOKENS = new Set([
 ]);
 // Known execute/traverse-only SDDL rights tokens; anything else fails closed.
 const KNOWN_HARMLESS_SDDL_RIGHT_TOKENS = new Set(["FX", "GX", "KX"]);
-const DEFAULT_SYSTEM_ROOT = "C:\\Windows";
-// Read/List/Traverse bits (FILE_READ_DATA 0x1, FILE_WRITE_DATA 0x2, FILE_APPEND_DATA 0x4,
-// FILE_READ_EA 0x8, FILE_READ_ATTRIBUTES 0x80, READ_CONTROL 0x20000, WRITE_DAC 0x40000,
-// WRITE_OWNER 0x80000, GENERIC_ALL 0x10000000, GENERIC_WRITE 0x40000000, GENERIC_READ 0x80000000).
-const EXPOSED_ACCESS_MASK_BITS = 0xD00E008F;
+// Known SDDL ACE flag tokens: OI CI NP IO ID SA FA TP CR.
+const KNOWN_ACE_FLAG_TOKENS = new Set(["OI", "CI", "NP", "IO", "ID", "SA", "FA", "TP", "CR"]);
+// Access bits that expose data, change entries or change ownership/permissions:
+// FILE_READ_DATA 0x1, FILE_WRITE_DATA 0x2, FILE_APPEND_DATA 0x4, FILE_READ_EA 0x8,
+// FILE_WRITE_EA 0x10, FILE_DELETE_CHILD 0x40, FILE_READ_ATTRIBUTES 0x80,
+// FILE_WRITE_ATTRIBUTES 0x100, DELETE 0x10000, READ_CONTROL 0x20000, WRITE_DAC 0x40000,
+// WRITE_OWNER 0x80000, GENERIC_ALL 0x10000000, GENERIC_WRITE 0x40000000, GENERIC_READ 0x80000000.
+const EXPOSED_ACCESS_MASK_BITS = 0xD00F01DF;
 
 /**
  * Resolve absolute win32 System32 paths for `whoami.exe` and `icacls.exe`, or return null when
@@ -116,13 +121,11 @@ const EXPOSED_ACCESS_MASK_BITS = 0xD00E008F;
  * @returns {{ whoami: string, icacls: string } | null}
  */
 function resolveSystemTools(env) {
-  const rawRoot = readEnv(env, "SystemRoot");
-  const systemRoot = rawRoot !== undefined && rawRoot.trim() !== "" ? rawRoot.trim() : DEFAULT_SYSTEM_ROOT;
-  const isAbsoluteWin32 = win32Path.isAbsolute(systemRoot) && (/^[A-Za-z]:[\\/]/.test(systemRoot) || /^\\\\[^\\]+\\[^\\]+/.test(systemRoot));
-  if (!isAbsoluteWin32) return null;
+  const root = systemRoot(env);
+  if (root === null) return null;
   return {
-    whoami: win32Path.join(systemRoot, "System32", "whoami.exe"),
-    icacls: win32Path.join(systemRoot, "System32", "icacls.exe"),
+    whoami: win32Path.join(root, "System32", "whoami.exe"),
+    icacls: win32Path.join(root, "System32", "icacls.exe"),
   };
 }
 
@@ -282,6 +285,22 @@ function rightsExposeAccess(rightsField) {
 }
 
 /**
+ * Split SDDL ACE flags into two-character tokens.
+ * @param {string} flags
+ * @returns {{ tokens: string[] } | { reason: string }}
+ */
+function parseAceFlags(flags) {
+  if (flags.length % 2 !== 0) return { reason: `odd-length ACE flags "${flags}" in DACL` };
+  const tokens = [];
+  for (let i = 0; i < flags.length; i += 2) {
+    const token = flags.slice(i, i + 2);
+    if (!KNOWN_ACE_FLAG_TOKENS.has(token)) return { reason: `unknown ACE flag token "${token}" in DACL` };
+    tokens.push(token);
+  }
+  return { tokens };
+}
+
+/**
  * Resolve an SDDL SID or two-letter alias to an uppercase SID string.
  * @param {string} trustee
  * @returns {string}
@@ -296,38 +315,40 @@ function resolveTrusteeSid(trustee) {
  * BUILTIN\Administrators, `userSid`, and inherit-only Creator Owner / Owner Rights.
  * @param {string} rawText
  * @param {string} userSid
- * @returns {{ valid: boolean, private: boolean, reason?: string }}
+ * @returns {{ valid: boolean, private: boolean, reason?: string, cause?: string, owner_sid?: string, grant_sid?: string }}
  */
 function analyzeIcaclsSave(rawText, userSid) {
   const clean = rawText.replace(/^\uFEFF/, "");
   const lines = clean.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
   if (lines.length < 2) {
-    return { valid: false, private: false, reason: "icacls /save output was empty or incomplete" };
+    return { valid: false, private: false, cause: "parse_acl", reason: "icacls /save output was empty or incomplete" };
   }
   const sddl = lines[1];
   const sections = extractSddlSections(sddl);
   if (sections === null || !Object.hasOwn(sections, "D")) {
-    return { valid: false, private: false, reason: "directory DACL is missing from icacls /save output" };
+    return { valid: false, private: false, cause: "parse_acl", reason: "directory DACL is missing from icacls /save output" };
   }
   const daclBody = sections.D;
   if (/^NO_ACCESS_CONTROL$/i.test(daclBody)) {
-    return { valid: true, private: false, reason: "directory has null DACL (NO_ACCESS_CONTROL)" };
+    return { valid: true, private: false, cause: "null_dacl", reason: "directory has null DACL (NO_ACCESS_CONTROL)" };
   }
   const aceStrings = parseAceStrings(daclBody);
   if (aceStrings === null) {
-    return { valid: false, private: false, reason: `directory has unparseable or unrestricted DACL (${daclBody})` };
+    return { valid: false, private: false, cause: "parse_acl", reason: `directory has unparseable or unrestricted DACL (${daclBody})` };
   }
   const normalizedUserSid = userSid.toUpperCase();
   if (Object.hasOwn(sections, "O")) {
     const rawOwner = sections.O;
     if (!rawOwner) {
-      return { valid: false, private: false, reason: "directory owner O: in icacls /save output is empty" };
+      return { valid: false, private: false, cause: "parse_acl", reason: "directory owner O: in icacls /save output is empty" };
     }
     const ownerSid = resolveTrusteeSid(rawOwner);
     if (ownerSid !== SYSTEM_SID && ownerSid !== BUILTIN_ADMINS_SID && ownerSid !== normalizedUserSid) {
       return {
         valid: true,
         private: false,
+        cause: "owner",
+        owner_sid: ownerSid,
         reason: `directory owner ${ownerSid} is not current user, SYSTEM, or Administrators`,
       };
     }
@@ -335,33 +356,52 @@ function analyzeIcaclsSave(rawText, userSid) {
   for (const ace of aceStrings) {
     const parts = ace.split(";");
     if (parts.length !== 6) {
-      return { valid: false, private: false, reason: `malformed ACE in DACL (${ace})` };
+      return { valid: false, private: false, cause: "parse_acl", reason: `malformed ACE in DACL (${ace})` };
     }
     const aceType = parts[0].trim().toUpperCase();
     const aceFlags = parts[1].trim().toUpperCase();
     const rights = parts[2].trim();
     const trusteeSid = resolveTrusteeSid(parts[5]);
 
+    const flags = parseAceFlags(aceFlags);
+    if ("reason" in flags) return { valid: false, private: false, cause: "parse_acl", reason: flags.reason };
+
     if (aceType === "D" || aceType === "OD") continue;
     if (aceType !== "A" && aceType !== "OA") {
-      return { valid: false, private: false, reason: `unsupported ACE type "${aceType}" in DACL` };
+      return { valid: false, private: false, cause: "parse_acl", reason: `unsupported ACE type "${aceType}" in DACL` };
     }
 
     const isAllowedPrincipal = trusteeSid === SYSTEM_SID
       || trusteeSid === BUILTIN_ADMINS_SID
       || trusteeSid === normalizedUserSid;
-    const isInheritOnlyCreator = (trusteeSid === CREATOR_OWNER_SID || trusteeSid === CREATOR_GROUP_OWNER_SID)
-      && aceFlags.includes("IO");
+    const isInheritOnlyCreator = (trusteeSid === CREATOR_OWNER_SID || trusteeSid === OWNER_RIGHTS_SID)
+      && flags.tokens.includes("IO");
 
     if (!isAllowedPrincipal && !isInheritOnlyCreator && rightsExposeAccess(rights)) {
       return {
         valid: true,
         private: false,
+        cause: "grant",
+        grant_sid: trusteeSid,
         reason: `directory ACL grants access to ${trusteeSid}`,
       };
     }
   }
   return { valid: true, private: true };
+}
+
+/**
+ * The first of `LOCALAPPDATA`, `USERPROFILE`, `TEMP`, `TMP` that is absolute (win32 rooted, or
+ * POSIX-absolute so simulated tests can use real temp folders), or `null` when none qualifies.
+ * @param {NodeJS.ProcessEnv} env
+ * @returns {string | null}
+ */
+function findScratchRoot(env) {
+  for (const name of ["LOCALAPPDATA", "USERPROFILE", "TEMP", "TMP"]) {
+    const value = firstEnv(env, [name]);
+    if (value !== undefined && (isRootedWin32(value) || posixPath.isAbsolute(value))) return value;
+  }
+  return null;
 }
 
 /**
@@ -391,6 +431,8 @@ export function checkDirPrivacy(dir, context = {}, options = {}) {
         message: formatPrivacyRefusalMessage(dir, "invalid `SystemRoot` for Windows ACL tools", command, suggestDir),
         file: dir,
         command,
+        suggest_dir: suggestDir,
+        cause: "system_tools",
       },
     };
   }
@@ -406,25 +448,41 @@ export function checkDirPrivacy(dir, context = {}, options = {}) {
         message: formatPrivacyRefusalMessage(dir, "could not determine current user SID via `whoami /user`", command, suggestDir),
         file: dir,
         command,
+        suggest_dir: suggestDir,
+        cause: "whoami",
       },
     };
   }
 
-  const scratchRoot = env.LOCALAPPDATA || env.USERPROFILE || env.TEMP || env.TMP || ".";
-  const pathJoin = /^[A-Za-z]:[\\/]|^\\\\/.test(scratchRoot) || scratchRoot.includes("\\") ? win32Path.join : nativeJoin;
+  const scratchRoot = findScratchRoot(env);
+  if (scratchRoot === null) {
+    const command = formatPrivateAclCommand(dir, userSid);
+    return {
+      ok: false,
+      refusal: {
+        outcome: "refused",
+        code: "acl_unreadable",
+        message: formatPrivacyRefusalMessage(dir, "no absolute LOCALAPPDATA, USERPROFILE, TEMP or TMP to hold the ACL dump", command, suggestDir),
+        file: dir,
+        command,
+        suggest_dir: suggestDir,
+        cause: "scratch_root",
+      },
+    };
+  }
   let realScratchDir = "";
   let saveFile = "";
   try {
     if (context.fs) {
       if (context.fs.mkdtempSync) {
-        const scratchDir = context.fs.mkdtempSync(pathJoin(scratchRoot, "qa-acl-"));
-        saveFile = pathJoin(scratchDir, "acl.sav");
+        const scratchDir = context.fs.mkdtempSync(scratchJoin(scratchRoot, "qa-acl-"));
+        saveFile = scratchJoin(scratchDir, "acl.sav");
       } else {
-        saveFile = pathJoin(scratchRoot, `qa-acl-${randomUUID()}.sav`);
+        saveFile = scratchJoin(scratchRoot, `qa-acl-${randomUUID()}.sav`);
       }
     } else {
-      realScratchDir = mkdtempSync(pathJoin(scratchRoot, "qa-acl-"));
-      saveFile = pathJoin(realScratchDir, "acl.sav");
+      realScratchDir = mkdtempSync(scratchJoin(scratchRoot, "qa-acl-"));
+      saveFile = scratchJoin(realScratchDir, "acl.sav");
     }
 
     const icaclsRes = run(tools.icacls, [dir, "/save", saveFile], { env, encoding: "utf8" });
@@ -438,6 +496,8 @@ export function checkDirPrivacy(dir, context = {}, options = {}) {
           message: formatPrivacyRefusalMessage(dir, "`icacls /save` failed to read the directory ACL", command, suggestDir),
           file: dir,
           command,
+          suggest_dir: suggestDir,
+          cause: "icacls_save",
         },
       };
     }
@@ -456,6 +516,8 @@ export function checkDirPrivacy(dir, context = {}, options = {}) {
           message: formatPrivacyRefusalMessage(dir, "could not read `icacls /save` output file", command, suggestDir),
           file: dir,
           command,
+          suggest_dir: suggestDir,
+          cause: "read_acl",
         },
       };
     }
@@ -471,6 +533,8 @@ export function checkDirPrivacy(dir, context = {}, options = {}) {
           message: formatPrivacyRefusalMessage(dir, verdict.reason ?? "directory ACL could not be parsed", command, suggestDir),
           file: dir,
           command,
+          suggest_dir: suggestDir,
+          cause: verdict.cause ?? "parse_acl",
         },
       };
     }
@@ -485,6 +549,10 @@ export function checkDirPrivacy(dir, context = {}, options = {}) {
           message: formatPrivacyRefusalMessage(dir, verdict.reason ?? "directory is readable by other users", command, suggestDir),
           file: dir,
           command,
+          suggest_dir: suggestDir,
+          ...(verdict.cause && { cause: verdict.cause }),
+          ...(verdict.owner_sid && { owner_sid: verdict.owner_sid }),
+          ...(verdict.grant_sid && { grant_sid: verdict.grant_sid }),
         },
       };
     }
@@ -522,9 +590,10 @@ function isTargetBlockedError(error) {
  * @param {string} target
  * @param {string} detail
  * @param {boolean} suggestDir
+ * @param {{ os_error?: string, target_kind?: "symlink" | "directory" }} [extra]
  * @returns {PlatformRefusal}
  */
-function secretTargetRefusal(target, detail, suggestDir) {
+function secretTargetRefusal(target, detail, suggestDir, extra = {}) {
   const locationHint = suggestDir
     ? "Use a fresh private `--dir` or `TEMP` directory."
     : "Check permissions on `TEMP` and remove any read-only or symlinked target.";
@@ -533,6 +602,8 @@ function secretTargetRefusal(target, detail, suggestDir) {
     code: "secret_target_unwritable",
     message: `Refusing to write secret target "${target}": ${detail}. ${locationHint}`,
     file: target,
+    suggest_dir: suggestDir,
+    ...extra,
   };
 }
 
@@ -563,7 +634,7 @@ export function ensurePrivateDir(dir, context = {}, options = {}) {
   } catch (error) {
     if (isTargetBlockedError(error)) {
       const code = /** @type {NodeJS.ErrnoException} */ (error).code;
-      return { ok: false, refusal: secretTargetRefusal(dir, `${code} while creating secret directory`, suggestDir) };
+      return { ok: false, refusal: secretTargetRefusal(dir, `${code} while creating secret directory`, suggestDir, { os_error: code }) };
     }
     throw error;
   }
@@ -596,7 +667,7 @@ export function moveSecretFileWin32(fromPath, targetPath, context = {}, options 
   if (existing && (existing.isSymbolicLink() || existing.isDirectory())) {
     return {
       ok: false,
-      refusal: secretTargetRefusal(targetPath, "target already exists as a symlink or directory", suggestDir),
+      refusal: secretTargetRefusal(targetPath, "target already exists as a symlink or directory", suggestDir, { target_kind: existing.isSymbolicLink() ? "symlink" : "directory" }),
     };
   }
 
@@ -606,7 +677,7 @@ export function moveSecretFileWin32(fromPath, targetPath, context = {}, options 
   } catch (error) {
     if (isTargetBlockedError(error)) {
       const code = /** @type {NodeJS.ErrnoException} */ (error).code;
-      return { ok: false, refusal: secretTargetRefusal(targetPath, `${code} on rename`, suggestDir) };
+      return { ok: false, refusal: secretTargetRefusal(targetPath, `${code} on rename`, suggestDir, { os_error: code }) };
     }
     throw error;
   }
@@ -639,7 +710,7 @@ export function writeSecretFile(targetPath, content, context = {}, options = {})
   if (existing && (existing.isSymbolicLink() || existing.isDirectory())) {
     return {
       ok: false,
-      refusal: secretTargetRefusal(targetPath, "target already exists as a symlink or directory", suggestDir),
+      refusal: secretTargetRefusal(targetPath, "target already exists as a symlink or directory", suggestDir, { target_kind: existing.isSymbolicLink() ? "symlink" : "directory" }),
     };
   }
 
@@ -651,7 +722,7 @@ export function writeSecretFile(targetPath, content, context = {}, options = {})
   } catch (error) {
     if (isTargetBlockedError(error)) {
       const code = /** @type {NodeJS.ErrnoException} */ (error).code;
-      return { ok: false, refusal: secretTargetRefusal(targetPath, `${code} writing secret file`, suggestDir) };
+      return { ok: false, refusal: secretTargetRefusal(targetPath, `${code} writing secret file`, suggestDir, { os_error: code }) };
     }
     throw error;
   } finally {

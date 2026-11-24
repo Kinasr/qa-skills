@@ -6,9 +6,9 @@ disable-model-invocation: true
 
 # /qa-impact
 
-`/qa-impact <feature-key> [<ref>...]` is the **quick path**, its only form. The earlier judge flow's
-flags (`--persist`, `--review`, `--target`) and its read-only report are retired: each gets the
-answer in [Entry](#entry).
+`/qa-impact <feature-key> [<ref>...]` is the **quick path**, its only form. Only the earlier user-facing
+slash-command flags (`--persist`, `--review`, `--target`, and bare `/qa-impact`) are retired,
+answered in [Entry](#entry); internal `impact plan --persist` and `impact persist` remain the shared CLI judge step.
 
 The quick path takes a small change to an existing **Feature** from References to written, settled
 **Test Cases** in one conversation. The engineer chose it by size; it hands the change to `/qa-deep-dive`
@@ -34,9 +34,8 @@ or a Dismissal.
 
 A Practice that contradicts an Invariant is void.
 
-- **At startup, on every path**, run
-  `node <this skill's directory>/../../scripts/scan.mjs migration-status [--root <qa-dir>]`.
-  If `pending`, warn using `migrations` in order. Continue the command.
+- **On every path where the command's JSON carries `migration`**, read it first: if `pending`,
+  warn using `migrations` in order; continue the command.
 
 - **The tracker is read-only except `/qa-publish`.**
 
@@ -44,31 +43,21 @@ A Practice that contradicts an Invariant is void.
   in the OS temp dir. Then the CLI
   writes every finding, Dismissal, Review stamp and Watermark; your one `.qa/` edit is a knowledge fix
   the engineer asks for.
-- **In the judge step, never interactive until the walk.** Ask the engineer nothing until the report is shown.
-- **Never pre-select an answer.** Every finding and every review is the engineer's. Offer the
+- **Every finding and every review answer is the engineer's; never pre-select one.** Offer the
   case's `choices`. A `proposal` on the case is design's data, shown beside them and never marked,
   defaulted or applied for the engineer. Ask about ambiguity, and leave open what the reply does
   not clearly address.
 - **Code and training never reach the judge.** Never pass test code, a diff of the code, training
-  or your own notes. The framework supplies only the unit's CLI-built brief as task content.
+  or your own notes; the framework supplies only the unit's CLI-built brief as task content.
   Delegates launch fresh and non-forked, with automatic startup loading of user, project and local
   CLAUDE.md disabled and without parent auto memory. Read is not path-confined; hooks and
   instructions loaded during file access remain residual channels. Qualified live (`docs/support.md`).
-- **Never run git to stage or commit yourself.** The commit follows the project's Commit mode through
-  `scan.mjs commit` (ADR-0062), never retried with `--no-verify`.
-- **Never stamp a name the engineer didn't give.** Ask for it.
-- **Never reuse answers given before the case changed.** Walk again.
-- **The quick path runs in this conversation.** Never hand its forecast, Rule edits or walk to a
-  Delegate; Delegates only judge and write cases.
+- **The commit follows the project's Commit mode through `scan.mjs commit`, never retried with `--no-verify`: never run git to stage or commit yourself.**
+- **Ask for the engineer's name; never stamp a name the engineer didn't give.**
+- **The quick path runs in this conversation.** Delegates only judge and write cases; never hand its forecast, Rule edits or walk to a Delegate.
 - **Rules change only through `/qa-deep-dive`'s procedure,** and cases are written only through
   design's Delegate, so the Conventions, the agreement brief and the Tier apply.
 - **One run dir per change.** Name it once with `impact quick`, and pass it to every call.
-- **Persist only into the run dir that holds the confirmed forecast.** `plan --persist` refuses a Rule
-  whose statement changed without one: run `quick-check` into the same dir again.
-- **Over the threshold, stop.** Write the handoff and give `/qa-deep-dive`'s command; never go on.
-- **Checkpoints follow the Commit mode.** Run the next step only once the checkpoint commit exists:
-  under `auto` the CLI makes it and the run goes on.
-- **An old invocation is answered, never run.** Entry refuses it; do not run the retired flow.
 
 ## The CLI
 
@@ -89,15 +78,16 @@ Commands that read input take it from a file: write it outside the repository (t
 - `design page --dir <dir>`; `design page-reply --dir <dir> --input <file>`, the pasted Reply unchanged
 - `design checkpoint --dir <dir>`
 
-**`ok: false`**: `refusals` carry a `code`, one factual `line` and data. Explain them in your own
-words and say what to do next. If a shared guard returns `text`, relay it intact. A refused
+**`ok: false`**: `refusals` carry a `code` and facts (including shared guards). Word them in your own
+words and say what to do next. A refused
 triage wrote nothing: resolve refusals and retry. If the case changed,
 run `walk` and obtain fresh answers. Elsewhere, stop.
 
 ## Entry
 
+An old invocation is answered, never run: Entry refuses it; do not run the retired flow.
 Run `impact entry` with the engineer's arguments as given, before anything else. With `route: quick`,
-go to the quick path. Otherwise relay each refusal's `line` and its `replacement`, and stop:
+go to the quick path. Otherwise word each refusal from `code` and its `replacement`, and stop:
 `--persist` and `--review` are `/qa-design <feature-key>`'s, which settles open findings and
 `--review` (unreviewed and Review overdue cases); `--target` has no replacement, since the judge reads
 the committed knowledge at HEAD; a call with no Feature key is `/qa-next`'s question.
@@ -113,21 +103,24 @@ the committed knowledge at HEAD; a call with no Feature key is `/qa-next`'s ques
    written file. Keep its Invariants. Skip its `reconcile` and its close, which step 3 replaces.
 3. **Scope.** Pass `{"forecast": {...}, "references": ["<URI>"], "open_questions": [...]}` to
    `impact quick-check <feature-key> --dir <dir> --input <file>`: the confirmed forecast (`widened` and `by`
-   as `deep-dive reconcile` takes them), every Reference's URI and each question still open. Settle
-   its `outside_band`, `unedited_changes`, `boundary_check` and `downstream` as the deep-dive
+   as `deep-dive reconcile` takes them), every Reference's URI and each question still open. Word every
+   section in order and settle its findings as the deep-dive
    re-run reference says. The engineer may confirm **one** downstream Rule to edit in this run: edit
    it, `deep-dive check` its Feature, and run `quick-check` again with that Feature's key.
-4. **Threshold.** `threshold` counts the confirmed Rules of every Feature plus the Stale cases they
-   owe after the downstream walk. When `over` is true, `handoff` is written: tell the engineer the
-   total and the limit, give its `next_step` (`/qa-deep-dive <feature-key> --dir <dir>`, which resumes
-   from it), and stop. When it is not, go on.
-5. **Checkpoint 1.** Make `quick-check`'s `changeset.commit`, the Rule edits, as [the commit reference](../references/commit.md) says, and go on once
-   it exists.
-6. **Store and judge.** Run [the judge step](#the-judge-step) with `impact plan --persist --dir <dir>`
+4. **Threshold.** When `over` is true, `handoff` is written: over the threshold, stop and never go on. Write
+   the handoff and give `/qa-deep-dive`'s command (`next_step`): offer it once; run it on yes, else stop. When it is
+   not, go on.
+5. **Checkpoint 1.** Checkpoints follow the Commit mode: run the next step only once the checkpoint
+   commit exists; under `auto` the CLI makes it and the run goes on. Make `quick-check`'s
+   `changeset.commit`, the Rule edits, as [the commit reference](../references/commit.md) says.
+6. **Store and judge.** Persist only into the run dir that holds the confirmed forecast (`plan --persist`
+   refuses a Rule whose statement changed without one: run `quick-check` into the same dir again).
+   Run [the judge step](#the-judge-step) with `impact plan --persist --dir <dir>`
    (with the Feature key when `quick-check`'s `next_step` names it), then its Dispatch, and
    `impact persist --dir <dir>`. Report as its Report does.
 7. **Settle.** Follow `/qa-design` §1's settlement from its walk, step 6 having judged, with
    `design walk|triage|propose|link|rule-fix` over `dir`, and [the chat walk](references/triage.md) or [Card page](references/card-page.md) as it says.
+   If a case changed, walk again: never reuse answers given before the case changed.
    **Ask the engineer for the name** their stamps carry (`human:<name>`), unless they gave it. Pass it
    once, on the first walk; the run dir keeps it for every triage. When `persist` carries
    `card_page.offer`, or the engineer asks for a Card page, or pastes a Card page Reply, follow
@@ -147,6 +140,8 @@ settles what is open, walking a Feature's open findings without judging it again
 
 ## The judge step
 
+In the judge step, never interactive until the walk: ask the engineer nothing until the report is shown.
+
 ### 1. Plan
 
 Run `impact plan` as step 6 gives it. Use its `dir` in every later call. `units` counts judge units;
@@ -162,10 +157,9 @@ case, and each Feature's Rules against its Boundaries.
 ### 3. Report
 
 Run `impact persist --dir <dir>`. Read
-[the shared wording rules](../references/wording-rules.md), then write the report from `report`:
-scope, judgements, overreaches, scans, run health and the Watermarks. Copy
-non-null `markdown` intact; word `scans.items` from codes, facts and labels. Give reasons, notes,
-failed units and `run_health.rerun` when set. Then settle (step 7).
+[the shared wording rules](../references/wording-rules.md), then word every section in order: copy each
+Markdown table row for row, word itemised sections from their codes, facts and labels, and give any
+reasons, notes, failed units and re-run command present. Then settle (step 7).
 
 ### 4. Close
 

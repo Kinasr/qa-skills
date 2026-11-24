@@ -25,6 +25,7 @@ import { isStoredFinding, storedCaseFindings, storedFeatureFindings } from "./st
 import { nextPage } from "./next-page.mjs";
 import { orThrow } from "./cli.mjs";
 import { digests } from "./pin-digest.mjs";
+import { buildSections } from "./report-sections.mjs";
 
 /** @import { CaseFieldEntry } from "./case-fields.mjs" */
 /** @import { CommandContext, CommandDefinition, CommandResult } from "./cli.mjs" */
@@ -34,11 +35,11 @@ import { digests } from "./pin-digest.mjs";
 /** @import { MigrationStatus } from "./migration-status.mjs" */
 /** @import { NextFeatureInfo, NextLegendEntry, NextLocation, NextRoute, NextStep, NextTraining } from "./page.d.mts" */
 /** @import { CaseDecl, KeyDecl, KeyIndex } from "./qa-index.mjs" */
-/** @import { RuleCoverageIndex } from "./rule-coverage.mjs" */
 /** @import { RunHealthNote } from "./scan-code.mjs" */
 /** @import { HistorySection, ReviewFact, UpstreamChange } from "./scan-history.mjs" */
 /** @import { ScanIndexSummary, ScanOutput } from "./scan.mjs" */
 /** @import { HistoryDismissalsSource } from "./stored-findings.mjs" */
+/** @import { ReportSection, SectionSpec } from "./report-sections.mjs" */
 
 /**
  * A place a Scan result cites: the file it sits in and the line it is on.
@@ -237,8 +238,8 @@ import { digests } from "./pin-digest.mjs";
 
 /**
  * The view the projection offers: the repository's global health, the Features it lists, the
- * steps it offers, and the page it wrote. This is the output type `next-page` reads as the
- * page's view.
+ * steps it offers, and the starting step. This is the view `next-page` reads for the Next steps
+ * page.
  * @typedef {{
  *   root: string,
  *   feature: string | null,
@@ -246,8 +247,41 @@ import { digests } from "./pin-digest.mjs";
  *   features: NextFeatureState[],
  *   next_steps: NextStepRow[],
  *   start_here: NextStepRow | null,
- *   next_steps_page?: { path: string } | { offer: true, pending: number },
  * }} NextProjection
+ */
+
+/**
+ * Ordered section registry for `next`: every reported outcome belongs to one entry in reading
+ * order.
+ * @type {readonly SectionSpec[]}
+ */
+export const SECTION_ORDER = [
+  { id: "schema", label: "Schema compatibility" },
+  { id: "run_health", label: "Run health" },
+  { id: "training", label: "Training status" },
+  { id: "features", label: "Features" },
+  { id: "next_steps", label: "Next steps" },
+  { id: "start_here", label: "Start here" },
+];
+
+/**
+ * Top-level keys allowed outside `sections`: adapter envelope, migration preflight, preserved CLI
+ * arguments (`root`, `feature`), and the page offer/path handoff.
+ * @type {readonly string[]}
+ */
+export const ALLOWED_OUTSIDE = ["mode", "migration", "root", "feature", "next_steps_page"];
+
+/**
+ * The CLI output the command prints: the root and Feature scope, the key migration preflight,
+ * ordered, labelled sections for schema compatibility, run health, training status, Features,
+ * Next steps, and Start here, and the optional Next steps page path or offer.
+ * @typedef {{
+ *   root: string,
+ *   feature: string | null,
+ *   migration: MigrationStatus,
+ *   sections: ReportSection[],
+ *   next_steps_page?: { path: string } | { offer: true, pending: number },
+ * }} NextOutput
  */
 
 /**
@@ -749,7 +783,7 @@ function impactSignals(facts, { files, index }) {
       const feature = typeof file.data.key === "string" ? file.data.key : null;
       if (feature === null || (facts.feature && facts.feature !== feature)) continue;
       for (const finding of storedFeatureFindings(/** @type {HistoryDismissalsSource} */ (facts.history), file)) {
-        if (!isStoredFinding(finding) || finding.status === "dismissed") continue;
+        if (!isStoredFinding(finding) || finding.status !== "open") continue;
         out.push({ kind: "stored_finding", code: finding.kind.toLowerCase(), feature, key: /** @type {string} */ (finding.subject),
           file: finding.file, line: finding.line, message: /** @type {string} */ (finding.evidence) });
       }
@@ -760,7 +794,7 @@ function impactSignals(facts, { files, index }) {
     if (facts.feature && facts.feature !== feature) continue;
     for (const entry of file.cases) {
       for (const finding of storedCaseFindings(/** @type {HistoryDismissalsSource} */ (facts.history), file, entry)) {
-        if (!isStoredFinding(finding) || finding.status === "dismissed") continue;
+        if (!isStoredFinding(finding) || finding.status !== "open") continue;
         out.push({ kind: "stored_finding", code: finding.kind.toLowerCase(), feature, key: entry.key,
           file: finding.file, line: finding.line, message: /** @type {string} */ (finding.evidence) });
       }
@@ -972,25 +1006,43 @@ export const command = {
         nothing_pending: pending.length === 0, top_next_step: pending[0] ?? null,
       };
     });
+    const schema = /** @type {NextSchemaState} */ (newer ?? { code: "current", version, supported: SCHEMA_VERSION });
+    const training = trainingStatus(index);
+    // A pending migration comes before any step: the steps stay listed as they are.
+    const startHere = (pendingSteps[0]?.signal === "missing_project" ? null : migrationFirst) ?? pendingSteps[0] ?? null;
     /** @type {NextProjection} */
-    const json = {
+    const view = {
       root: /** @type {string} */ (root),
       feature: facts.feature,
       global: {
         migration,
-        schema: /** @type {NextSchemaState} */ (newer ?? { code: "current", version, supported: SCHEMA_VERSION }),
+        schema,
         run_health: facts.run_health,
-        training: trainingStatus(index),
+        training,
       },
       features,
       next_steps,
-      // A pending migration comes before any step: the steps stay listed as they are.
-      start_here: (pendingSteps[0]?.signal === "missing_project" ? null : migrationFirst) ?? pendingSteps[0] ?? null,
+      start_here: startHere,
     };
-    // The projection's own output is the view the page reads: the page contract (lib/page.d.mts)
-    // names the fields the rendered document shows, and the projection writes exactly those, so
-    // the view crosses the page's own boundary without a cast.
-    if (page) json.next_steps_page = orThrow(nextPage(json, pageSummaries(index, names, facts.feature), NEXT_LEGEND));
+    const startCommand = startHere?.route.type === "command" && startHere.route.command
+      ? [startHere.route.command, ...(startHere.route.args ?? [])].join(" ")
+      : null;
+    /** @type {NextOutput} */
+    const json = {
+      root: /** @type {string} */ (root),
+      feature: facts.feature,
+      migration,
+      sections: buildSections(SECTION_ORDER, [
+        { id: "schema", items: schema.code === "current" ? [] : [schema] },
+        { id: "run_health", items: facts.run_health },
+        { id: "training", items: facts.feature ? [] : [training] },
+        { id: "features", items: features },
+        { id: "next_steps", items: next_steps },
+        { id: "start_here", items: startHere ? [startHere] : [], next: startCommand },
+      ]),
+    };
+    // The internal projection supplies the page's data model (lib/page.d.mts) without a cast.
+    if (page) json.next_steps_page = orThrow(nextPage(view, pageSummaries(index, names, facts.feature), NEXT_LEGEND));
     else if (pendingSteps.length > NEXT_STEPS_PAGE_OFFER_THRESHOLD) json.next_steps_page = { offer: true, pending: pendingSteps.length };
     return { exit: 0, json };
   },

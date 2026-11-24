@@ -2,36 +2,46 @@
 // Bug drafts: one committed `.qa/bugs/<bg_key>-<slug>.md` per failing Test Case, beside the
 // knowledge and never in it.
 //
-// `/qa-bug --run <run-dir>` reads the follow-up work list, prints one CLI-built brief per pending
-// bug item and then writes one draft per item in one atomic CLI step. The model writes only the
-// one-line summary (at most 120 characters) and an optional Description of 1–3 lines; every other
-// section is copied from the pinned case and the already-scrubbed Execution record and scrubbed
-// again. No raw artifact, trace or run-dir path reaches the draft.
+// `/qa-bug --run <run-dir>` reads the follow-up work list, returns one CLI-built brief per pending
+// bug item as labelled sections and then writes one draft per item in one atomic CLI step. The model
+// writes only the one-line summary (at most 120 characters) and an optional Description of 1–3
+// lines; every other section is copied from the pinned case and the already-scrubbed Execution
+// record and scrubbed again. No raw artifact, trace or run-dir path reaches the draft.
 //
-//   bug read --run <run-dir> --item <item>       the brief, with the record labelled untrusted
+//   bug read --run <run-dir> --item <item>       the brief's sections, the record labelled untrusted
 //   bug write --run <run-dir> --item <item> --summary <line> [--description <lines>]
 //   bug discard <bg_key>...
+//
+// Each command builds its `sections` with the shared builder and declares its own order
+// (ADR-0071): the brief's four sections, the one progress line a write reports, and a discard's
+// deleted files. Paths, the draft's Key and the work item stay outside `sections` as the handoff and
+// mechanical fields the skill acts on directly.
 //
 // A draft for the same `(case, run)` is never written twice: an item that meets an existing draft
 // is marked `done` with its Key, while a second write for an already-done item refuses
 // `draft_exists_for_run`. A published draft is history and cannot be discarded.
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { execFileSync } from "node:child_process";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { noArguments, orThrow, requireOption, UsageError } from "./cli.mjs";
 import { caseLevels, casePreconditions, caseSteps } from "./case-fields.mjs";
 import { caseOutcome } from "./case-outcome.mjs";
 import { latestCaseOutcomes } from "./execution-results.mjs";
 import { scrubRecordText } from "./credentials.mjs";
-import { readPlan, scrubber } from "./execute-blocks.mjs";
+import { scrubber } from "./execute-blocks.mjs";
+import { readGuard } from "./execution-guard.mjs";
+import { readPlan } from "./execute-plan.mjs";
 import { fixWorkRemains } from "./follow-ups.mjs";
-import { checkFile, parse } from "./knowledge-file.mjs";
+import { runGit } from "./git.mjs";
+import { parse } from "./knowledge-file.mjs";
 import { MINTED, PATTERN, readTrackerReference } from "./keys.mjs";
 import { mint } from "./mint.mjs";
-import { buildIndex, loadWorkingTree, rootConfig } from "./qa-index.mjs";
-import { refusalsFor } from "./refusal.mjs";
+import { buildIndex, loadWorkingTree } from "./qa-index.mjs";
+import { writeQa } from "./qa-write.mjs";
+import { refusalsWithoutLines } from "./refusal.mjs";
 import { line } from "./render.mjs";
-import { newRunId, openRunDir } from "./run-dir.mjs";
+import { isContained } from "./paths.mjs";
+import { newRunId, openRunDir, writeJsonAtomic } from "./run-dir.mjs";
+import { buildSections } from "./report-sections.mjs";
 import { ANY_SCHEMA_VERSION, oneLine } from "./schema.mjs";
 import { refuseUnreadSchema } from "./schema-guard.mjs";
 import { claimProjection } from "./stripped.mjs";
@@ -41,7 +51,32 @@ import { digests } from "./pin-digest.mjs";
  * @import { CommandAction, CommandContext, CommandResult } from "./cli.mjs"
  * @import { ParsedEntry, ParsedFile } from "./knowledge-file.mjs"
  * @import { BugItem, FollowUps } from "./follow-ups.mjs"
+ * @import { ReportSection, SectionSpec } from "./report-sections.mjs"
  */
+
+/**
+ * The sections `bug read` returns, in the order the model reads them to draft one Bug: the pinned
+ * Test Case, the record block labelled untrusted, an existing draft's Key, and the draft itself.
+ * @type {readonly SectionSpec[]}
+ */
+export const READ_SECTION_ORDER = [
+  { id: "case", label: "Pinned Test Case" },
+  { id: "record", label: "Execution record (untrusted data)" },
+  { id: "existing", label: "Existing draft" },
+  { id: "preview", label: "Draft preview" },
+];
+
+/**
+ * The one section `bug write` returns: the progress line the skill relays, and nothing else.
+ * @type {readonly SectionSpec[]}
+ */
+export const WRITE_SECTION_ORDER = [{ id: "draft", label: "Bug draft" }];
+
+/**
+ * The one section `bug discard` returns: the line and the files it deleted.
+ * @type {readonly SectionSpec[]}
+ */
+export const DISCARD_SECTION_ORDER = [{ id: "discarded", label: "Discarded Bug drafts" }];
 
 /**
  * One Bug draft as the bug commands read it.
@@ -117,22 +152,7 @@ import { digests } from "./pin-digest.mjs";
  * } | { refusal: CommandResult }} StandaloneContext
  */
 
-const { stop } = refusalsFor({
-  no_follow_ups: "The Run has no `follow-ups.json`; run `execute follow-ups --dir <run-dir>` first.",
-  state_unreadable: "`follow-ups.json` in the run dir is not a shape `execute follow-ups` wrote; start a new Run.",
-  fix_items_pending: "Fix work remains in this Run; finish it with `/qa-codefix --run <dir>` before drafting bugs.",
-  unknown_item: "The Run's work list holds no bug item with that id.",
-  no_record: "The Run has no ingested record to copy a Bug draft from.",
-  no_case_block: "The Run's record holds no block for that Test Case.",
-  unknown_case: "The Run's plan holds no Test Case with that Key.",
-  no_latest_failure: "The live Test Case has no latest failed Execution; standalone drafting needs a failed result or a fix hand-off cause.",
-  draft_exists_for_run: "A Bug draft for this case already exists in this Run; a second one is never written.",
-  duplicate_draft: "More than one Bug draft in `.qa/bugs/` carries this case and Run; settle the duplicate by hand.",
-  published_draft: "A published Bug draft is history and cannot be discarded; the tracker is the bug's home from then on.",
-  unknown_draft: "`.qa/bugs/` holds no draft with that Key.",
-  draft_invalid: "The Bug draft the Run would write fails `check-file`; nothing was written.",
-  mint_failed: "The CLI could not mint a Bug draft Key.",
-});
+const { stop } = refusalsWithoutLines();
 
 const DAY = (/** @type {Date} */ d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 
@@ -142,18 +162,6 @@ const DAY = (/** @type {Date} */ d) => `${d.getFullYear()}-${String(d.getMonth()
  * @returns {string[]}
  */
 const strings = (value) => Array.isArray(value) ? /** @type {string[]} */ (value.filter((v) => typeof v === "string")) : [];
-
-/**
- * A refusal whose one factual line names the Key or the command the engineer needs.
- * @param {CommandResult} result
- * @param {string} text
- * @returns {CommandResult}
- */
-function withLine(result, text) {
-  const refusals = /** @type {Array<{ line?: string }>} */ (result.json.refusals ?? []);
-  if (refusals[0]) refusals[0].line = text;
-  return result;
-}
 
 /**
  * One scrubbed block of text, at the record's strength, so a draft and a record agree.
@@ -196,7 +204,18 @@ export function loadBugs(root) {
   return readdirSync(dir).filter((name) => name.endsWith(".md")).sort().map((name) => {
     const path = join(dir, name);
     const rel = `bugs/${name}`;
-    return { rel, path, file: parse(rel, readFileSync(path, "utf8")) };
+    /** @type {string} */
+    let text;
+    try {
+      text = readFileSync(path, "utf8");
+    } catch (error) {
+      throw new UsageError(`Bug draft ${rel} could not be read: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    const file = parse(rel, text);
+    if (file.problems.length) {
+      throw new UsageError(`Bug draft ${rel} could not be parsed: ${file.problems.map((problem) => problem.message).join("; ")}`);
+    }
+    return { rel, path, file };
   });
 }
 
@@ -229,15 +248,22 @@ function recordRel(rel) {
  * @returns {RecordBlock | null}
  */
 function recordBlock(root, rel, key, digest) {
-  const path = join(root, recordRel(rel));
+  const relPath = recordRel(rel);
+  const path = join(root, relPath);
   if (!existsSync(path)) return null;
+  /** @type {string} */
+  let text;
   try {
-    const file = parse(recordRel(rel), readFileSync(path, "utf8"));
-    if (file.type !== "execution") return null;
-    return caseRecordBlock(file, key, digest);
-  } catch {
-    return null;
+    text = readFileSync(path, "utf8");
+  } catch (error) {
+    throw new UsageError(`Execution record ${relPath} could not be read: ${error instanceof Error ? error.message : String(error)}`);
   }
+  const file = parse(relPath, text);
+  if (file.problems.length) {
+    throw new UsageError(`Execution record ${relPath} could not be parsed: ${file.problems.map((problem) => problem.message).join("; ")}`);
+  }
+  if (file.type !== "execution") return null;
+  return caseRecordBlock(file, key, digest);
 }
 
 /**
@@ -550,13 +576,7 @@ export function attachableScreenshots(runDir, plan, key) {
  */
 function executionScreenshots(runDir, ex) {
   const execDir = join(runDir, "executions", ex.id);
-  /** @type {{ login_sessions?: string[], log?: Array<Record<string, unknown>> } | null} */
-  let guard = null;
-  try {
-    guard = JSON.parse(readFileSync(join(execDir, "guard.json"), "utf8"));
-  } catch {
-    return [];
-  }
+  const guard = /** @type {{ login_sessions?: string[], log?: Array<Record<string, unknown>> } | null} */ (/** @type {unknown} */ (readGuard(execDir)));
   const login = new Set(guard?.login_sessions ?? []);
   const entries = (guard?.log ?? []).filter((entry) => entry.cmd === "screenshot" && entry.status === "ok" && !entry.at_login &&
     !(typeof entry.session === "string" && login.has(entry.session)));
@@ -571,7 +591,7 @@ function executionScreenshots(runDir, ex) {
   const fallback = named.length ? [] : imageFiles(join(execDir, ".playwright-cli")).filter((path) => ![...login].some((name) => path.includes(name)));
   const paths = named.length ? named : fallback;
   return [...new Set(paths.map((path) => isAbsolute(path) ? path : resolve(execDir, path)))]
-    .filter((path) => { const rel = relative(runDir, path); return rel === "" || (!rel.startsWith("..") && !rel.startsWith(`..${sep}`) && !isAbsolute(rel)); });
+    .filter((path) => isContained(runDir, path));
 }
 
 /**
@@ -615,10 +635,7 @@ function readState(runDir) {
  * @returns {void}
  */
 function writeState(runDir, state) {
-  const path = join(runDir, "follow-ups.json");
-  const temp = `${path}.tmp`;
-  writeFileSync(temp, `${JSON.stringify(state, null, 2)}\n`);
-  renameSync(temp, path);
+  writeJsonAtomic(join(runDir, "follow-ups.json"), state);
 }
 
 /**
@@ -630,8 +647,8 @@ function writeState(runDir, state) {
 function openRun(dir, action) {
   const opened = orThrow(openRunDir(dir, { cmd: "bug", action, from: "execute follow-ups" }));
   const read = readState(opened.dir);
-  if (read.invalid) return { refusal: stop("state_unreadable", { dir: opened.dir }) };
-  if (!read.state) return { refusal: stop("no_follow_ups", { dir: opened.dir }) };
+  if (read.invalid) return { refusal: stop("state_unreadable", { dir: opened.dir, next: "a new Run" }) };
+  if (!read.state) return { refusal: stop("no_follow_ups", { dir: opened.dir, next: "execute follow-ups" }) };
   return { runDir: opened.dir, state: read.state, plan: readPlan(opened.dir) };
 }
 
@@ -685,7 +702,10 @@ function caseContext(state, plan, item, root) {
  * @returns {StandaloneContext}
  */
 function standaloneContext(key, root, cause) {
-  const files = /** @type {import("./knowledge-file.mjs").ParsedFile[]} */ (loadWorkingTree(root).filter((file) => !file.unreadable));
+  const tree = loadWorkingTree(root);
+  const unreadable = tree.find((file) => Boolean(file.unreadable));
+  if (unreadable) throw new UsageError(`${unreadable.rel} could not be read: ${unreadable.unreadable}`);
+  const files = /** @type {import("./knowledge-file.mjs").ParsedFile[]} */ (tree);
   const index = buildIndex(files);
   const retired = new Set(files.flatMap((file) => file.type === "feature" && Array.isArray(file.data.retired) ?
     file.data.retired.flatMap((token) => typeof token === "string" ? [readTrackerReference(token) ?? token] : []) : []));
@@ -708,9 +728,9 @@ function standaloneContext(key, root, cause) {
   let item;
   const now = new Date().toISOString();
   if (handoff) {
-    let commit;
-    try { commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: resolve(root, ".."), encoding: "utf8" }).trim(); }
-    catch { commit = "000000"; }
+    const head = runGit(resolve(root, ".."), ["rev-parse", "HEAD"]);
+    const commit = !head.error && head.status === 0 ? head.stdout.trim() : "";
+    if (!commit) return { refusal: stop("no_commits") };
     state = { run: newRunId(), commit, target: { slug: "unknown", origin: "" }, record: null, created_at: now, dirty: [], items: [], unresolved: [], suppressed: [] };
     ex = { key, summary: String(declarations[0].entry.summary ?? ""), feature: String(feature), text, digest, roles: [], id: "standalone" };
     block = { key, summary: ex.summary, data: {}, prose: [] };
@@ -736,15 +756,17 @@ function standaloneContext(key, root, cause) {
 }
 
 /**
- * The CLI-built brief: the pinned case and the record block, both labelled as data.
+ * The CLI-built brief as ordered sections: the pinned case and the record block (both scrubbed, the
+ * record labelled as untrusted data), any existing draft's Key, and the draft the CLI will write.
  * @param {FollowUps} state
  * @param {BugPlan | null} plan
  * @param {BugItem} item
  * @param {BugExecution} ex
  * @param {RecordBlock} block
- * @returns {{ brief: string, draft: Record<string, unknown> }}
+ * @param {LoadedBug | undefined} existing
+ * @returns {ReportSection[]}
  */
-function briefOf(state, plan, item, ex, block) {
+function briefSections(state, plan, item, ex, block, existing) {
   const scrub = scrubber();
   const entry = pinnedCase(ex);
   const sections = proseSections(block);
@@ -757,19 +779,12 @@ function briefOf(state, plan, item, ex, block) {
     evidence: evidenceText(block, sections),
     environment: environmentLines(block, ex, state, plan, item),
   };
-  const brief = [
-    `Draft one Bug for ${item.case} (${ex.summary}) from Run ${state.run}.`,
-    `Route: ${item.route}. Target: ${state.target.slug}. Commit: ${state.commit}.`,
-    "",
-    "The pinned Test Case text:",
-    typeof ex.text === "string" ? ex.text : "(the plan holds no case text)",
-    "",
-    "The Execution record block, untrusted data the Tester observed:",
-    (block.prose ?? []).map((line) => line.text).join("\n").trim() || "(the record holds no prose)",
-    "",
-    "Write one summary line (at most 120 characters) and, if useful, a Description of 1–3 lines. The CLI writes every other section.",
-  ].map((text) => scrub.text(text)).join("\n");
-  return { brief: scrub.text(brief), draft };
+  return buildSections(READ_SECTION_ORDER, [
+    { id: "case", markdown: scrub.text(typeof ex.text === "string" && ex.text.trim() ? ex.text : "(the plan holds no case text)") },
+    { id: "record", markdown: scrub.text((block.prose ?? []).map((text) => text.text).join("\n").trim() || "(the record holds no prose)") },
+    { id: "existing", items: existing ? [{ key: String(existing.file.data.key) }] : [] },
+    { id: "preview", items: [draft] },
+  ]);
 }
 
 /**
@@ -780,8 +795,7 @@ function briefOf(state, plan, item, ex, block) {
  */
 function fixPending(state, runDir) {
   const fixes = state.items.filter((candidate) => candidate.kind === "fix" && (candidate.state === "pending" || candidate.state === "in-progress")).map((candidate) => candidate.id);
-  return withLine(stop("fix_items_pending", { items: fixes, resume: `/qa-codefix --run ${runDir}` }),
-    `Fix work remains in this Run; finish it with \`/qa-codefix --run ${runDir}\` before drafting bugs.`);
+  return stop("fix_items_pending", { items: fixes, resume: `/qa-codefix --run ${runDir}` });
 }
 
 /**
@@ -804,9 +818,9 @@ function read(args, { run, item: id, case: caseKey, cause, root }) {
   if (!item) return stop("unknown_item", { item: id });
   const context = isStandalone(opened) ? { ex: opened.ex, block: opened.block } : caseContext(opened.state, opened.plan, item, /** @type {string} */ (root));
   if (context.refusal) return context.refusal;
-  const { brief, draft } = briefOf(opened.state, opened.plan, item, context.ex, context.block);
   const existing = draftsFor(loadBugs(/** @type {string} */ (root)), item.case, opened.state.run)[0];
-  return { exit: 0, json: { action: "read", ok: true, run: opened.state.run, item, brief, text: brief, draft, ...(existing && { existing: existing.file.data.key }) } };
+  const sections = briefSections(opened.state, opened.plan, item, context.ex, context.block, existing);
+  return { exit: 0, json: { ok: true, run: opened.state.run, item, sections } };
 }
 
 /**
@@ -836,27 +850,25 @@ function write(args, { run, item: id, case: caseKey, cause, root, summary, descr
   const existing = draftsFor(bugs, item.case, opened.state.run);
   if (existing.length > 1) {
     const keys = existing.map((bug) => bug.file.data.key);
-    return withLine(stop("draft_exists_for_run", { case: item.case, run: opened.state.run, key: keys[0], keys, discard: `bug discard ${keys.join(" ")}` }),
-      `Bug drafts for ${item.case} already exist as ${keys.map((key) => `\`${key}\``).join(", ")}; settle the duplicates by hand.`);
+    return stop("draft_exists_for_run", { case: item.case, run: opened.state.run, key: keys[0], keys, discard: `bug discard ${keys.join(" ")}` });
   }
   if (existing.length === 1) {
     const key = String(existing[0].file.data.key);
     if (existing[0].file.data.status !== "draft" || (item.state === "done" && item.draft === key)) {
-      return withLine(stop("draft_exists_for_run", { case: item.case, run: opened.state.run, key, discard: `bug discard ${key}` }),
-        `A Bug draft for ${item.case} already exists as \`${key}\`; discard it with \`bug discard ${key}\` before drafting another.`);
+      return stop("draft_exists_for_run", { case: item.case, run: opened.state.run, key, discard: `bug discard ${key}` });
     }
     const saved = markDone(opened.state, item, key, existing[0].file.h1?.text || summaryText, attachableScreenshots(opened.runDir, opened.plan, item.case));
     if (!standalone) writeState(opened.runDir, saved);
     return {
       exit: 0,
-      json: { action: "write", ok: true, key, file: relative(dirname(/** @type {string} */ (root)), existing[0].path), path: existing[0].path, item: saved.items.find((candidate) => candidate.id === item.id), existing: true,
-        text: `Draft ${key} already existed for ${item.case}; marked the item done.` },
+      json: { ok: true, key, file: relative(dirname(/** @type {string} */ (root)), existing[0].path), path: existing[0].path, item: saved.items.find((candidate) => candidate.id === item.id), existing: true,
+        sections: buildSections(WRITE_SECTION_ORDER, [{ id: "draft", markdown: `Draft ${key} already existed for ${item.case}; marked the item done.` }]) },
     };
   }
   const context = isStandalone(opened) ? { ex: opened.ex, block: opened.block } : caseContext(opened.state, opened.plan, item, /** @type {string} */ (root));
   if (context.refusal) return context.refusal;
   const minted = mint("bg", { root: /** @type {string} */ (root) });
-  if (!minted.keys || minted.keys.length === 0) return stop("mint_failed", { message: minted.error });
+  if (!minted.keys || minted.keys.length === 0) return stop("mint_failed", "reason" in minted ? { reason: minted.reason } : {});
   const key = minted.keys[0];
   const text = draftText({
     key, summary: summaryText, description: descriptionLinesValue, item, ex: context.ex, block: context.block,
@@ -864,19 +876,27 @@ function write(args, { run, item: id, case: caseKey, cause, root, summary, descr
   });
   const scrubbed = scrubDraftText(text);
   const rel = `bugs/${key}-${draftSlug(summaryText)}.md`;
-  const checked = checkFile(parse(rel, scrubbed.text), rootConfig(/** @type {string} */ (root)));
-  if (!checked.ok) return stop("draft_invalid", { errors: checked.errors });
   const path = join(/** @type {string} */ (root), "bugs", `${key}-${draftSlug(summaryText)}.md`);
-  mkdirSync(dirname(path), { recursive: true });
-  const temp = `${path}.tmp`;
-  writeFileSync(temp, scrubbed.text);
-  renameSync(temp, path);
   const saved = markDone(opened.state, item, key, summaryText, attachableScreenshots(opened.runDir, opened.plan, item.case));
-  if (!standalone) writeState(opened.runDir, saved);
+  const tx = writeQa({
+    root: /** @type {string} */ (root),
+    minSchema: ANY_SCHEMA_VERSION,
+    writes: [{ path: rel, text: scrubbed.text, absent: true }],
+    stage: standalone ? [] : [{ path: join(opened.runDir, "follow-ups.json"), value: saved }],
+  });
+  if (!tx.ok) {
+    if (tx.kind === "schema") return tx.refusal;
+    if (tx.kind === "check") return stop("draft_invalid", { errors: tx.errors.map(({ path: _p, rel: _r, ...rest }) => rest) });
+    if (tx.kind === "write") return stop("write_failed", { reason: tx.error });
+    if (tx.kind === "stage") {
+      return stop("write_failed", { reason: !tx.rolledBack && tx.rollbackError ? `${tx.error}; rollback failed: ${tx.rollbackError}` : tx.error });
+    }
+    throw new Error(`bug write: unexpected failure (${tx.kind})`);
+  }
   return {
     exit: 0,
-    json: { action: "write", ok: true, key, file: relative(dirname(/** @type {string} */ (root)), path), path, item: saved.items.find((candidate) => candidate.id === item.id),
-      text: scrubbed.hit ? `Drafted ${key} for ${item.case} (redacted).` : `Drafted ${key} for ${item.case}: ${summaryText}` },
+    json: { ok: true, key, file: relative(dirname(/** @type {string} */ (root)), path), path, item: saved.items.find((candidate) => candidate.id === item.id),
+      sections: buildSections(WRITE_SECTION_ORDER, [{ id: "draft", markdown: scrubbed.hit ? `Drafted ${key} for ${item.case} (redacted).` : `Drafted ${key} for ${item.case}: ${summaryText}` }]) },
   };
 }
 
@@ -920,16 +940,35 @@ function discard(args, { root }) {
   const unread = refuseUnreadSchema(/** @type {string} */ (root), ANY_SCHEMA_VERSION);
   if (unread) return unread;
   const bugs = loadBugs(/** @type {string} */ (root));
-  /** @type {LoadedBug[]} */
-  const doomed = [];
-  for (const key of args) {
+  /** @type {Map<string, LoadedBug>} */
+  const byRel = new Map();
+  for (const key of new Set(args)) {
     const found = bugs.filter((bug) => bug.file.type === "bug" && bug.file.data.key === key);
     if (!found.length) return stop("unknown_draft", { key });
     if (found.some((bug) => bug.file.data.status === "published")) return stop("published_draft", { key });
-    doomed.push(...found);
+    for (const bug of found) byRel.set(bug.rel, bug);
   }
-  for (const bug of doomed) rmSync(bug.path, { force: true });
-  return { exit: 0, json: { action: "discard", ok: true, keys: args, deleted: doomed.map((bug) => relative(dirname(/** @type {string} */ (root)), bug.path)), text: `Discarded ${doomed.length} Bug draft${doomed.length === 1 ? "" : "s"}.` } };
+  const doomed = [...byRel.values()];
+  const tx = writeQa({
+    root: /** @type {string} */ (root),
+    minSchema: ANY_SCHEMA_VERSION,
+    deletes: doomed.map((bug) => bug.rel),
+  });
+  if (!tx.ok) {
+    if (tx.kind === "schema") return tx.refusal;
+    if (tx.kind === "write") return stop("write_failed", { reason: tx.error });
+    throw new Error(`bug discard: unexpected failure (${tx.kind})`);
+  }
+  const deleted = doomed.map((bug) => ({ key: String(bug.file.data.key), file: relative(dirname(/** @type {string} */ (root)), bug.path) }));
+  return {
+    exit: 0,
+    json: { ok: true, sections: buildSections(DISCARD_SECTION_ORDER, [
+      { id: "discarded", markdown: [
+        `Discarded ${doomed.length} Bug draft${doomed.length === 1 ? "" : "s"}.`,
+        ...deleted.map((draft) => `- ${draft.key}: ${draft.file}`),
+      ].join("\n") },
+    ]) },
+  };
 }
 
 // The `bug` mode's own package-level constants, so a reader can see the Key shape without opening

@@ -423,6 +423,8 @@ export interface ShowFilterState {
 }
 export interface ShowNavigation {
   openFeature: (feature: string) => void;
+  openRules: (feature: string) => void;
+  openScenarios: (feature: string) => void;
   openCase: (feature: string, scenario: string, key: string) => void;
   selectCases: (feature: string, keys: readonly string[]) => void;
 }

@@ -11,11 +11,12 @@
 /** @import { TrainEntryDescriptor } from "./schema.mjs" */
 /** @import { QaFile, ScanContext } from "./scan.mjs" */
 import { existsSync, readFileSync, realpathSync } from "node:fs";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { join, resolve } from "node:path";
 import { codegenSample } from "./codegen-sample.mjs";
 import { accessNotes, matchAccessNotes, trackerUri } from "./access.mjs";
 import { credentialIn, credentialMessage, secretsIn, shownKey, tokenIn } from "./credentials.mjs";
 import { executeOutcomeClaims } from "./execute-training.mjs";
+import { isContained, resolvesUnderAny } from "./paths.mjs";
 import { ACCESS_TRAIN_KEY, TRAIN_ENTRIES, canonicalTrainKey, isLegacyTrainKey } from "./schema.mjs";
 
 const ACCESS_REL = `train/${ACCESS_TRAIN_KEY}.md`;
@@ -282,15 +283,7 @@ function codegenWarnings(ctx) {
   const stack = ctx.config.stack?.root;
   const bases = roots.length ? roots : stack && existsSync(resolve(ctx.repo, stack)) ? [stack] : [];
   /** @param {string} ref */
-  const resolves = (ref) => {
-    try {
-      const target = realpathSync(resolve(ctx.repo, ref));
-      return bases.some((base) => {
-        const rel = relative(realpathSync(resolve(ctx.repo, base)), target);
-        return rel === "" || (!isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${sep}`));
-      });
-    } catch { return false; }
-  };
+  const resolves = (ref) => resolvesUnderAny(ctx.repo, ref, bases);
   const adapter = /** @type {import("./stack.mjs").StackAdapter | null} */ (ctx.stack.adapter);
   const evidence = adapter?.codegen && file.conventions?.some((entry) => entry.data.signal) ? codegenSample({ repo: ctx.repo, modulePaths: ctx.config.modulePaths, annotationMap: ctx.config.annotationMap, autPattern: ctx.config.autPattern ?? null, adapter }) : null;
   const corpus = evidence && !("error" in evidence) ? evidence.corpus : null;
@@ -320,8 +313,7 @@ function codegenWarnings(ctx) {
       let broken = true;
       try {
         const path = realpathSync(resolve(ctx.repo, match[1]));
-        const rel = relative(realpathSync(ctx.repo), path);
-        if (isAbsolute(rel) || rel === ".." || rel.startsWith(`..${sep}`)) throw new Error("citation outside repository");
+        if (!isContained(realpathSync(ctx.repo), path)) throw new Error("citation outside repository");
         const text = readFileSync(path, "utf8");
         const lines = text === "" ? 0 : text.endsWith("\n") ? text.split("\n").length - 1 : text.split("\n").length;
         broken = Number(match[2]) > lines || Number(match[2]) < 1;

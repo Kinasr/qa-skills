@@ -4,7 +4,7 @@
 // scoped view. Nothing reverse is stored; the indexes are built once per acquisition.
 /** @import {ShowInventoryEntry} from './show-acquisition.mjs' */
 /** @import {ScanAcquisition} from './scan.mjs' */
-import { casesCoveringRule } from './rule-coverage.mjs';
+import { casesCoveringRule } from './qa-index.mjs';
 import { reverseReliance } from './reliance.mjs';
 import { dependencyEnds, dependencyIndex, formatRuleRef } from './rule-ref.mjs';
 

@@ -43,6 +43,5 @@ file holds is already an item. Each edit is the whole new value.
   `tags_without_meaning`. Offer to give each a meaning here; until then the `/qa-design` Delegate
   never assigns it.
 - **A description edit** (a Tag's meaning, a Custom field's description, `role_meaning`) changes what
-  the label means. The Card returns `confirm: true` with each change's `described` entries: the
-  `kind`, the `name` and `cases`, the number of cases that carry it. Show the counts and write only
-  on the engineer's explicit yes.
+  the label means. The Card returns `confirm: true` with each changed meaning and the number of cases
+  that carry it. Show the counts and write only on the engineer's explicit yes.

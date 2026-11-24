@@ -3,7 +3,7 @@
 // returns `{parsed, selector}`, where `parsed` is one ordered-attempt list per instance. Adding a
 // tool is one entry here plus its module: `gradle` and `maven` join it without reshaping the
 // seam execute, `codefix verify` and `codegen verify` share.
-import { withAuthHeaderEnv } from "../header-credential.mjs";
+import { resolveAuthHeaderEnv } from "../header-credential.mjs";
 import { runGradle } from "./gradle.mjs";
 import { runMaven } from "./maven.mjs";
 import { runPlaywright } from "./playwright.mjs";
@@ -55,7 +55,7 @@ export function displaySelector(selection) {
 
 /**
  * Run one Automation through its tool's adapter, in `env` plus the target's `auth:` Header credentials
- * (`withAuthHeaderEnv`), whichever caller runs it. `root` is the project's `.qa` directory.
+ * (`resolveAuthHeaderEnv`), failing closed on `.qa/auth` refusals. `root` is the project's `.qa` directory.
  * @param {RunnerOptions} options
  * @returns {{ parsed: RunnerResult, selector: string }}
  */
@@ -67,5 +67,12 @@ export function runSelection(options) {
       selector: displaySelector(options.selection),
     };
   }
-  return adapter.run({ ...options, env: withAuthHeaderEnv(options.root, options.origin, options.env) });
+  const auth = resolveAuthHeaderEnv(options.root, options.origin, options.env);
+  if (auth.refusal) {
+    return {
+      parsed: { instances: {}, reason: "runner-error", diagnostics: [auth.refusal.message] },
+      selector: displaySelector(options.selection),
+    };
+  }
+  return adapter.run({ ...options, env: auth.env });
 }

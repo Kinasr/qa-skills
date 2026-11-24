@@ -11,6 +11,7 @@
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { defaultBatchLauncher, spawnBatchWrapper } from "../platform.mjs";
+import { GRADLE_DEFAULT_TASK } from "./descriptors.mjs";
 import {
   copyFreshReport, gradleSelector, jvmModule, jvmTarget, lastAttemptPassed, mergeRunnerResult,
   movePriorReport, readFreshReport, reportDirectory, runnerEnvironment, runnerOutput,
@@ -32,9 +33,6 @@ import {
  *   context?: PlatformContext,
  * }} RunOptions
  */
-
-/** The Gradle task run when `test_runner.task` is absent. @type {string} */
-export const GRADLE_DEFAULT_TASK = "test";
 
 /**
  * Run one Automation through the project's Gradle and read its report.

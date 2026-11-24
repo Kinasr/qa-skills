@@ -7,30 +7,37 @@
 // `design split`, `delegate start` and `record`, `impact persist` and `triage`, `init apply` and
 // `add-role`, `sync apply` and `scout ingest`.
 import { rootConfig } from "./qa-index.mjs";
+import { fact } from "./refusal.mjs";
 import { ANY_SCHEMA_VERSION, pendingMigrations, SCHEMA_VERSION, SUITE_KEYS_SCHEMA_VERSION } from "./schema.mjs";
 
 /**
+ * Structured schema-guard refusal fact (ADR-0024).
+ * @typedef {{ code: "schema_newer", version: number, supported: number, file: "project.md" }
+ *   | { code: "schema_malformed", file: "project.md", supported: number, declared?: unknown }
+ *   | { code: "schema_migration_required", version: number, required: number, next?: string }
+ *   | { code: "suite_schema_required", version: number, required: number, next: "migrate-keys" }} SchemaFact
+ */
+
+/**
  * The refusal of a writing command on a `.qa/` this CLI does not read (ADR-0024): `{exit: 1, json:
- * {ok: false, text}}`.
+ * {ok: false, refusals: [SchemaFact]}}`.
  * @typedef {{
  *   exit: 1,
  *   json: {
  *     ok: false,
- *     text: string,
- *     code?: "schema_migration_required",
+ *     refusals: [SchemaFact],
  *   },
  * }} UnreadSchemaRefusal
  */
 
 /**
  * The refusal of a writing command that needs the Suite boundary (ADR-0024): `{exit: 1, json: {ok:
- * false, code, text}}`.
+ * false, refusals: [SchemaFact]}}`.
  * @typedef {{
  *   exit: 1,
  *   json: {
  *     ok: false,
- *     code: "suite_schema_required",
- *     text: string,
+ *     refusals: [SchemaFact],
  *   },
  * }} SuiteSchemaRefusal
  */
@@ -40,25 +47,53 @@ import { ANY_SCHEMA_VERSION, pendingMigrations, SCHEMA_VERSION, SUITE_KEYS_SCHEM
  * @typedef {UnreadSchemaRefusal | SuiteSchemaRefusal} SchemaRefusal
  */
 
+/**
+ * Builds an exit-1 schema refusal carrying a typed SchemaFact.
+ * @param {SchemaFact["code"]} code
+ * @param {Record<string, unknown>} data
+ * @returns {{ exit: 1, json: { ok: false, refusals: [SchemaFact] } }}
+ */
+function schemaStop(code, data) {
+  return {
+    exit: /** @type {const} */ (1),
+    json: {
+      ok: false,
+      refusals: [/** @type {SchemaFact} */ (fact(code, data))],
+    },
+  };
+}
+
 // The refusal of a writing command on the `.qa/` directory `root` (ADR-0024): `{exit: 1, json: {ok:
-// false, text}}`, or null when the schema is supported and reaches the writer's minimum.
+// false, refusals: [SchemaFact]}}`, or null when the schema is supported and reaches the writer's minimum.
 /**
  * @param {string} root
  * @param {number} minimum
  * @returns {UnreadSchemaRefusal | null}
  */
 export function refuseUnreadSchema(root, minimum) {
-  const { schemaVersion } = rootConfig(root);
+  const { schemaVersion, declaredSchemaVersion } = rootConfig(root);
   if (schemaVersion !== null && schemaVersion <= SCHEMA_VERSION) {
     if (schemaVersion >= minimum) return null;
-    const command = pendingMigrations(schemaVersion)[0].command;
-    return { exit: 1, json: { ok: false, code: "schema_migration_required", text: `Nothing was written: schema ${minimum} is required. Run \`${command}\`, commit the migration, then run this command again.` } };
+    const command = pendingMigrations(schemaVersion)[0]?.command;
+    return schemaStop(
+      "schema_migration_required",
+      { version: schemaVersion, required: minimum, ...(command && { next: command }) },
+    );
   }
-  const text =
-    schemaVersion === null
-      ? "Nothing was written: `.qa/project.md` declares a `schema_version` that is not an integer ≥ 1, so which qa-skills reads it is unknown. Fix it, then run the command again."
-      : `Nothing was written: \`.qa/project.md\` declares \`schema_version: ${schemaVersion}\`, and this qa-skills reads up to ${SCHEMA_VERSION}. Update qa-skills, then run the command again.`;
-  return { exit: 1, json: { ok: false, text } };
+  if (schemaVersion === null) {
+    return schemaStop(
+      "schema_malformed",
+      {
+        file: "project.md",
+        supported: SCHEMA_VERSION,
+        ...(declaredSchemaVersion !== undefined && { declared: declaredSchemaVersion }),
+      },
+    );
+  }
+  return schemaStop(
+    "schema_newer",
+    { version: schemaVersion, supported: SCHEMA_VERSION, file: "project.md" },
+  );
 }
 
 // Agent-written Feature files need the Suite boundary too.
@@ -69,6 +104,10 @@ export function refuseUnreadSchema(root, minimum) {
 export function refuseSuiteSchema(root) {
   const unread = refuseUnreadSchema(root, ANY_SCHEMA_VERSION);
   if (unread) return unread;
-  if (rootConfig(root).schemaVersion >= SUITE_KEYS_SCHEMA_VERSION) return null;
-  return { exit: 1, json: { ok: false, code: "suite_schema_required", text: "Run `migrate-keys` on the default branch before writing Features: schema 3 is required." } };
+  const { schemaVersion } = rootConfig(root);
+  if (schemaVersion >= SUITE_KEYS_SCHEMA_VERSION) return null;
+  return schemaStop(
+    "suite_schema_required",
+    { version: schemaVersion, required: SUITE_KEYS_SCHEMA_VERSION, next: "migrate-keys" },
+  );
 }

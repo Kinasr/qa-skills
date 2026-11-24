@@ -26,17 +26,17 @@
 // Persist writes into the working tree, whose knowledge equals HEAD's (the stripped-dirty check)
 // but whose Bookkeeping may run ahead of the target, so the existing findings are the working
 // tree's, and `scan` is asked for its facts about those.
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { isMap } from "./dialect.mjs";
 import { featureUnitId, isFeatureUnit } from "./dispatch.mjs";
 import { loadQaTree, repositoryOf } from "./git-tree.mjs";
-import { checkFile, edit, parse } from "./knowledge-file.mjs";
-import { backfill } from "./pin-digest.mjs";
-import { buildIndex, loadWorkingTree, rootConfig } from "./qa-index.mjs";
+import { edit, parse } from "./knowledge-file.mjs";
+import { buildIndex, loadWorkingTree } from "./qa-index.mjs";
+import { writeQa } from "./qa-write.mjs";
 import { scan } from "./scan.mjs";
-import { holdsQuote } from "./schema.mjs";
+import { ANY_SCHEMA_VERSION, holdsQuote } from "./schema.mjs";
 import { isQualifiedRuleRef, isRuleRef, ruleRefsIn } from "./rule-ref.mjs";
 import { findingOrigin, isJudgedFinding, isMechanicalFinding, isOpenFinding, isStaleObligation } from "./stored-findings.mjs";
 
@@ -336,10 +336,22 @@ export function settleFindings(plan, outcomes, complete, { persist = false } = {
       const brief = o?.usable ? /** @type {JudgeBrief} */ (JSON.parse(readFileSync(/** @type {NonNullable<typeof unit>} */ (unit).brief_json, "utf8"))) : null;
       const compared = new Set((brief?.upstream_rules ?? []).map((r) => r.ref));
       for (const c of judgedFile?.cases ?? []) {
-        // Only the cases the unit was sent are settled: the judge never read the others, so their
-        // stored findings stay exactly as they are.
-        if (sc.selected && !sc.selected.includes(c.key)) continue;
         const decl = workIndex.cases.get(c.key)?.[0];
+        if (sc.selected && !sc.selected.includes(c.key)) {
+          // Unselected same-file cases keep pre-existing judged findings intact, while settling any
+          // mechanical findings or symmetric same-file Conflicts derived for them in this run.
+          if (!decl) continue;
+          const before = Array.isArray(/** @type {ParsedEntry} */ (decl.entry).data.finding) ? /** @type {unknown[]} */ (/** @type {ParsedEntry} */ (decl.entry).data.finding) : [];
+          const place = { feature: f.feature, scenario: /** @type {string} */ (sc.scenario), file: decl.file.rel, key: c.key };
+          const u = mergeUnselected(before, derived.get(c.key) ?? [], { key: c.key, dismissalFact });
+          dismissed.held += u.held;
+          dismissed.rearmed += u.rearmed;
+          dismissed.total += u.after.filter((x) => isMap(x) && isMap(x.dismissed)).length;
+          if (!isDeepStrictEqual(before, u.after)) {
+            cases.push({ ...place, verdict: "Current", before, after: u.after, changed: true, entry: /** @type {ParsedEntry} */ (decl.entry), raised: u.raised });
+          }
+          continue;
+        }
         if (!decl) {
           if (o?.usable) missing.push({ feature: f.feature, scenario: /** @type {string} */ (sc.scenario), key: c.key });
           continue;
@@ -642,6 +654,39 @@ function mergeMechanical(before, fresh, { key, dismissalFact }) {
   return { after, held, rearmed, raised };
 }
 
+/**
+ * Settle an unselected same-file case: keep pre-existing judged findings while merging mechanical
+ * findings and symmetric same-file Conflicts derived during this run.
+ * @param {unknown[]} before
+ * @param {Array<{ finding: PersistFinding, subjects: string[] }>} fresh
+ * @param {{ key: string, dismissalFact: Map<unknown, DismissalFact> }} options
+ * @returns {{ after: unknown[], held: number, rearmed: number, raised: PersistFinding[] }}
+ */
+function mergeUnselected(before, fresh, { key, dismissalFact }) {
+  const result = mergeMechanical(before, fresh, { key, dismissalFact });
+  const after = [...result.after];
+  const raised = [...result.raised];
+  let { held, rearmed } = result;
+  for (const d of fresh) {
+    if (isMechanicalFinding(d.finding)) continue;
+    const match = after.find((x) => isMap(x) && x.kind !== "Stale" && !isOpenFinding(x) && findingOrigin(x) === "judged" && reEmerges(d, x));
+    if (match) {
+      if (dismissalFact.get(match)?.status === "holds") {
+        held++;
+        continue;
+      }
+      const at = after.indexOf(match);
+      if (at !== -1) after.splice(at, 1);
+      rearmed++;
+    } else if (after.some((x) => isMap(x) && isOpenFinding(x) && x.kind === d.finding.kind && x.evidence === d.finding.evidence)) {
+      continue;
+    }
+    after.push(d.finding);
+    raised.push(d.finding);
+  }
+  return { after, held, rearmed, raised };
+}
+
 // The cases a Feature holds in the working tree, each with its declaration.
 /**
  * @param {KeyIndex} index
@@ -833,22 +878,30 @@ export function writeFindings(settled) {
 
     /** @type {Array<{ file: string, line?: number | null, message: string }>} */
     const errors = [];
-    /** @type {Map<string, string>} */
-    const outputs = new Map();
-    const config = rootConfig(root);
+    /** @type {Array<{ path: string, text: string }>} */
+    const preparedWrites = [];
     for (const [rel, e] of edits) {
       const text = readFileSync(join(root, rel), "utf8");
       const out = editFindings(parse(rel, text), e);
       errors.push(...out.errors.map((m) => ({ file: repoPath(rel), message: m })));
       if (out.errors.length) continue;
-      const checked = checkFile(out.file, config);
-      errors.push(...checked.errors.map((x) => ({ file: repoPath(rel), line: x.line, message: x.message })));
-      const filled = backfill(root, rel, out.text);
-      if (filled !== text) outputs.set(rel, filled);
+      preparedWrites.push({ path: rel, text: out.text });
     }
-    if (!errors.length) for (const [rel, text] of outputs) writeFileSync(join(root, rel), text);
+    /** @type {string[]} */
+    let writtenFiles = [];
+    if (!errors.length && preparedWrites.length) {
+      const tx = writeQa({ root, minSchema: ANY_SCHEMA_VERSION, writes: preparedWrites, skipUnchanged: true });
+      if (tx.ok) {
+        writtenFiles = tx.written.map(repoPath).sort();
+      } else {
+        const fallbackFile = repoPath(j.file ?? preparedWrites[0]?.path ?? j.watermark?.file ?? "project.md");
+        if (tx.kind === "schema") errors.push({ file: fallbackFile, message: tx.refusal.json.refusals[0].code });
+        else if (tx.kind === "check") errors.push(...tx.errors.map((x) => ({ file: repoPath(x.rel), line: x.line, message: x.message })));
+        else errors.push({ file: fallbackFile, message: tx.kind === "afterCommit" ? (tx.error ?? "write failed") : tx.error });
+      }
+    }
     const watermark = { advanced: false, from: j.watermark?.from ?? null, reason: errors.length ? "write_blocked" : due ? "awaiting_checkpoint" : hold };
-    features.push({ feature, watermark, written: errors.length ? [] : [...outputs.keys()].map(repoPath).sort(), blocked: errors });
+    features.push({ feature, watermark, written: errors.length ? [] : writtenFiles, blocked: errors });
   }
   const paths = features.flatMap((f) => f.written).sort();
   return { features, paths };

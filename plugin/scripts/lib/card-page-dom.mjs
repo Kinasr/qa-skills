@@ -2,13 +2,6 @@
 // Composition entry for the page script. Section views import only the neutral
 // client; this entry may also import their mounts. Keep top-level bindings unique
 // across the ordered PAGE_MODULES manifest for raw inlining.
-import { showScenariosView } from "./card-page-view-show-scenarios.mjs";
-import { showKnowledgeView } from "./card-page-view-show-knowledge.mjs";
-import { showErrorsView } from "./card-page-view-show-errors.mjs";
-import { showStateView } from "./card-page-view-show-state.mjs";
-import { showLinksView } from "./card-page-view-show-links.mjs";
-import { showFiltersView } from "./card-page-view-show-filters.mjs";
-import { showOverviewView } from "./card-page-view-show-overview.mjs";
 import { mountShow } from "./card-page-view-show.mjs";
 import {
   answerStatus,
@@ -43,7 +36,7 @@ import {
 const views = {
   // Feature order: errors and state, knowledge (Coverage through Boundaries), Rules, the two
   // filter bars, then the Scenario → Case tree. The summary and banners stay page-level.
-  show: (model, doc, ctx) => mountShow(/** @type {import("./page.d.mts").ShowPageModel} */ (model), doc, ctx, [showErrorsView, showStateView, showKnowledgeView, showFiltersView, showScenariosView, showLinksView, showOverviewView], 3),
+  show: (model, doc, ctx) => { mountShow(/** @type {import("./page.d.mts").ShowPageModel} */ (model), doc, ctx); },
   inbox: /** @type {(model: PageModel, doc: Document, ctx: { app: HTMLElement, header: HTMLElement, node: (<K extends keyof HTMLElementTagNameMap>(tag: K, text?: string, parent?: Element) => HTMLElementTagNameMap[K]) }) => void} */ (mountInbox),
   next: /** @type {(model: PageModel, doc: Document, ctx: { app: HTMLElement, header: HTMLElement, node: (<K extends keyof HTMLElementTagNameMap>(tag: K, text?: string, parent?: Element) => HTMLElementTagNameMap[K]) }) => void} */ (mountNext),
 };
@@ -609,14 +602,16 @@ function mountInbox(model, doc, { app, header, node }) {
   refreshSize = () => {
     try {
       const result = prepareReply(model, selections, comment);
-      meter.value = Math.min(result.length, /** @type {PageLimits} */ (model.limits).max);
+      meter.value = Math.min(result.length, limits.max);
       const flags = [
         result.commentTooLarge && "Shorten the page comment: it exceeds the maximum on its own.",
         result.oversized.length && `Shorten these cases: ${result.oversized.join(", ")}. Each exceeds the maximum on its own.`,
-        result.overLimit && `Copy includes ${result.taken} whole cases; ${result.left} left.`,
+        result.overLimit && (result.taken
+          ? `Copy includes ${result.taken} whole cases; ${result.left} left.`
+          : !result.commentTooLarge && !result.oversized.length && "No whole cases fit; shorten the page comment or first case."),
       ].filter(Boolean);
       size.textContent = `${result.length} characters / ${limits.max} maximum (warning at ${limits.warn}). ${result.warning ? "Size warning. " : ""}${flags.join(" ")}`;
-      copy.disabled = result.commentTooLarge;
+      copy.disabled = result.commentTooLarge || result.taken === 0;
     } catch {
       size.textContent = "";  // an unwritable answer is reported when Copy is pressed
     }
@@ -632,7 +627,9 @@ function mountInbox(model, doc, { app, header, node }) {
       return;
     }
     if (!result.block) {
-      message.textContent = "Shorten the page comment before copying.";
+      message.textContent = result.commentTooLarge
+        ? "Shorten the page comment before copying."
+        : "Shorten the first case or page comment before copying.";
       return;
     }
     const block = result.block;

@@ -35,8 +35,9 @@ the same CLI and `--root` as `deep-dive`:
 3. `scout ingest --dir <dir>`, **once** per run dir: a second call writes a duplicate Observation.
    Its `uri` replaces the `observe:` input in the list you pass to `deep-dive refs`.
 
-A step that prints `ok: false` fails that input. Print its `error` as it stands: it says what to fix.
-With no Access note for the URL, it names `/qa-train access`.
+A step that prints `ok: false` fails that input. Word `refusals` (`code` and facts) when present,
+falling back to `.error` only for deferred exit-1 `scout` / `scout ingest` refusals: it says what to
+fix. With no Access note for the URL, it names `/qa-train access`.
 
 `scout.allowed_hosts` in `.qa/project.md`, when set, lists the hosts `observe:` may look at, checked
 before the Access note; without it, any host an Access note reaches is observed. `observe_disabled` means the list is empty, so `observe:` is off; `host_not_allowed`

@@ -11,7 +11,7 @@
 /** @import { ParsedFile } from "./knowledge-file.mjs" */
 /** @import { KeyIndex } from "./qa-index.mjs" */
 import { relative, join, sep } from "node:path";
-import { casesCoveringRule } from "./rule-coverage.mjs";
+import { casesCoveringRule } from "./qa-index.mjs";
 import { reverseReliance } from "./reliance.mjs";
 import { dependencyIndex, formatRuleRef, parseDependsField, readDependsOn } from "./rule-ref.mjs";
 

@@ -39,14 +39,15 @@
 /** @import { ScanFinding } from "./scan-integrity.mjs" */
 /** @import { StrippableFile } from "./stripped.mjs" */
 /** @import { ScanContext, ScanResult } from "./scan.mjs" */
+import { UsageError } from "./cli.mjs";
 import { isMap } from "./dialect.mjs";
-import { firstParentTouching, loadQaAt, repositoryOf, resolveRef } from "./git-tree.mjs";
+import { firstParentTouchingResult, loadQaAt, repositoryOf, resolveRef } from "./git-tree.mjs";
 import { resolveCommits } from "./git.mjs";
 import { hasMintedPrefix, isTrackerKey, PATTERN, provisionalKeys, readTrackerReference, trackerReference } from "./keys.mjs";
 import { buildIndex, loadWorkingTree } from "./qa-index.mjs";
 import { parse } from "./knowledge-file.mjs";
 import { digests, featureDismissalHolds, isMigratedPin, pinsOf, writtenDigest } from "./pin-digest.mjs";
-import { dependencyIndex, formatRuleRef, parseRuleRef, resolveRuleRef, ruleRefsIn } from "./rule-ref.mjs";
+import { dependencyIndex, formatRuleRef, parseRuleRef, refUnder, resolveRuleRef, ruleRefsIn } from "./rule-ref.mjs";
 import { affectedRules } from "./affected-rules.mjs";
 import { changedRuleKeys } from "./rule-diff.mjs";
 import { relianceOf } from "./reliance.mjs";
@@ -393,13 +394,22 @@ export function run(ctx) {
       tip ??= ctx.target?.commit ?? (repo && resolveRef(repo.top, "HEAD"));
       let found = null;
       if (repo && tip && digest !== null) {
-        const paths = now.rels(slug).map((rel) => `${repo.prefix}${rel}`);
+        const paths = [...new Set(reanchorFeatures(now, deps, slug).flatMap((f) => now.rels(f)).map((rel) => `${repo.prefix}${rel}`))];
         /** @param {string} c @returns {boolean} */
         const matches = (c) => {
           const d = h.digestsAt(c);
           return d.feature(slug) === digest || d.featureLocal(slug) === digest;
         };
-        found = firstParentTouching(repo.top, tip, paths).find(matches) ?? null;
+        const direct = firstParentTouchingResult(repo.top, tip, paths);
+        if (!direct.ok) throw new UsageError(direct.error, { code: "git_history_failed", reason: direct.error });
+        found = direct.commits.find(matches) ?? null;
+        if (found === null) {
+          const seen = new Set(direct.commits);
+          const qaPath = repo.prefix ? repo.prefix.slice(0, -1) : ".";
+          const fallback = firstParentTouchingResult(repo.top, tip, [qaPath]);
+          if (!fallback.ok) throw new UsageError(fallback.error, { code: "git_history_failed", reason: fallback.error });
+          found = fallback.commits.find((c) => !seen.has(c) && matches(c)) ?? null;
+        }
       }
       anchors.set(key, found);
       return found;
@@ -579,6 +589,40 @@ function identities(files, config) {
   };
 }
 
+/**
+ * Feature keys whose `.qa/` paths affect `slug`'s Feature digest: `slug` plus any transitive
+ * upstream Dependency or Reliance Feature.
+ * @param {Snapshot} now
+ * @param {DependencyIndex} deps
+ * @param {string} slug
+ * @returns {string[]}
+ */
+function reanchorFeatures(now, deps, slug) {
+  const visited = new Set([slug]);
+  const queue = [slug];
+  while (queue.length) {
+    const current = /** @type {string} */ (queue.shift());
+    for (const { upstream } of deps.upstreamClosure(current)) {
+      if (!visited.has(upstream.feature)) {
+        visited.add(upstream.feature);
+        queue.push(upstream.feature);
+      }
+    }
+    for (const decls of now.index.cases.values()) {
+      for (const decl of decls) {
+        if ((decl.feature ?? now.index.featureOf(decl.file)) !== current) continue;
+        for (const { ref } of relianceOf(/** @type {import("./knowledge-file.mjs").CaseEntry} */ (/** @type {unknown} */ (decl.entry)), current).refs) {
+          if (!visited.has(ref.feature)) {
+            visited.add(ref.feature);
+            queue.push(ref.feature);
+          }
+        }
+      }
+    }
+  }
+  return [...visited];
+}
+
 // `.qa/` at one state: its Key index and stripped files, cases and Rules. Raw stripped files are
 // kept separately for the persist dirty check, which must still see an uncommitted Key rewrite.
 // A file kept beside the knowledge, an Execution record or a Bug draft, is never part of one.
@@ -704,7 +748,7 @@ function feature(h, slug, file) {
     // A Rule of another Feature that this Feature's cases rely on (no Dependency) is compared at this
     // Feature's Watermark too: it is Affected for this Feature, so the Feature is a candidate.
     summary.affected_rules = affectedRules({ then, now, feature: slug, baseline: W, target: h.deps });
-    const relianceMoved = summary.affected_rules.rules.some((r) => !r.ref.startsWith(`${slug}/`));
+    const relianceMoved = summary.affected_rules.rules.some((r) => !refUnder(r.ref, slug));
     if (diff === "" && summary.upstream_changed.length === 0 && !relianceMoved) {
       summary.class = ctx.feature === slug && summary.open_findings > 0 ? "walk_only" : "unchanged";
     } else {

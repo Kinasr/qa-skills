@@ -12,22 +12,15 @@ disable-model-invocation: true
 
 A Practice that contradicts an Invariant is void.
 
-- **Migration preflight:** on every path where the command's JSON carries `global.migration`,
-  read it first. If `pending`, warn using `migrations` in order; continue the command. The
-  migration is then `start_here`: end both views on it.
-- **Never writes the repo, `.qa/`, a run dir or the tracker.**
-- **Never runs another command.** Run only the CLI calls below, displaying recommended routes.
-- **Never fetches the tracker.** Mirrored values are stored copies, never current tracker facts.
-- **An Uncited case is missing knowledge, never a Finding.** An `uncited_case` step has an empty `covers`; reliance never counts as coverage for an `uncovered_rule` step.
-- **Renders only what the CLI supplies.** Preserve labels, locations, prerequisites, routes, ordering; add no Next steps.
-- **Emojis are used only in `/qa-next` output, including its Next steps page.**
-- **Read `.qa/train/next.md` before starting**, if present, and follow its Practices.
-- **Training status is overview-only information, never Next steps.** Render one Training status
-  line from `global.training`: each `commands` entry's `command`, ✅ and counts
-  (`conventions`, `practices`) when `trained`, else ℹ️ untrained; `access_notes` separately.
-  Format: `🎓 Training: design ✅ (4 Conventions, 2 Practices) · deep-dive ℹ️ untrained · Access notes: 2`.
+- **Migration preflight:** on every path where the command's JSON carries `migration`,
+  read it first. If `pending`, warn using `migrations` in order; continue the command.
+- **Report CLI sections only; never writes the repo, `.qa/`, a run dir or the tracker.**
+- **Runs another command only on the engineer's yes.** Run only the CLI calls below, displaying recommended routes.
+- **Read stored copies only; never fetches the tracker.** Mirrored values are never current tracker facts.
 
 ## Read and run
+
+Read `.qa/train/next.md` before starting, if present, and follow its Practices.
 
 From the repo root (JSON):
 
@@ -35,28 +28,30 @@ From the repo root (JSON):
 node <this skill's directory>/../../scripts/scan.mjs next [<feature-key>] [--root <qa-dir>] [--page]
 ```
 
-Preserve Feature key and root; explain usage `error` and stop.
+Preserve Feature key and root; on `ok: false`, word `refusals` from `code` and facts and stop.
 
 ## Render
 
 Use [shared wording rules](../references/wording-rules.md) and this legend.
-For `next_steps_page` or an explicit request, follow [Next steps page](references/next-steps-page.md); otherwise render below.
+For `next_steps_page` or an explicit request, follow [Next steps page](references/next-steps-page.md); otherwise word every section in order below.
+Each view renders only what the CLI supplies (preserve labels, locations, prerequisites, routes, ordering; add no Next steps); emojis are used only in `/qa-next` output, including its Next steps page:
 
-Show `global` migration, schema, run health. Overview: each `features`
-label, `counts`, `top_next_step` on one line; ✅ for `nothing_pending`.
-In both views, show each Feature's `information` label and ℹ️ unreviewed count, including zero, and
-each non-null `executions` as information, never as Next steps: each `results` row is a Case
-outcome, with its legend emoji, `label`, `reason`, `date`, `target`, `file`/`line`, "out of date"
-when `out_of_date`, then its `hint`; then ℹ️ `passed.count` Passed, and ◐ Incomplete means a bound
-level did not run.
-With a Feature key, show all `next_steps`, global ones included, with `labels`, Keys,
-`file`/`line` and `locations`. Show each `prerequisites` string before its exact `route`: a command with `args`,
-or a person's `text` action. Finish with 👉 `start_here`, or ✅ when null.
-For Automation, show `labels.scenario` with its case Keys; separate ❔ `unknown` from
-🤖 `automation_gap`.
-For Parked questions, show `count` and citations; offer `optional_routes` to collect answers
-via the tracker.
-An open Overreach is an at-risk step: knowledge a Boundary or Waiver forbids.
+- **Schema compatibility** and **Run health**: show when present.
+- **Training status is overview-only information, never Next steps.** Render one Training status
+  line: each command, ✅ and counts (Conventions, Practices) when trained, else ℹ️ untrained; Access notes separately.
+  Format: `🎓 Training: design ✅ (4 Conventions, 2 Practices) · deep-dive ℹ️ untrained · Access notes: 2`.
+- **Features:** in overview, one line per Feature (label, counts, top step or ✅ when nothing pending).
+  In both views, show each Feature's ℹ️ unreviewed count (including zero) and execution results as
+  information, never as Next steps: each Case outcome row with legend emoji, label, reason, date,
+  target, location, "out of date" when out of date, then hint; then ℹ️ Passed count (◐ Incomplete means a bound level did not run).
+- **Next steps:** with a Feature key, show all Next steps (global included) with labels, Keys,
+  locations, and prerequisites before each exact route (command or person's action).
+  An Uncited case is missing knowledge, never a Finding; reliance never counts as coverage for an uncovered Rule.
+  For Automation, show the Scenario label with case Keys, separating ❔ `unknown` from 🤖 `automation_gap`.
+  For Parked questions, show count, citations, and optional `/qa-publish` route.
+  An open Overreach is at risk: knowledge a Boundary or Waiver forbids.
+- **Start here:** finish both views with 👉 Start here (a command: offer it once; run it on yes), or ✅ when absent.
+  When a migration is pending, the migration is then Start here: end both views on it.
 
 📤 Review prerequisites precede `/qa-publish`, which fetches the tracker and decides writes.
 

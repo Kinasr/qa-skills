@@ -15,14 +15,14 @@
 //
 // Nothing here stages or commits: `commitLine` only words the command, which `lib/commit.mjs` makes
 // as the project's Commit mode says (ADR-0062).
-import { chmodSync, existsSync, mkdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { dirname, join, relative, sep } from "node:path";
+import { chmodSync, closeSync, lstatSync, mkdirSync, openSync, renameSync, rmdirSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join, relative, resolve, sep } from "node:path";
 
 /**
  * A file write in a Changeset.
  * @typedef {{
  *   path: string,
- *   text?: string,
+ *   text: string,
  *   absent?: boolean,
  * }} ChangesetWrite
  */
@@ -36,10 +36,12 @@ import { dirname, join, relative, sep } from "node:path";
  */
 
 /**
- * Result of writeAll: empty object on success, or { error, reason } on failure.
+ * Result of writeAll: empty object on success, or { error, reason, code?, path? } on failure.
  * @typedef {{
  *   error?: string,
  *   reason?: string,
+ *   code?: "EEXIST",
+ *   path?: string,
  * }} WriteAllResult
  */
 
@@ -68,16 +70,33 @@ const shellArg = (s) => (/^[A-Za-z0-9_./:@%+=,-]+$/.test(s) ? s : `'${s.replaceA
  */
 export const changedPaths = ({ writes, deletes = [] }) => [...writes.map((w) => w.path), ...deletes].sort();
 
+/**
+ * Returns `lstatSync(abs)` without following symlinks, or `null` when absent or under a non-directory.
+ * @param {string} abs
+ * @returns {import("node:fs").Stats | null}
+ */
+function statNoFollow(abs) {
+  try {
+    return lstatSync(abs);
+  } catch (err) {
+    const code = /** @type {NodeJS.ErrnoException} */ (err).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return null;
+    throw err;
+  }
+}
+
 // The Changeset written under `repo`, all or none, in three phases:
-//   1. stage: each write's text beside its target (`<path>.tmp`), after the checks that `absent` asks
-//      for;
+//   1. stage: each regular write's text beside its target (`<path>.tmp`), and parent dirs for
+//      `absent` writes, after the checks that `absent` asks for;
 //   2. set aside: each target that exists, and each file to delete, renamed to `<path>.qa-init-aside`;
 //      a path already taken by such a file is in the way, and stops the write;
-//   3. put in place: each staged file renamed onto its target.
+//   3. put in place: each `absent` write opened exclusively (`wx`), then each staged file renamed
+//      onto its target.
 // Then the set-aside files are removed, and the write is done. A failure in any phase undoes them
 // all: what was put in place is removed, what was set aside is renamed back, and what was staged and
-// the directories it created are removed. Each undo step that fails is named in the reason, beside the
-// failure that stopped the write, so neither hides the other. Returns `{}`, or `{error, reason}`.
+// the empty directories it created are removed. Each undo step that fails is named in the reason,
+// beside the failure that stopped the write, so neither hides the other. Returns `{}`, or
+// `{error, reason, code?, path?}`.
 /**
  * @param {string} repo
  * @param {Changeset} changeset
@@ -87,27 +106,80 @@ export function writeAll(repo, { writes, deletes = [] }) {
   const rel = (/** @type {string} */ abs) => relative(repo, abs).split(sep).join("/");
   /** @type {string[]} */
   const created = [];
+  /** @type {Set<string>} */
+  const createdSet = new Set();
   /** @type {string[]} */
   const staged = [];
   /** @type {string[]} */
   const aside = [];
   /** @type {string[]} */
   const placed = [];
+
+  /** @param {string} absFile */
+  const recordMissingDirs = (absFile) => {
+    /** @type {string[]} */
+    const missing = [];
+    for (let d = dirname(absFile); statNoFollow(d) === null && dirname(d) !== d; d = dirname(d)) {
+      missing.unshift(d);
+    }
+    for (const d of missing) {
+      if (!createdSet.has(d)) {
+        createdSet.add(d);
+        created.push(d);
+      }
+    }
+  };
+
   try {
+    /** @type {Set<string>} */
+    const seenWrites = new Set();
+    /** @type {Set<string>} */
+    const seenDeletes = new Set();
     for (const w of writes) {
-      if (w.absent && existsSync(join(repo, w.path))) throw new Error(`${w.path} exists already`);
+      const abs = resolve(repo, w.path);
+      if (seenWrites.has(abs)) throw new Error(`${w.path} appears more than once in writes`);
+      seenWrites.add(abs);
     }
-    for (const w of writes) {
+    for (const p of deletes) {
+      const abs = resolve(repo, p);
+      if (seenDeletes.has(abs)) throw new Error(`${p} appears more than once in deletes`);
+      if (seenWrites.has(abs)) throw new Error(`${p} appears in both writes and deletes`);
+      seenDeletes.add(abs);
+    }
+
+    const regularWrites = writes.filter((w) => !w.absent);
+    const absentWrites = writes.filter((w) => w.absent);
+
+    // Phase 0: fast-fail `absent` pre-check (including broken symlinks via `statNoFollow`).
+    for (const w of absentWrites) {
+      if (statNoFollow(join(repo, w.path)) !== null) {
+        throw Object.assign(new Error(`${w.path} exists already`), { qaCode: "EEXIST", qaPath: w.path });
+      }
+    }
+
+    // Phase 1: stage regular writes and create missing parent dirs for `absentWrites`.
+    for (const w of regularWrites) {
       const abs = join(repo, w.path);
-      for (let d = dirname(abs); !existsSync(d); d = dirname(d)) created.unshift(d);
+      recordMissingDirs(abs);
       mkdirSync(dirname(abs), { recursive: true });
-      writeFileSync(`${abs}.tmp`, /** @type {string} */ (w.text));
+      writeFileSync(`${abs}.tmp`, w.text);
       staged.push(abs);
-      // A replaced file keeps its mode: the staged file is renamed onto it, so it would take the umask's.
-      if (existsSync(abs)) chmodSync(`${abs}.tmp`, statSync(abs).mode & 0o7777);
+      // A replaced regular file keeps its mode: the staged file is renamed onto it, so it would take the umask's.
+      const st = statNoFollow(abs);
+      if (st && st.isFile()) chmodSync(`${abs}.tmp`, st.mode & 0o7777);
     }
-    for (const abs of [...staged, ...deletes.map((p) => join(repo, p))].filter((t) => existsSync(t))) {
-      if (existsSync(`${abs}${SET_ASIDE_SUFFIX}`)) throw new Error(`${rel(abs)}${SET_ASIDE_SUFFIX} is in the way`);
+    for (const w of absentWrites) {
+      const abs = join(repo, w.path);
+      recordMissingDirs(abs);
+      mkdirSync(dirname(abs), { recursive: true });
+    }
+
+    // Phase 2: set aside existing targets for regular writes and deletes.
+    for (const abs of [...staged, ...deletes.map((p) => join(repo, p))]) {
+      const st = statNoFollow(abs);
+      if (st === null) continue;
+      if (st.isDirectory()) throw new Error(`${rel(abs)} is a directory`);
+      if (statNoFollow(`${abs}${SET_ASIDE_SUFFIX}`) !== null) throw new Error(`${rel(abs)}${SET_ASIDE_SUFFIX} is in the way`);
       try {
         renameSync(abs, `${abs}${SET_ASIDE_SUFFIX}`);
       } catch (e) {
@@ -115,11 +187,32 @@ export function writeAll(repo, { writes, deletes = [] }) {
       }
       aside.push(abs);
     }
+
+    // Phase 3: place `absentWrites` atomically via `openSync(abs, "wx")`, then rename `staged`.
+    for (const w of absentWrites) {
+      const abs = join(repo, w.path);
+      let fd;
+      try {
+        fd = openSync(abs, "wx");
+      } catch (err) {
+        if (/** @type {NodeJS.ErrnoException} */ (err).code === "EEXIST") {
+          throw Object.assign(new Error(`${w.path} exists already`), { qaCode: "EEXIST", qaPath: w.path });
+        }
+        throw err;
+      }
+      placed.push(abs);
+      try {
+        writeFileSync(fd, w.text);
+      } finally {
+        closeSync(fd);
+      }
+    }
     for (const abs of staged) {
       renameSync(`${abs}.tmp`, abs);
       placed.push(abs);
     }
   } catch (e) {
+    const err = /** @type {Error & { qaCode?: "EEXIST", qaPath?: string }} */ (e);
     /** @type {string[]} */
     const stuck = [];
     const undo = (/** @type {string} */ abs, /** @type {() => void} */ step) => {
@@ -132,9 +225,23 @@ export function writeAll(repo, { writes, deletes = [] }) {
     for (const abs of placed) undo(abs, () => rmSync(abs, { force: true }));
     for (const abs of aside) undo(abs, () => renameSync(`${abs}${SET_ASIDE_SUFFIX}`, abs));
     for (const abs of staged.filter((t) => !placed.includes(t))) undo(abs, () => rmSync(`${abs}.tmp`, { force: true }));
-    for (const d of created.reverse()) undo(d, () => rmSync(d, { recursive: true, force: true }));
-    const reason = stuck.length ? `${(/** @type {Error} */ (e)).message}; and ${stuck.join(", ")} could not be put back as it was` : (/** @type {Error} */ (e)).message;
-    return { error: `nothing was written: ${reason}`, reason };
+    for (const d of [...created].reverse()) {
+      undo(d, () => {
+        try {
+          rmdirSync(d);
+        } catch (rmErr) {
+          const code = /** @type {NodeJS.ErrnoException} */ (rmErr).code;
+          if (code !== "ENOENT" && code !== "ENOTEMPTY" && code !== "EEXIST" && code !== "ENOTDIR") throw rmErr;
+        }
+      });
+    }
+    const reason = stuck.length ? `${err.message}; and ${stuck.join(", ")} could not be put back as it was` : err.message;
+    return {
+      error: `nothing was written: ${reason}`,
+      reason,
+      ...(err.qaCode !== undefined && { code: err.qaCode }),
+      ...(err.qaPath !== undefined && { path: err.qaPath }),
+    };
   }
   for (const abs of aside) rmSync(`${abs}${SET_ASIDE_SUFFIX}`, { force: true });
   return {};

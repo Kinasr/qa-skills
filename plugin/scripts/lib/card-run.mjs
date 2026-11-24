@@ -2,14 +2,14 @@
 // Sealed Card lifecycle: rebuild, validate decisions, issue and verify confirmations, then write.
 // Adapters supply build/data/decisions/apply, refusal facts and run-file options.
 import { createHash } from "node:crypto";
-import { rmSync, writeFileSync } from "node:fs";
+import { rmSync } from "node:fs";
 import { isDeepStrictEqual } from "node:util";
 import { parseDecisions } from "./refusal.mjs";
 import { join } from "node:path";
 import { changedPaths, commitLine, writeAll } from "./changeset.mjs";
 import { backfillChangeset } from "./pin-digest.mjs";
-import { readRunFile } from "./run-dir.mjs";
-/** @import { RunFileResult } from "./run-dir.mjs" */
+import { readRunFile, stageJson, writeJsonAtomic } from "./run-dir.mjs";
+/** @import { RunFileResult, StagedJson } from "./run-dir.mjs" */
 
 /**
  * A refusal fact: a code, its human line, and the data it carries.
@@ -172,7 +172,9 @@ export function cardRun(adapter) {
         return refused(built.refused);
       }
       const at = typeof dir === "function" ? dir() : dir;
-      writeFileSync(join(at, CARD_FILE), `${JSON.stringify(/** @type {CardRecord<Input, Data>} */ ({ kind, digest: digestOf(built.seal), input, ...(adapter.keepData && { card: adapter.data(ctx, built.card) }) }), null, 2)}\n`);
+      /** @type {CardRecord<Input, Data>} */
+      const cardRecord = { kind, digest: digestOf(built.seal), input, ...(adapter.keepData && { card: adapter.data(ctx, built.card) }) };
+      writeJsonAtomic(join(at, CARD_FILE), cardRecord);
       return { ok: true, dir: at, card: adapter.data(ctx, built.card), exit: 0 };
     },
 
@@ -198,21 +200,37 @@ export function cardRun(adapter) {
 
       if ("refused" in out) return { ...refused(out.refused ?? [], out.rebuild ?? false), ...out.data };
       if (out.confirm) {
-        writeFileSync(join(dir, CARD_FILE), `${JSON.stringify(/** @type {CardRecord<Input, Data>} */ ({ .../** @type {CardRecord<Input, Data>} */ (recorded.value), pending: out.confirm.decisions }), null, 2)}\n`);
+        /** @type {CardRecord<Input, Data>} */
+        const pendingRecord = { .../** @type {CardRecord<Input, Data>} */ (recorded.value), pending: out.confirm.decisions };
+        writeJsonAtomic(join(dir, CARD_FILE), pendingRecord);
         return { ok: false, confirm: true, ...out.confirm, exit: 0 };
       }
 
       const { changeset, message, report } = out;
-      // `changeset.mjs` is not adopted yet, so `changedPaths` infers `deletes: never[]` from its default.
-      const paths = changedPaths(/** @type {{ writes: CardWrite[], deletes?: never[] }} */ (changeset));
-      if (paths.length) {
-        const written = writeAll(ctx.repo, backfillChangeset(ctx.root, ctx.repo, changeset));
-        if (written.error) return refused([adapter.fact("write_failed", { reason: written.reason })]);
-      }
+      const paths = changedPaths(changeset);
+      const record = /** @type {CardRecord<Input, Data>} */ (recorded.value);
+      /** @type {StagedJson | null} */
+      let stagedCard = null;
       if (pending) {
-        delete /** @type {CardRecord<Input, Data>} */ (recorded.value).pending;
-        writeFileSync(join(dir, CARD_FILE), `${JSON.stringify(/** @type {CardRecord<Input, Data>} */ (recorded.value), null, 2)}\n`);
+        const { pending: _p, ...cleared } = record;
+        /** @type {CardRecord<Input, Data>} */
+        const clearedRecord = cleared;
+        stagedCard = stageJson(join(dir, CARD_FILE), clearedRecord);
       }
+      if (paths.length) {
+        let written;
+        try {
+          written = writeAll(ctx.repo, backfillChangeset(ctx.root, ctx.repo, changeset));
+        } catch (err) {
+          stagedCard?.abort();
+          throw err;
+        }
+        if (written.error) {
+          stagedCard?.abort();
+          return refused([adapter.fact("write_failed", { reason: written.reason })]);
+        }
+      }
+      stagedCard?.commit();
       return { ok: true, ...out.data, report: report(paths.length ? commitLine(paths, message) : null), exit: 0 };
     },
   };

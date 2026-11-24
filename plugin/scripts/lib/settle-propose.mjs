@@ -5,22 +5,19 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { keyLabel, terms } from "./labels.mjs";
-import { writeAll } from "./changeset.mjs";
 import { isMap } from "./dialect.mjs";
 import { repositoryOf } from "./git-tree.mjs";
-import { written } from "./impact-persist.mjs";
-import { backfillChangeset } from "./pin-digest.mjs";
 import { refuse } from "./impact-json.mjs";
 import { parseRuleRef, resolveRuleRef } from "./rule-ref.mjs";
-import { checkFile, parse } from "./knowledge-file.mjs";
-import { object, refusalsFor } from "./refusal.mjs";
-import { rootConfig } from "./qa-index.mjs";
+import { object, refusalsWithoutLines } from "./refusal.mjs";
+import { writeQa } from "./qa-write.mjs";
 import { readRunFile } from "./run-dir.mjs";
 import { scan } from "./scan.mjs";
+import { ANY_SCHEMA_VERSION } from "./schema.mjs";
 import { isOpenFinding } from "./stored-findings.mjs";
 import { STATE, current, findingsOf, load, reliesOn, strings, textWith } from "./settle-walk.mjs";
 import { unknown } from "./settle-page.mjs";
-/** @import { WalkCaseDecl, WalkNow } from "./settle-walk.mjs" */
+/** @import { WalkCaseDecl, WalkNow, WalkState } from "./settle-walk.mjs" */
 /** @import { CommandResult } from "./cli.mjs" */
 /** @import { Terms } from "./impact-json.mjs" */
 /** @import { ImpactPlan } from "./impact.mjs" */
@@ -56,20 +53,7 @@ import { unknown } from "./settle-page.mjs";
 const PROPOSALS = "proposals.json";
 const OUTCOMES = ["keep", "fix", "retire"];
 const PROPOSAL_FIELDS = ["outcome", "reason", "covers", "relies_on"];
-/** @type {Record<string, string>} */
-export const PROPOSE_REFUSALS = {
-  proposal_json: "The proposals are not a JSON object `{v: 1, items: {<case key>: {outcome?, reason?, covers?, relies_on?}}}`.",
-  proposal_field: "A proposal holds a field other than outcome, reason, covers and relies_on, or a value of the wrong type.",
-  proposal_case: "A proposal names a case the knowledge layer does not hold.",
-  proposal_outcome: "A proposed outcome is keep, fix or retire.",
-  proposal_not_stale: "Only a case with an open Stale takes a proposed outcome.",
-  proposal_link: "A proposed link names a Rule that is not live.",
-  link_json: "The links are not a JSON object holding `covers` and/or `relies_on`, each a list of Rule references.",
-  link_field: "The links hold a field other than covers and relies_on.",
-  link_case: "The case is not one the knowledge layer holds.",
-  link_rule: "A link names a Rule that is not live.",
-};
-const { refuse: proposeRefuse, stop: proposeStop } = refusalsFor(PROPOSE_REFUSALS);
+const { refuse: proposeRefuse, stop: proposeStop } = refusalsWithoutLines();
 
 /**
  * @param {unknown} v
@@ -112,7 +96,7 @@ function proposalsOf(dir) {
   return read.error || !read.value || !object(read.value.items) ? { v: 1, items: {} } : read.value;
 }
 
-// `design propose --dir --stdin`: design's proposals, `{v: 1, items: {<case key>: {outcome?, reason?,
+// `design propose --dir --input <path>`: design's proposals, `{v: 1, items: {<case key>: {outcome?, reason?,
 // covers?, relies_on?}}}`. Each case's entry replaces its earlier one; the rest are kept. Every item is
 // held to the knowledge layer first, so a refusal writes nothing.
 /**
@@ -126,18 +110,18 @@ export function propose(dir, plan, text) {
   if (loaded.refused) return loaded.refused;
   /** @type {unknown} */
   let given;
-  try { given = JSON.parse(text); } catch { return proposeRefuse("proposal_json"); }
-  if (!object(given) || given.v !== 1 || !object(given.items) || unknown(given, ["v", "items"])) return proposeRefuse("proposal_json");
+  try { given = JSON.parse(text); } catch { return proposeRefuse("proposal_json", { shape: "{v: 1, items: {<case key>: {outcome?, reason?, covers?, relies_on?}}}" }); }
+  if (!object(given) || given.v !== 1 || !object(given.items) || unknown(given, ["v", "items"])) return proposeRefuse("proposal_json", { shape: "{v: 1, items: {<case key>: {outcome?, reason?, covers?, relies_on?}}}" });
   const now = current(plan.root);
   /** @type {Record<string, Proposal>} */
   const items = {};
   for (const [key, item] of Object.entries(given.items)) {
-    if (!object(item) || unknown(item, PROPOSAL_FIELDS) || (item.reason !== undefined && typeof item.reason !== "string")) return proposeRefuse("proposal_field", { key });
-    for (const field of /** @type {const} */ (["covers", "relies_on"])) if (item[field] !== undefined && !stringList(item[field])) return proposeRefuse("proposal_field", { key });
+    if (!object(item) || unknown(item, PROPOSAL_FIELDS) || (item.reason !== undefined && typeof item.reason !== "string")) return proposeRefuse("proposal_field", { key, fields: PROPOSAL_FIELDS });
+    for (const field of /** @type {const} */ (["covers", "relies_on"])) if (item[field] !== undefined && !stringList(item[field])) return proposeRefuse("proposal_field", { key, fields: PROPOSAL_FIELDS });
     const decl = now.index.cases.get(key)?.[0];
     if (!decl) return proposeStop("proposal_case", { key });
     if (item.outcome !== undefined) {
-      if (typeof item.outcome !== "string" || !OUTCOMES.includes(item.outcome)) return proposeRefuse("proposal_outcome", { key });
+      if (typeof item.outcome !== "string" || !OUTCOMES.includes(item.outcome)) return proposeRefuse("proposal_outcome", { key, outcomes: OUTCOMES });
       if (!staleOpen(decl)) return proposeStop("proposal_not_stale", { key });
     }
     const unresolved = unresolvedRules(now, decl.feature, [...strings(item.covers), ...strings(item.relies_on)]);
@@ -185,7 +169,7 @@ export function proposalLines(proposal) {
   ];
 }
 
-// `design link --dir --case <key> --stdin`: the links the engineer confirmed for a case, `{covers?,
+// `design link --dir --case <key> --input <path>`: the links the engineer confirmed for a case, `{covers?,
 // relies_on?}`. A list given replaces the case's own; one left out stays. Every Rule must be live and
 // the file must pass `check-file` before it is written; a refusal writes nothing. Any case may be
 // linked, an Uncited one included: it needs no open finding, and the proposal is not consulted.
@@ -205,10 +189,10 @@ export function link(dir, plan, key, text) {
   if (typeof key !== "string" || !decl) return proposeStop("link_case", { key });
   /** @type {unknown} */
   let given;
-  try { given = JSON.parse(text); } catch { return proposeRefuse("link_json"); }
-  if (!object(given) || !Object.keys(given).length) return proposeRefuse("link_json");
-  if (unknown(given, ["covers", "relies_on"])) return proposeRefuse("link_field");
-  for (const field of ["covers", "relies_on"]) if (given[field] !== undefined && !stringList(given[field])) return proposeRefuse("link_json");
+  try { given = JSON.parse(text); } catch { return proposeRefuse("link_json", { shape: "{covers?: [<rule ref>...], relies_on?: [<rule ref>...]}" }); }
+  if (!object(given) || !Object.keys(given).length) return proposeRefuse("link_json", { shape: "{covers?: [<rule ref>...], relies_on?: [<rule ref>...]}" });
+  if (unknown(given, ["covers", "relies_on"])) return proposeRefuse("link_field", { fields: ["covers", "relies_on"] });
+  for (const field of ["covers", "relies_on"]) if (given[field] !== undefined && !stringList(given[field])) return proposeRefuse("link_json", { shape: "{covers?: [<rule ref>...], relies_on?: [<rule ref>...]}" });
   const unresolved = unresolvedRules(now, decl.feature, [...strings(given.covers), ...strings(given.relies_on)]);
   if (unresolved.length) return proposeStop("link_rule", { key, rules: unresolved });
   const repo = repositoryOf(root);
@@ -216,12 +200,22 @@ export function link(dir, plan, key, text) {
   const rel = decl.file.rel;
   const set = { ...(given.covers !== undefined && { covers: given.covers }), ...(given.relies_on !== undefined && { relies_on: strings(given.relies_on).length ? given.relies_on : undefined }) };
   const edited = textWith(rel, readFileSync(join(root, rel), "utf8"), [{ at: key, set }]);
-  const checked = /** @type {{ errors: Array<{ line?: number, message: string }> }} */ (checkFile(parse(rel, edited), rootConfig(root)));
-  if (checked.errors.length) return refuse("check_file", { errors: checked.errors.map((x) => ({ file: `${repo.prefix}${rel}`, line: x.line, message: x.message })) });
-  const wrote = /** @type {{ error?: string }} */ (writeAll(root, backfillChangeset(root, root, { writes: [{ path: rel, text: edited }] })));
-  if (wrote.error) throw new Error(`design link: ${wrote.error}`);
-  loaded.state.written = [...new Set([...loaded.state.written, `${repo.prefix}${rel}`])].sort();
-  writeFileSync(join(dir, STATE), `${JSON.stringify(loaded.state, null, 2)}\n`);
+  /** @type {WalkState} */
+  const nextState = {
+    ...loaded.state,
+    written: [...new Set([...loaded.state.written, `${repo.prefix}${rel}`])].sort(),
+  };
+  const tx = writeQa({
+    root,
+    minSchema: ANY_SCHEMA_VERSION,
+    writes: [{ path: rel, text: edited }],
+    stage: [{ path: join(dir, STATE), value: nextState }],
+  });
+  if (!tx.ok) {
+    if (tx.kind === "schema") return tx.refusal;
+    if (tx.kind === "check") return refuse("check_file", { errors: tx.errors.map((x) => ({ file: `${repo.prefix}${x.rel}`, line: x.line, message: x.message })) });
+    throw new Error(`design link: ${tx.error ?? "failed"}${tx.kind !== "write" && !tx.rolledBack && tx.rollbackError ? `; rollback failed: ${tx.rollbackError}` : ""}`);
+  }
   const after = current(root).index.cases.get(key)?.[0];
   /** @type {Terms} */
   const t = terms();

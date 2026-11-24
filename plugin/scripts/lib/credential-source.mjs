@@ -1,15 +1,15 @@
 // @ts-check
 // CLI-only credential reads. Values stay inside the caller; never put a resolved value in output.
 import { existsSync, readFileSync, realpathSync } from "node:fs";
-import { spawnSync } from "node:child_process";
 import { basename, dirname, join, relative, resolve } from "node:path";
 import { authKeyOf, authKeysNeeded, authTemplate, templateKeysWithValue } from "./auth-template.mjs";
+import { runGit } from "./git.mjs";
 
 /** @import { ParsedEntry, ParsedFile } from "./knowledge-file.mjs" */
 /** @import { CheckProblem } from "./check-file.mjs" */
 /**
  * Safe to print: no credential values or file contents.
- * @typedef {{ code: string, message: string, gitignore_line: string }} CredentialSourceRefusal
+ * @typedef {{ code: string, message: string, gitignore_line: string, file?: string, checkout?: string, key?: string }} CredentialSourceRefusal
  */
 /**
  * @typedef {{ value: string | null, refusal?: never } | { value?: never, refusal: CredentialSourceRefusal }} CredentialResolution
@@ -24,11 +24,12 @@ import { authKeyOf, authKeysNeeded, authTemplate, templateKeysWithValue } from "
 export function credentialEnvRefusal(root) {
   const repo = dirname(resolve(root));
   if (!existsSync(join(repo, ".env"))) return null;
-  const tracked = spawnSync("git", ["-C", repo, "ls-files", "--error-unmatch", "--", ".env"], { encoding: "utf8" }).status === 0;
-  const ignored = spawnSync("git", ["-C", repo, "check-ignore", "--quiet", "--", ".env"], { encoding: "utf8" }).status === 0;
+  const tracked = runGit(repo, ["ls-files", "--error-unmatch", "--", ".env"]).status === 0;
+  const ignored = runGit(repo, ["check-ignore", "--quiet", "--", ".env"]).status === 0;
   if (!tracked && ignored) return null;
   return {
     code: tracked ? "credential_env_tracked" : "credential_env_not_ignored",
+    file: ".env",
     message: `${tracked ? "Git tracks `.env`: run `git rm --cached -- .env` and add" : "Git would track `.env`: add"} this line to the repo root's \`.gitignore\`: \`/.env\` before using it for credentials`,
     gitignore_line: "/.env",
   };
@@ -144,7 +145,7 @@ export function resolveCredential(root, name) {
   try {
     entries = readFileSync(file, "utf8").split(/\r?\n/);
   } catch {
-    return { refusal: { code: "credential_env_unreadable", message: "The repo root's `.env` could not be read; restore read access before using credentials.", gitignore_line: "/.env" } };
+    return { refusal: { code: "credential_env_unreadable", file: ".env", message: "The repo root's `.env` could not be read; restore read access before using credentials.", gitignore_line: "/.env" } };
   }
   for (const line of entries) {
     const assignment = /^([A-Z_][A-Z0-9_]*)=(.*)$/.exec(line);
@@ -169,7 +170,7 @@ export const AUTH_TEMPLATE = "auth.example";
  * @returns {string | null} Trimmed stdout, or null when git fails.
  */
 function gitOut(dir, args) {
-  const r = spawnSync("git", ["-C", dir, ...args], { encoding: "utf8" });
+  const r = runGit(dir, args);
   return r.status === 0 ? r.stdout.trim() : null;
 }
 
@@ -232,12 +233,14 @@ const where = (loc) => `${loc.checkout === "main" ? "the main checkout's" : "thi
  * @returns {CredentialSourceRefusal | null}
  */
 function authStanding(loc) {
-  const tracked = spawnSync("git", ["-C", loc.dir, "ls-files", "--error-unmatch", "--", loc.rel], { encoding: "utf8" }).status === 0;
-  const ignored = spawnSync("git", ["-C", loc.dir, "check-ignore", "--quiet", "--", loc.rel], { encoding: "utf8" }).status === 0;
+  const tracked = runGit(loc.dir, ["ls-files", "--error-unmatch", "--", loc.rel]).status === 0;
+  const ignored = runGit(loc.dir, ["check-ignore", "--quiet", "--", loc.rel]).status === 0;
   if (!tracked && ignored) return null;
   const line = `/${loc.rel}`;
   return {
     code: tracked ? "credential_auth_tracked" : "credential_auth_not_ignored",
+    file: loc.rel,
+    checkout: loc.checkout,
     message: `${tracked ? `Git tracks ${where(loc)}: run \`git rm --cached -- ${loc.rel}\` and add` : `Git would track ${where(loc)}: add`} this line to its checkout's \`.gitignore\`: \`${line}\` before using it for credentials`,
     gitignore_line: line,
   };
@@ -255,7 +258,7 @@ function authEntries(loc) {
   try {
     lines = readFileSync(loc.file, "utf8").split(/\r?\n/);
   } catch {
-    return { refusal: { code: "credential_auth_unreadable", message: `${where(loc)} could not be read; restore read access before using credentials.`, gitignore_line: `/${loc.rel}` } };
+    return { refusal: { code: "credential_auth_unreadable", file: loc.rel, checkout: loc.checkout, message: `${where(loc)} could not be read; restore read access before using credentials.`, gitignore_line: `/${loc.rel}` } };
   }
   /** @type {Array<[string, string]>} */
   const entries = [];
@@ -279,7 +282,7 @@ export function resolveAuthKey(root, key) {
     const read = authEntries(loc);
     if (read.refusal) return { refusal: read.refusal };
     const hits = read.entries.filter(([k]) => k === key);
-    if (hits.length > 1) return { refusal: { code: "credential_auth_duplicate", message: `${where(loc)} sets \`${key}\` more than once: keep one line`, gitignore_line: `/${loc.rel}` } };
+    if (hits.length > 1) return { refusal: { code: "credential_auth_duplicate", file: loc.rel, checkout: loc.checkout, key, message: `${where(loc)} sets \`${key}\` more than once: keep one line`, gitignore_line: `/${loc.rel}` } };
     if (hits[0]?.[1]) return { value: hits[0][1] };
   }
   return { value: null };

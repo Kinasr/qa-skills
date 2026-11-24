@@ -8,10 +8,10 @@
 //     (`newRunDir`'s `make`), so a refused call leaves no dir behind.
 //   - Opening one tells a missing dir, a missing file and a corrupt file apart (`openRunDir`,
 //     `readRunFile`), each naming the path and the command that recovers.
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
-import { drawKey } from "./mint.mjs";
+import { dirname, join, resolve } from "node:path";
+import { drawKey } from "./keys.mjs";
 
 // A Run is named by a random id: 8 lowercase Crockford characters from a CSPRNG, drawn as `mint`
 // draws keys.
@@ -107,8 +107,8 @@ export function openPlan(cmd, action, args, dir) {
  */
 
 // A JSON file in a run dir, which `by` wrote: `{value}`, or `{error}`. An absent file is
-// `{value: null}` when `missing` is undefined, else the usage error `missing`. A file that is not
-// JSON is always a usage error; `restart` names what starts a fresh run. `by` and `restart` are
+// `{value: null}` when `missing` is undefined, else the usage error `missing`. A file that cannot
+// be read, which names its cause, or is not JSON is always a usage error; `restart` names what starts a fresh run. `by` and `restart` are
 // each a command or a list of them.
 /**
  * @template [T=unknown]
@@ -120,8 +120,15 @@ export function openPlan(cmd, action, args, dir) {
 export function readRunFile(dir, name, { by, restart, missing }) {
   const path = join(dir, name);
   if (!existsSync(path)) return missing === undefined ? { value: null } : { error: missing };
+  let text;
   try {
-    return { value: /** @type {T} */ (JSON.parse(readFileSync(path, "utf8"))) };
+    text = readFileSync(path, "utf8");
+  } catch (error) {
+    const cause = /** @type {NodeJS.ErrnoException} */ (error).code ?? String(error);
+    return { error: `${path} cannot be read (${cause}): start a new run with ${commands(restart)}` };
+  }
+  try {
+    return { value: /** @type {T} */ (JSON.parse(text)) };
   } catch {
     return { error: `${path} is not the JSON ${commands(by)} wrote: start a new run with ${commands(restart)}` };
   }
@@ -151,4 +158,105 @@ const commands = (from) => [from].flat().map((c) => `\`${c}\``).join(" or ");
  */
 function isDir(path) {
   return existsSync(path) && statSync(path).isDirectory();
+}
+
+const PRIMARY_STATE_FILES = [
+  "execute.json",
+  "plan.json",
+  "dispatch.spec.json",
+  "dispatch.json",
+  "codegen.json",
+  "follow-ups.json",
+  "run.json",
+  "publish.json",
+  "card.json",
+  "change.json",
+  "scout-ui.json",
+  "scout-tracker.json",
+  "automation.json",
+];
+
+let stageSeq = 0;
+
+/**
+ * A staged JSON write ready to commit atomically or abort.
+ * @typedef {{
+ *   path: string,
+ *   temp: string,
+ *   commit: () => void,
+ *   abort: () => void,
+ * }} StagedJson
+ */
+
+/**
+ * Stages `value` formatted as JSON in a unique temporary file beside `path`, returning commit
+ * and abort handles.
+ * @param {string} path
+ * @param {unknown} value
+ * @param {{ compact?: boolean }} [options]
+ * @returns {StagedJson}
+ */
+export function stageJson(path, value, { compact = false } = {}) {
+  const temp = `${path}.tmp.${process.pid}.${++stageSeq}`;
+  const body = compact ? `${JSON.stringify(value)}\n` : `${JSON.stringify(value, null, 2)}\n`;
+  mkdirSync(dirname(path), { recursive: true });
+  try {
+    writeFileSync(temp, body);
+  } catch (err) {
+    try { rmSync(temp, { force: true }); } catch {}
+    throw err;
+  }
+  let settled = false;
+  return {
+    path,
+    temp,
+    commit() {
+      if (settled) throw new Error(`staged JSON already settled: ${path}`);
+      settled = true;
+      try {
+        renameSync(temp, path);
+      } catch (err) {
+        try { rmSync(temp, { force: true }); } catch {}
+        throw err;
+      }
+    },
+    abort() {
+      if (settled) return;
+      settled = true;
+      try { rmSync(temp, { force: true }); } catch {}
+    },
+  };
+}
+
+/**
+ * Writes `value` formatted as JSON atomically via a unique temporary file and rename.
+ * @param {string} path
+ * @param {unknown} value
+ * @param {{ compact?: boolean }} [options]
+ * @returns {void}
+ */
+export function writeJsonAtomic(path, value, options) {
+  stageJson(path, value, options).commit();
+}
+
+/**
+ * Finds the `.qa/` root recorded in a run directory's state JSON file, prioritizing
+ * command-primary state files over alphabetical remaining `*.json` files.
+ * @param {string} dir
+ * @returns {string | undefined}
+ */
+export function runDirRoot(dir) {
+  if (!isDir(dir)) return undefined;
+  const names = readdirSync(dir).filter((f) => f.endsWith(".json")).sort();
+  const primary = PRIMARY_STATE_FILES.filter((name) => names.includes(name));
+  const extra = names.filter((name) => !PRIMARY_STATE_FILES.includes(name));
+  for (const name of [...primary, ...extra]) {
+    try {
+      const data = JSON.parse(readFileSync(join(dir, name), "utf8"));
+      if (typeof data?.root === "string") return data.root;
+    } catch {
+      // Unreadable or non-JSON file falls through to the next candidate.
+    }
+  }
+  return undefined;
 }

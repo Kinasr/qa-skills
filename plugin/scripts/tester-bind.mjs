@@ -22,12 +22,23 @@ import { bindTester } from "./lib/tester-guard.mjs";
  * }} PostToolUseEvent
  */
 
+/** @type {PostToolUseEvent} */
+let event;
 try {
-  const bound = /** @type {({ execDir: string, error?: never } | { execDir?: never, error: string }) | null} */ (bindTester(/** @type {PostToolUseEvent} */ (JSON.parse(readFileSync(0, "utf8")))));
+  event = /** @type {PostToolUseEvent} */ (JSON.parse(readFileSync(0, "utf8")));
+} catch {
+  // Not a launch this hook can read: an unbound Tester is refused by the guard anyway.
+  process.exit(0);
+}
+
+try {
+  const bound = /** @type {({ execDir: string, error?: never } | { execDir?: never, error: string }) | null} */ (bindTester(event));
   if (bound?.error) {
     process.stderr.write(`Tester binding: ${bound.error}; the guard refuses every call of this Tester.\n`);
     process.exit(2);
   }
-} catch {
-  // Not a launch this hook can read: an unbound Tester is refused by the guard anyway.
+} catch (error) {
+  const message = error instanceof Error ? error.message : String(error);
+  process.stderr.write(`Tester binding: ${message}; the guard refuses every call of this Tester.\n`);
+  process.exit(2);
 }

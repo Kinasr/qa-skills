@@ -105,6 +105,7 @@ export function parseYaml(text, firstLine = 1) {
     const indent = (/** @type {RegExpMatchArray} */ (raw.match(/^ */)))[0].length;
     const body = raw.slice(indent).replace(/\s+$/, "");
     if (body.startsWith("\t")) return errors.push({ code: "dialect", line, message: "tab in indentation" });
+    if (raw.includes("\t")) return errors.push({ code: "dialect", line, message: "tabs are outside the dialect" });
     if (body.startsWith("#")) return errors.push({ code: "dialect", line, message: "comments are outside the dialect" });
     lines.push({ line, indent, body });
   });

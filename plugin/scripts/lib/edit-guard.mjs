@@ -4,23 +4,25 @@
 // content of every path it touched; the guards answer with refusal facts, never with a repaired
 // tree.
 //
-// Four guards:
-//   scope      every path is under `module_paths` (minus `.qa/`) and outside the fixed deny list
-//              (runner and build config, lockfiles, `tsconfig*`, `.env*`, `.auth/`, `*auth*.json`,
-//              snapshot dirs and images), and its realpath does not escape that scope through a
-//              symlink;
+// Two guards:
+//   scope      every path is under `module_paths` (minus `.qa/`) and outside the deny list
+//              (universal VCS/knowledge/env/auth/snapshot/image rules and non-adapter build
+//              files, plus stack- and runner-owned protected files from `stacks/descriptors.mjs`
+//              and `runners/descriptors.mjs`), and its realpath does not escape that scope
+//              through a symlink;
 //   identity   every test function a file held still holds its `(file, class, name)`, its
 //              `automationKeys`, `trackerKeys`, `keyPrefixes` and `parameterised` flag, read
-//              through the code index (lib/code-index.mjs);
-//   tokens     a line the edit adds holds no disable, focus or assume token, and no sleep, retry or
-//              timeout token, as the stack adapter names them;
-//   assertions that the edited files did not lose assertions unless the caller gives a reason.
+//              through the code index (lib/code-index.mjs).
 //
-// The guard module never names a language, a framework, a file extension or a declaration syntax:
-// the deny list is shared file policy, and the tokens and assertion counter are the adapter's.
-import { lstatSync, realpathSync } from "node:fs";
-import { basename, dirname, join, posix, resolve } from "node:path";
+// The guard module never names a supported stack's or runner's files or declaration syntax:
+// those live in `stacks/descriptors.mjs` and `runners/descriptors.mjs`, while universal and
+// cross-ecosystem repository policy lives here.
+import { realpathSync } from "node:fs";
+import { posix, relative, sep } from "node:path";
 import { indexSource } from "./code-index.mjs";
+import { isContained, isSafeRelativePath, resolveRealPath, within } from "./paths.mjs";
+import { RUNNER_PROTECTED_FILES } from "./runners/descriptors.mjs";
+import { STACK_PROTECTED_FILES } from "./stacks/descriptors.mjs";
 
 /**
  * @import { KeyPatterns } from "./code-index.mjs"
@@ -48,7 +50,6 @@ import { indexSource } from "./code-index.mjs";
  *   adapter: StackAdapter | null,
  *   patterns: KeyPatterns,
  *   edits: readonly GuardEdit[],
- *   assertionsReduced?: string | false,
  * }} GuardInput
  */
 
@@ -56,25 +57,20 @@ import { indexSource } from "./code-index.mjs";
  * A refused edit, as the caller's adapter turns it into its own refusal.
  * @typedef {RefusalFact & {
  *   path?: string,
+ *   outside?: string,
+ *   via?: string,
+ *   detail?: string,
+ *   kind?: string,
+ *   denied?: string,
+ *   fn?: string,
  *   what?: string,
- *   token?: string,
- *   net?: number,
  * }} GuardRefusal
- */
-
-/**
- * @typedef {{
- *   before: number,
- *   after: number,
- *   net: number,
- * }} AssertionChange
  */
 
 /**
  * @typedef {{
  *   ok: boolean,
  *   refusals: GuardRefusal[],
- *   assertions: AssertionChange,
  *   files: string[],
  * }} GuardResult
  */
@@ -82,26 +78,28 @@ import { indexSource } from "./code-index.mjs";
 // Directories no edit may enter, wherever they sit under a module path.
 const DENY_DIRS = new Set([".git", ".qa", ".auth", "__snapshots__", "snapshots", "snapshot"]);
 
-// Runner and build configuration, package manifests, and lockfiles: a fix may not change how the
-// build or the runner behaves.
-const DENY_NAMES = new Set([
-  "package.json", "package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "pnpm-workspace.yaml",
-  "bun.lock", "bun.lockb", "bunfig.toml",
-  "pom.xml", "build.xml", "ivy.xml", "build.sbt",
-  "build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts",
-  "gradle.properties", "gradle.lockfile", "gradlew", "gradlew.bat", "mvnw", "mvnw.cmd", "mvnwDebug",
-  "angular.json", "turbo.json", "nx.json", "lerna.json", "workspace.json", "project.json",
-]);
+// Non-adapter build systems and unrelated app-framework manifests.
+const UNIVERSAL_DENY_NAMES = ["build.xml", "ivy.xml", "build.sbt", "angular.json"];
 
-// A file name (lower-cased) the fixed deny list claims.
-const DENY_BASENAMES = [
-  /^tsconfig.*\.json$/,
+// Universal environment, auth, unrelated test/app config, snapshot, and image patterns.
+const UNIVERSAL_DENY_BASENAMES = [
   /^\.env.*/,
   /auth.*\.json$/,
-  /^\.(?:mocharc|babelrc|swcrc|npmrc|yarnrc|pnpmrc|nvmrc).*/,
-  /^(?:playwright|vitest|jest|cypress|karma|ava|mocha|webpack|vite|rollup|esbuild|tsup|next|nuxt|svelte|babel)\.config\.[^.]+$/,
+  /^\.mocharc.*/,
+  /^(?:vitest|jest|cypress|karma|ava|mocha|next|nuxt|svelte)\.config\.[^.]+$/,
   /\.snap$/,
   /\.(?:png|jpe?g|gif|webp|svg|bmp|ico|tiff?|avif)$/,
+];
+
+// Compose universal policy with all registered stack and runner protected files.
+const PROTECTED_FILES = [...STACK_PROTECTED_FILES, ...RUNNER_PROTECTED_FILES];
+const DENY_NAMES = new Set([
+  ...UNIVERSAL_DENY_NAMES,
+  ...PROTECTED_FILES.flatMap((entry) => entry.names).map((name) => name.toLowerCase()),
+]);
+const DENY_BASENAMES = [
+  ...UNIVERSAL_DENY_BASENAMES,
+  ...PROTECTED_FILES.flatMap((entry) => entry.basenames),
 ];
 
 /**
@@ -116,34 +114,36 @@ export function scopeRefusals({ repo, modulePaths, edits }) {
   const refusals = [];
   for (const edit of edits) {
     const path = normalizePath(edit.path);
-    if (path === null || !roots.some((root) => under(path, root))) {
-      refusals.push({ code: "out_of_scope", path: String(edit.path), message: "The path is outside `module_paths`." });
+    if (path === null || !roots.some((root) => within(path, root))) {
+      refusals.push({ code: "out_of_scope", path: String(edit.path), outside: "module_paths" });
       continue;
     }
-    const real = resolveReal(repo, path);
+    const real = resolveRealPath(repo, path);
     if ("error" in real) {
-      refusals.push({ code: "realpath_escape", path, message: `The path does not resolve inside the repository: ${real.error}.` });
+      refusals.push({ code: "realpath_escape", path, detail: real.error });
       continue;
     }
     const repoReal = realpathSync(repo);
-    const insideRepo = under(real.real, repoReal) || real.real === repoReal;
+    const insideRepo = isContained(repoReal, real.real);
     const rootReals = roots.flatMap((root) => {
-      const resolved = resolveReal(repo, root);
+      const resolved = resolveRealPath(repo, root);
       return "error" in resolved ? [] : [resolved.real];
     });
-    if (!insideRepo || !rootReals.some((root) => under(real.real, root) || real.real === root)) {
-      refusals.push({ code: "realpath_escape", path, message: "The path resolves outside `module_paths` through a symlink." });
+    if (!insideRepo || !rootReals.some((root) => isContained(root, real.real))) {
+      refusals.push({ code: "realpath_escape", path, outside: "module_paths", via: "symlink" });
       continue;
     }
-    const denied = denyReason(path);
-    if (denied) refusals.push({ code: "denied_path", path, message: `The fixed deny list covers ${denied}.` });
+    const realRel = relative(repoReal, real.real).split(sep).join("/");
+    const denied = denyReason(path) ?? (realRel ? denyReason(realRel) : null);
+    if (denied) refusals.push({ code: "denied_path", path, ...denied });
   }
   return refusals;
 }
 
 /**
  * The identity guard: each test function that existed still exists with the same keys, Key
- * prefixes and parameterised flag. New functions are allowed (code gen adds them).
+ * prefixes, enclosing package and class tracker keys, with no duplicate `(class,
+ * name)` collisions. New functions are allowed (code gen adds them).
  * @param {{
  *   annotationMap?: Record<string, readonly string[]> | null,
  *   adapter: StackAdapter | null,
@@ -156,48 +156,61 @@ export function identityRefusals({ annotationMap, adapter, patterns, edits }) {
   if (!adapter) return [];
   /** @type {GuardRefusal[]} */
   const refusals = [];
+  /** @param {readonly import("./code-index.mjs").IndexedFunction[]} list */
+  const groupByKey = (list) => {
+    /** @type {Map<string, import("./code-index.mjs").IndexedFunction[]>} */
+    const groups = new Map();
+    for (const f of list) {
+      const key = `${f.class}\0${f.name}`;
+      const entries = groups.get(key);
+      if (entries) entries.push(f);
+      else groups.set(key, [f]);
+    }
+    return groups;
+  };
   for (const edit of edits) {
     const before = indexSource(edit.before ?? "", edit.path, annotationMap, adapter, patterns);
     const after = indexSource(edit.after ?? "", edit.path, annotationMap, adapter, patterns);
-    const now = new Map(after.functions.map((f) => [`${f.class}\0${f.name}`, f]));
+    if (before.functions.length > 0 && before.package !== after.package) {
+      refusals.push({ code: "identity_changed", path: edit.path, fn: edit.path, what: "package" });
+    }
+    const afterClasses = new Map(after.classes.map((c) => [c.path, c]));
+    for (const wasClass of before.classes) {
+      const isClass = afterClasses.get(wasClass.path);
+      if ((wasClass.trackerKeys.length > 0 && (!isClass || !sameKeys(wasClass.trackerKeys, isClass.trackerKeys)))
+        || (isClass && wasClass.trackerKeys.length === 0 && isClass.trackerKeys.length > 0)) {
+        refusals.push({ code: "identity_changed", path: edit.path, fn: wasClass.path, what: "trackerKeys" });
+      }
+    }
+    const beforeGroups = groupByKey(before.functions);
+    const afterGroups = groupByKey(after.functions);
+    /** @type {Set<string>} */
+    const seenDuplicates = new Set();
     for (const was of before.functions) {
       const key = `${was.class}\0${was.name}`;
-      const is = now.get(key);
-      if (!is) {
-        refusals.push({ code: "identity_changed", path: edit.path, what: "name", message: `The test function \`${was.name}\` is gone.` });
+      const isList = afterGroups.get(key) ?? [];
+      if (isList.length === 0) {
+        refusals.push({ code: "identity_changed", path: edit.path, fn: was.name, what: "name" });
         continue;
       }
-      for (const field of /** @type {const} */ (["automationKeys", "trackerKeys"])) {
-        if (!sameKeys(was[field], is[field])) refusals.push({ code: "identity_changed", path: edit.path, what: field, message: `The test function \`${was.name}\` changed its ${field}.` });
-      }
-      if (was.parameterised !== is.parameterised) refusals.push({ code: "identity_changed", path: edit.path, what: "parameterised", message: `The test function \`${was.name}\` changed whether it is parameterised.` });
-      if (!sameList(prefixesOf(before, was), prefixesOf(after, is))) refusals.push({ code: "identity_changed", path: edit.path, what: "keyPrefixes", message: `The test function \`${was.name}\` changed its Key prefix.` });
-    }
-  }
-  return refusals;
-}
-
-/**
- * The token guard: a line the edit adds holds no never token of the stack.
- * @param {{ adapter: StackAdapter | null, edits: readonly GuardEdit[] }} input
- * @returns {GuardRefusal[]}
- */
-export function tokenRefusals({ adapter, edits }) {
-  const guard = adapter?.guard;
-  if (!guard) return [];
-  /** @type {GuardRefusal[]} */
-  const refusals = [];
-  for (const edit of edits) {
-    const seen = new Set();
-    for (const line of addedLines(edit.before ?? "", edit.after ?? "")) {
-      if (isComment(line)) continue;
-      for (const token of guard.never) {
-        if (seen.has(token.id)) continue;
-        const match = line.match(token.pattern);
-        if (match) {
-          seen.add(token.id);
-          refusals.push({ code: "forbidden_token", path: edit.path, token: token.id, message: `The edit adds a ${token.id} token: \`${match[0].trim()}\`.` });
+      if (isList.length > 1) {
+        if (!seenDuplicates.has(key)) {
+          seenDuplicates.add(key);
+          refusals.push({ code: "identity_changed", path: edit.path, fn: was.name, what: "duplicate" });
         }
+        continue;
+      }
+      const is = isList[0];
+      for (const field of /** @type {const} */ (["automationKeys", "trackerKeys"])) {
+        if (!sameKeys(was[field], is[field])) refusals.push({ code: "identity_changed", path: edit.path, fn: was.name, what: field });
+      }
+      if (was.parameterised !== is.parameterised) refusals.push({ code: "identity_changed", path: edit.path, fn: was.name, what: "parameterised" });
+      if (!sameList(prefixesOf(before, was), prefixesOf(after, is))) refusals.push({ code: "identity_changed", path: edit.path, fn: was.name, what: "keyPrefixes" });
+    }
+    for (const [key, isList] of afterGroups) {
+      if (isList.length > 1 && !beforeGroups.has(key) && !seenDuplicates.has(key)) {
+        seenDuplicates.add(key);
+        refusals.push({ code: "identity_changed", path: edit.path, fn: isList[0].name, what: "duplicate" });
       }
     }
   }
@@ -205,20 +218,7 @@ export function tokenRefusals({ adapter, edits }) {
 }
 
 /**
- * How many assertions the edited files held before and after.
- * @param {{ adapter: StackAdapter | null, edits: readonly GuardEdit[] }} input
- * @returns {AssertionChange}
- */
-export function assertionChange({ adapter, edits }) {
-  const count = adapter?.guard?.assertions;
-  if (!count) return { before: 0, after: 0, net: 0 };
-  const before = edits.reduce((n, edit) => n + (edit.before === null ? 0 : count(edit.before)), 0);
-  const after = edits.reduce((n, edit) => n + (edit.after === null ? 0 : count(edit.after)), 0);
-  return { before, after, net: after - before };
-}
-
-/**
- * Every guard, over the touched paths: scope, identity, tokens and assertion count.
+ * Every guard, over the touched paths: scope and identity.
  * @param {GuardInput} input
  * @returns {GuardResult}
  */
@@ -229,16 +229,11 @@ export function checkEdits(input) {
   const usable = input.edits.filter((edit) => !refusedAt.has(edit.path));
   /** @type {GuardRefusal[]} */
   const refusals = [...scope];
-  if (usable.length && !input.adapter) refusals.push({ code: "no_adapter", message: "The project's stack loaded no code adapter to read the edited tests with." });
+  if (usable.length && !input.adapter) refusals.push({ code: "no_adapter" });
   if (input.adapter) {
     refusals.push(...identityRefusals({ ...input, edits: usable }));
-    refusals.push(...tokenRefusals({ ...input, edits: usable }));
   }
-  const assertions = assertionChange({ adapter: input.adapter, edits: usable });
-  if (assertions.net < 0 && !input.assertionsReduced) {
-    refusals.push({ code: "assertions_reduced", net: assertions.net, message: `The edit removes ${-assertions.net} assertion(s) with no reason.` });
-  }
-  return { ok: refusals.length === 0, refusals, assertions, files: usable.map((edit) => edit.path) };
+  return { ok: refusals.length === 0, refusals, files: usable.map((edit) => edit.path) };
 }
 
 // A repository-relative POSIX path, or null when it is absolute or climbs out of the repository.
@@ -247,89 +242,29 @@ export function checkEdits(input) {
  * @returns {string | null}
  */
 function normalizePath(value) {
+  if (!isSafeRelativePath(String(value))) return null;
   const path = posix.normalize(String(value).replace(/\\/g, "/")).replace(/\/+$/, "");
-  if (!path || path === "." || path === ".." || posix.isAbsolute(path) || path.startsWith("../")) return null;
+  // `isSafeRelativePath` already refused every `..` segment and absolute or drive path.
+  if (!path || path === ".") return null;
   return path;
 }
 
-/** @param {string} path @param {string} root */
-const under = (path, root) => root === "." || path === root || path.startsWith(`${root}/`);
-
 /**
- * The real path of `rel`, resolving symlinks in every existing component and keeping the missing
- * tail. A dangling or unreadable symlink is an error: nothing behind it can be trusted.
- * @param {string} repo
- * @param {string} rel
- * @returns {{ real: string } | { error: string }}
- */
-function resolveReal(repo, rel) {
-  const abs = resolve(repo, rel);
-  /** @type {string[]} */
-  const tail = [];
-  let probe = abs;
-  for (;;) {
-    try {
-      return { real: join(realpathSync(probe), ...tail) };
-    } catch (e) {
-      const code = /** @type {NodeJS.ErrnoException} */ (e).code ?? "unresolvable";
-      if (code !== "ENOENT") return { error: code };
-      try {
-        if (lstatSync(probe).isSymbolicLink()) return { error: "dangling_symlink" };
-      } catch {
-        // Not present either: keep walking to the deepest existing ancestor.
-      }
-      const parent = dirname(probe);
-      if (parent === probe) return { error: "unresolvable" };
-      tail.unshift(basename(probe));
-      probe = parent;
-    }
-  }
-}
-
-/**
- * The deny-list reason for a repo-relative path, or null.
+ * The deny-list match for a repo-relative path, or null.
  * @param {string} path
- * @returns {string | null}
+ * @returns {{ kind: "directory" | "file" | "pattern", denied: string } | null}
  */
-function denyReason(path) {
+export function denyReason(path) {
   const parts = path.split("/");
   const name = /** @type {string} */ (parts.pop()).toLowerCase();
   for (const part of parts) {
     const dir = part.toLowerCase();
-    if (DENY_DIRS.has(dir)) return `the \`${part}\` directory`;
+    if (DENY_DIRS.has(dir)) return { kind: "directory", denied: part };
   }
-  if (DENY_DIRS.has(name)) return `the \`${name}\` directory`;
-  if (DENY_NAMES.has(name) || name.endsWith(".lock")) return `\`${name}\``;
-  for (const pattern of DENY_BASENAMES) if (pattern.test(name)) return `\`${name}\``;
+  if (DENY_DIRS.has(name)) return { kind: "directory", denied: name };
+  if (DENY_NAMES.has(name) || name.endsWith(".lock")) return { kind: "file", denied: name };
+  for (const pattern of DENY_BASENAMES) if (pattern.test(name)) return { kind: "pattern", denied: name };
   return null;
-}
-
-/**
- * The lines `after` adds over `before`, as a multiset difference: a line that already occurred in
- * `before` is not added again. A moved or modified line counts as added, which only makes the scan
- * stricter.
- * @param {string} before
- * @param {string} after
- * @returns {string[]}
- */
-function addedLines(before, after) {
-  /** @type {Map<string, number>} */
-  const counts = new Map();
-  for (const line of before.split("\n")) counts.set(line, (counts.get(line) ?? 0) + 1);
-  /** @type {string[]} */
-  const added = [];
-  for (const line of after.split("\n")) {
-    const left = counts.get(line) ?? 0;
-    if (left > 0) counts.set(line, left - 1);
-    else added.push(line);
-  }
-  return added;
-}
-
-/** @param {string} line */
-function isComment(line) {
-  const text = line.trim();
-  return text === "" || text.startsWith("//") || text.startsWith("/*") || text.startsWith("*") || text.startsWith("#");
 }
 
 /**

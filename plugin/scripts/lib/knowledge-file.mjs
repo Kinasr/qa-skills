@@ -19,6 +19,7 @@
  * @import { CaseSectionKind } from "./case-sections.mjs"
  * @import { MintRecipe } from "./keys.mjs"
  * @import { MarkdownElement, MarkdownFenceElement, MarkdownHeadingElement, MarkdownItemElement } from "./markdown.mjs"
+ * @import { RunnerTool } from "./runners/descriptors.mjs"
  * @import { TrainEntryDescriptor } from "./schema.mjs"
  */
 import { posix } from "node:path";
@@ -29,7 +30,7 @@ import { isMap, parseYaml } from "./dialect.mjs";
 import { automationKeyPattern, compileKeyPattern, parseMintRecipe } from "./keys.mjs";
 import { keyedHeading, splitFile } from "./markdown.mjs";
 import { block, line, role, token } from "./render.mjs";
-import { GRADLE_DEFAULT_TASK } from "./runners/gradle.mjs";
+import { defaultRunnerConfig } from "./runners/descriptors.mjs";
 import { FIELD_RENDER, isCommitMode, isSchemaVersion, KNOWN, TRAIN_ENTRIES, trainEntry } from "./schema.mjs";
 
 export { checkFile, checkExecution } from "./check-file.mjs";
@@ -278,7 +279,7 @@ export const RULE_FIELDS = ["Waived", "Depends on"];
 /**
  * Built-in runner parameters. Launcher defaults depend on wrappers on disk and are resolved by
  * the runner, not the text parser. Optional arrays remain absent when not declared.
- * @typedef {{ tool: "playwright" | "gradle" | "maven", dir: string, launcher?: string[], task?: string, args?: string[], target_env: string[] }} TestRunner
+ * @typedef {{ tool: RunnerTool, dir: string, launcher?: string[], task?: string, args?: string[], target_env: string[] }} TestRunner
  */
 
 /**
@@ -815,7 +816,10 @@ function setKeys(lines, sets, order) {
     const add = text === null ? [] : text.split("\n");
     if (at) {
       let end = at;
-      while (end < out.length && /^\s+\S/.test(out[end])) end++;
+      for (let probe = at; probe < out.length; probe++) {
+        if (/^\s+\S/.test(out[probe])) end = probe + 1;
+        else if (!/^\s*$/.test(out[probe])) break;
+      }
       out = [...out.slice(0, at - 1), ...add, ...out.slice(end)];
       continue;
     }
@@ -871,7 +875,7 @@ export function projectConfig(project) {
     // no restriction; `[]` when `observe:` is off, as it is while the value is not a list.
     allowedHosts: isMap(d.scout) && d.scout.allowed_hosts !== undefined ? list(d.scout.allowed_hosts).map((h) => h.toLowerCase()) : null,
     modulePaths: list(d.module_paths),
-    test_runner: isMap(d.test_runner) ? /** @type {TestRunner} */ ({ ...d.test_runner, dir: d.test_runner.dir ?? ".", ...(d.test_runner.tool === "gradle" && { task: d.test_runner.task ?? GRADLE_DEFAULT_TASK }) }) : undefined,
+    test_runner: isMap(d.test_runner) ? /** @type {TestRunner} */ (defaultRunnerConfig(d.test_runner)) : undefined,
     code_host: isMap(d.code_host) ? /** @type {CodeHost} */ (d.code_host) : undefined,
     bug_publish: hasBugPublishTracker(project) ? /** @type {BugPublishConfig} */ ({ issue_type: tracker.bug_type, link_type: tracker.bug_link_type, direction: tracker.bug_link_direction, fields: d.bug_fields ?? [] }) : undefined,
     stack: isMap(d.stack) ? /** @type {{ language: string, framework: string, root: string }} */ ({ language: d.stack.language, framework: d.stack.framework, root: d.stack.root ?? "." }) : null,

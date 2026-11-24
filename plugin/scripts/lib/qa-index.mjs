@@ -2,11 +2,14 @@
 // Reads the working tree's `.qa/` into parsed files (lib/knowledge-file.mjs, the filesystem adapter
 // of its `parseTree`) and builds the Key index (ADR-0004): Key → the file and line that declares
 // it. Nothing is stored; every scan rebuilds it.
-/** @import { ParsedEntry, ParsedFile, ProjectConfig, UnreadableFile } from "./knowledge-file.mjs" */
+/** @import { CaseEntry, ParsedEntry, ParsedFile, ProjectConfig, UnreadableFile } from "./knowledge-file.mjs" */
 /** @import { TrackerIndex, TrackerResolver } from "./tracker-resolver.mjs" */
-import { existsSync, lstatSync, realpathSync, readdirSync, readFileSync } from "node:fs";
+import { lstatSync, readdirSync, readFileSync } from "node:fs";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
+import { listOf } from "./dialect.mjs";
+import { readTrackerReference } from "./keys.mjs";
 import { parse, parseTree, projectConfig } from "./knowledge-file.mjs";
+import { resolvesInside } from "./paths.mjs";
 import { canonicalTrainKey } from "./schema.mjs";
 import { buildTrackerResolver } from "./tracker-resolver.mjs";
 
@@ -143,8 +146,25 @@ import { buildTrackerResolver } from "./tracker-resolver.mjs";
  */
 export const qaRel = (root, path) => relative(root, path).split(sep).join("/");
 
-// Every `.md` file under `root`, relative and `/`-separated, in a stable order. Unreadable
-// directories are skipped, not fatal.
+/**
+ * Whether `err` represents a genuinely absent filesystem entry (`ENOENT` on both access and
+ * `lstatSync`, so broken symlinks fail closed instead of looking missing).
+ * @param {unknown} err
+ * @param {string} path
+ * @returns {boolean}
+ */
+function isMissingEntry(err, path) {
+  if (/** @type {NodeJS.ErrnoException} */ (err).code !== "ENOENT") return false;
+  try {
+    lstatSync(path);
+    return false;
+  } catch (statErr) {
+    return /** @type {NodeJS.ErrnoException} */ (statErr).code === "ENOENT";
+  }
+}
+
+// Every `.md` file under `root`, relative and `/`-separated, in a stable order. Fails closed when
+// `root` or any subdirectory cannot be read; returns `[]` only when `root` itself does not exist.
 /**
  * @param {string} root
  * @returns {string[]}
@@ -161,8 +181,9 @@ export function listQaFiles(root) {
     let entries;
     try {
       entries = readdirSync(dir, { withFileTypes: true });
-    } catch {
-      return;
+    } catch (e) {
+      if (dir === root && isMissingEntry(e, dir)) return;
+      throw e;
     }
     for (const e of entries) {
       const abs = join(dir, e.name);
@@ -229,30 +250,43 @@ export function locate(path, { root } = {}) {
     project = projectAt(dir);
     if (project || root !== undefined || dirname(dir) === dir) break;
   }
-  return { root: qa, rel: qaRel(qa, abs), config: { ...projectConfig(project), pathInsideRepo: (path) => pathInsideRepo(dirname(qa), path) } };
+  return { root: qa, rel: qaRel(qa, abs), config: { ...projectConfig(project), pathInsideRepo: (path) => resolvesInside(dirname(qa), path) } };
 }
 
 // The configuration a writer checks a file under before it lands: `root`'s own `project.md`.
 /**
  * @param {string} root
- * @returns {ProjectConfig}
+ * @returns {ProjectConfig & { declaredSchemaVersion?: unknown }}
  */
-export const rootConfig = (root) => projectConfig(projectAt(resolve(root)));
+export const rootConfig = (root) => {
+  const qa = resolve(root);
+  const project = projectAt(qa);
+  const config = projectConfig(project);
+  return {
+    ...config,
+    pathInsideRepo: (path) => resolvesInside(dirname(qa), path),
+    ...(config.schemaVersion === null && { declaredSchemaVersion: project?.data?.schema_version }),
+  };
+};
 
-// `dir/project.md`, parsed, when it exists, reads and declares `type: project`; else null.
+// `dir/project.md`, parsed, when it exists and declares `type: project`; null when absent or not
+// a project file. Non-`ENOENT` read errors (and broken symlinks) fail closed instead of defaulting.
 /**
  * @param {string} dir
  * @returns {ParsedFile | null}
  */
 function projectAt(dir) {
   const path = join(dir, "project.md");
-  if (!existsSync(path)) return null;
+  /** @type {string} */
+  let text;
   try {
-    const f = parse("project.md", readFileSync(path, "utf8"));
-    return f.type === "project" ? f : null;
-  } catch {
-    return null;
+    text = readFileSync(path, "utf8");
+  } catch (e) {
+    if (isMissingEntry(e, path)) return null;
+    throw e;
   }
+  const f = parse("project.md", text);
+  return f.type === "project" ? f : null;
 }
 
 // The Key index over parsed files. Each map is Key → every declaration of it, in file order, so a
@@ -334,22 +368,148 @@ export function buildIndex(files) {
 }
 
 /**
- * Resolve existing ancestors too, so a future child under an escaping symlink is refused.
- * @param {string} repo
- * @param {string} path
- * @returns {boolean}
+ * @typedef {{
+ *   kind: string,
+ *   key: string,
+ *   feature?: string | null,
+ *   scenario?: string | null,
+ *   file: ParsedFile,
+ *   entry?: ParsedEntry | null,
+ *   line: number,
+ * }} ScopeDeclaration
  */
-function pathInsideRepo(repo, path) {
-  let ancestor = resolve(repo, path);
-  try {
-    while (true) {
-      try { lstatSync(ancestor); break; }
-      catch (error) {
-        if (/** @type {NodeJS.ErrnoException} */ (error).code !== "ENOENT" || dirname(ancestor) === ancestor) return false;
-        ancestor = dirname(ancestor);
+
+/**
+ * @typedef {{
+ *   kind: "case",
+ *   key: string,
+ *   feature: string | null,
+ *   scenario: string | null,
+ *   file: ParsedFile,
+ *   entry: CaseEntry,
+ *   line: number,
+ * }} ScopeCase
+ */
+
+/**
+ * @typedef {{
+ *   retired: Map<string, string>,
+ *   declarations: ScopeDeclaration[],
+ *   cases: ScopeCase[],
+ *   casesFor: (d: { kind: string, key: string, feature?: string | null }) => ScopeCase[],
+ *   liveFeature: (key: string) => boolean,
+ * }} ScopeState
+ */
+
+/**
+ * @typedef {{ ok: true, cases: ScopeCase[], alias?: string }
+ *   | { ok: false, code: "ambiguous_key" | "retired_key" | "unknown_key", key: string, feature?: string }} ScopeResolveResult
+ */
+
+/**
+ * @param {unknown} value
+ * @returns {string[]}
+ */
+const strings = (value) => Array.isArray(value) ? /** @type {string[]} */ (value.filter((v) => typeof v === "string")) : [];
+
+/**
+ * Build the live scope index state (declarations, live cases, and retired-key index) from `index`.
+ * @param {KeyIndex} index
+ * @returns {ScopeState}
+ */
+export function buildScopeState(index) {
+  const retired = new Map(strings(index.project?.data.retired_features).map((key) => [key, "retired_features"]));
+  for (const [key, declarations] of index.features) {
+    for (const { file } of declarations) {
+      for (const token of strings(file.data.retired)) {
+        retired.set(readTrackerReference(token) ?? token, key);
       }
     }
-    const rel = relative(realpathSync(repo), realpathSync(ancestor));
-    return rel !== ".." && !rel.startsWith(`..${sep}`);
-  } catch { return false; } // A dangling symlink cannot certify containment.
+  }
+  const liveFeature = (/** @type {string} */ key) => !retired.has(key);
+  const live = (/** @type {ScopeDeclaration} */ d) => liveFeature(d.feature ?? d.key) && !retired.has(d.key) && (!d.scenario || !retired.has(d.scenario));
+  /** @type {Array<[string, Map<string, ReadonlyArray<{ file: ParsedFile, line: number }>>]>} */
+  const maps = [["feature", index.features], ["suite", index.suites], ["scenario", index.scenarios], ["case", index.cases]];
+  /** @type {ScopeDeclaration[]} */
+  const allDeclarations = [];
+  for (const [kind, map] of maps) {
+    for (const [key, entries] of map) {
+      for (const { file, line } of entries) {
+        const entry = kind === "case" ? (file.cases.find((c) => c.key === key && c.line === line) ?? file.cases.find((c) => c.key === key) ?? null) : null;
+        const scenario = (kind === "scenario" || kind === "case") && typeof file.data.key === "string" ? file.data.key : null;
+        allDeclarations.push({ kind, key, feature: index.featureOf(file), scenario, file, entry, line: entry?.line ?? line });
+      }
+    }
+  }
+  const declarations = allDeclarations.filter(live);
+  const cases = /** @type {ScopeCase[]} */ (declarations.filter((d) => d.kind === "case" && d.entry != null));
+  /**
+   * @param {{ kind: string, key: string, feature?: string | null }} d
+   * @returns {ScopeCase[]}
+   */
+  const casesFor = (d) => cases.filter((c) => d.kind === "case" ? c.key === d.key : d.kind === "scenario" ? c.scenario === d.key : c.feature === (d.feature ?? d.key));
+  return { retired, declarations, cases, casesFor, liveFeature };
+}
+
+/**
+ * Resolve a scope token (Feature, Suite, Scenario, Test Case, Tracker key, `mirror.suite`,
+ * retired key, or `formerly` alias) against `index` and `state`.
+ * @param {string} token
+ * @param {KeyIndex} index
+ * @param {ScopeState} state
+ * @returns {ScopeResolveResult}
+ */
+export function resolveScopeToken(token, index, state) {
+  /**
+   * @param {ScopeDeclaration[]} found
+   * @param {boolean} [former]
+   * @returns {ScopeResolveResult | null}
+   */
+  const resolveMatches = (found, former = false) => {
+    if (found.length > 1) return { ok: false, code: "ambiguous_key", key: token };
+    if (!found.length) return null;
+    return { ok: true, cases: state.casesFor(found[0]), ...(former && { alias: `${token} → ${found[0].key}` }) };
+  };
+  const direct = resolveMatches(state.declarations.filter((d) => d.key === token));
+  if (direct) return direct;
+  const tracker = index.tracker.resolve(token);
+  if (tracker.status === "ambiguous") return { ok: false, code: "ambiguous_key", key: token };
+  if (tracker.status === "retired") return { ok: false, code: "retired_key", key: token, feature: state.retired.get(token) ?? "retired_features" };
+  if (tracker.status === "unique") {
+    if (!tracker.entry.feature || state.retired.has(tracker.entry.key) || !state.liveFeature(tracker.entry.feature)) {
+      return { ok: false, code: "retired_key", key: token, feature: state.retired.get(tracker.entry.key) ?? "retired_features" };
+    }
+    return { ok: true, cases: state.casesFor(tracker.entry) };
+  }
+  if (tracker.status === "absent") {
+    const suite = resolveMatches(state.declarations.filter((d) => {
+      const mirror = d.file.data.mirror;
+      return d.kind === "feature" && typeof mirror === "object" && mirror !== null && /** @type {{ suite?: unknown }} */ (mirror).suite === token;
+    }));
+    if (suite) return suite;
+  }
+  const retiredFeature = state.retired.get(token);
+  if (retiredFeature !== undefined) return { ok: false, code: "retired_key", key: token, feature: retiredFeature };
+  const former = resolveMatches(state.declarations.filter((d) => d.kind !== "suite" && strings((d.entry ?? d.file).data.formerly).includes(token)), true);
+  return former ?? { ok: false, code: "unknown_key", key: token };
+}
+
+/**
+ * The index shape holding cases for rule coverage lookups.
+ * @typedef {{
+ *   cases: ReadonlyMap<string, CaseDecl[]>,
+ *   [key: string]: unknown,
+ * }} RuleCoverageIndex
+ */
+
+/**
+ * Inverse `covers` lookup: every Test Case declaration in `feature` whose `covers` list names `rule`.
+ * @param {RuleCoverageIndex} index
+ * @param {string} feature
+ * @param {string} rule
+ * @returns {CaseDecl[]}
+ */
+export function casesCoveringRule(index, feature, rule) {
+  return [...index.cases.values()].map((d) => d[0]).filter((d) => d.feature === feature)
+    .filter((c) => listOf(c.entry.data.covers).includes(rule));
 }

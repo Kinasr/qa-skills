@@ -2,11 +2,12 @@
 // Local git for the PR plumbing: reads needed to decide a mode and a base, and the one write that
 // builds an item's commit on a temporary index. Nothing here switches the checkout, stages in the
 // engineer's index, or reaches the network.
-import { spawnSync } from "node:child_process";
-import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { UsageError } from "./cli.mjs";
+import { runGitBuffer } from "./git.mjs";
+import { isContained, isSafeRelativePath, within } from "./paths.mjs";
 
 // A file as git would store it: its mode and the id of its blob, which is written to the object
 // database when the file is read, so its bytes are read back with `fileBytes` and never held here.
@@ -23,9 +24,9 @@ import { UsageError } from "./cli.mjs";
  * @returns {import("node:child_process").SpawnSyncReturns<Buffer>}
  */
 export function prGit(repo, args, { input, index } = {}) {
-  return spawnSync("git", ["-C", repo, "--literal-pathspecs", "--no-optional-locks", ...args], {
+  return runGitBuffer(repo, ["--literal-pathspecs", "--no-optional-locks", ...args], {
     input,
-    env: { ...process.env, ...(index && { GIT_INDEX_FILE: index }) },
+    env: index ? { GIT_INDEX_FILE: index } : {},
     maxBuffer: 1 << 28,
   });
 }
@@ -98,6 +99,38 @@ function parseStagedModes(output) {
 /** @param {string | undefined} staged @returns {string} */
 const regularMode = (staged) => (staged === "100644" || staged === "100755" ? staged : "100644");
 
+/** @param {string} dir @returns {boolean} */
+const isRelativeParent = (dir) => (
+  dir !== "." && dir !== "" && isSafeRelativePath(dir)
+);
+
+/**
+ * Whether every directory prefix of `path` is an existing real directory (not missing, a file, or a symlink).
+ * @param {string} repo
+ * @param {string} path
+ * @param {Map<string, boolean>} cache
+ * @returns {boolean}
+ */
+function hasRealDirectoryAncestors(repo, path, cache) {
+  /** @type {string[]} */
+  const ancestors = [];
+  for (let d = dirname(path); isRelativeParent(d); d = dirname(d)) {
+    const cached = cache.get(d);
+    if (cached !== undefined) {
+      if (!cached) return false;
+      break;
+    }
+    ancestors.push(d);
+  }
+  for (let i = ancestors.length - 1; i >= 0; i--) {
+    const d = ancestors[i];
+    const ok = Boolean(statOf(repo, d)?.isDirectory());
+    cache.set(d, ok);
+    if (!ok) return false;
+  }
+  return true;
+}
+
 // The working tree's tracked and untracked files, excluding what git ignores, by path. Snapshotting
 // all of them is what lets `done` notice an edit outside module_paths and refuse it. Each file is
 // hashed into the object database by one batched `git hash-object` call, so a snapshot holds blob
@@ -112,7 +145,10 @@ export function snapshotPrTree(repo) {
   const tree = {};
   /** @type {{ name: string, mode: string }[]} */
   const batch = [];
+  /** @type {Map<string, boolean>} */
+  const dirCache = new Map();
   for (const name of new Set(names.split("\0").filter(Boolean))) {
+    if (!hasRealDirectoryAncestors(repo, name, dirCache)) continue;
     const stat = statOf(repo, name);
     if (!stat) continue;
     // `--stdin-paths` reads one path per line, drops a trailing carriage return and unquotes a line
@@ -136,7 +172,8 @@ function statOf(repo, path) {
   try {
     return lstatSync(join(repo, path));
   } catch (e) {
-    if (/** @type {NodeJS.ErrnoException} */ (e).code === "ENOENT") return null;
+    const code = /** @type {NodeJS.ErrnoException} */ (e).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return null;
     throw e;
   }
 }
@@ -355,6 +392,132 @@ export function writeTreeFile(repo, path, file) {
   if (!isFilemodeFalse(repo)) chmodSync(target, file.mode === "100755" ? 0o755 : 0o644);
 }
 
+/** @param {string} p @returns {number} */
+const pathDepth = (p) => p.split("/").length;
+
+/** @param {string} a @param {string} b @returns {number} */
+const shallowFirst = (a, b) => pathDepth(a) - pathDepth(b) || a.length - b.length || a.localeCompare(b);
+
+/** @param {string} a @param {string} b @returns {number} */
+const deepFirst = (a, b) => shallowFirst(b, a);
+
+/**
+ * Remove empty ancestor directories of `path` inside `repo`, stopping at repo root or non-empty dirs.
+ * @param {string} repo
+ * @param {string} path
+ * @returns {void}
+ */
+function pruneEmptyParents(repo, path) {
+  for (let dir = dirname(path); isRelativeParent(dir); dir = dirname(dir)) {
+    try {
+      rmdirSync(join(repo, dir));
+    } catch (e) {
+      const code = /** @type {NodeJS.ErrnoException} */ (e).code;
+      if (code === "ENOENT" || code === "ENOTEMPTY" || code === "EEXIST" || code === "ENOTDIR") break;
+      throw e;
+    }
+  }
+}
+
+/**
+ * Collect every valid relative ancestor directory of `paths`.
+ * @param {readonly string[]} paths
+ * @returns {string[]}
+ */
+function allAncestorsOf(paths) {
+  /** @type {Set<string>} */
+  const ancestors = new Set();
+  for (const p of paths) {
+    for (let d = dirname(p); isRelativeParent(d); d = dirname(d)) {
+      if (ancestors.has(d)) break;
+      ancestors.add(d);
+    }
+  }
+  return [...ancestors];
+}
+
+/**
+ * Remove `rootDir` only when every descendant entry is a real directory; throw `ENOTEMPTY` before
+ * deleting anything otherwise.
+ * @param {string} rootDir
+ * @returns {void}
+ */
+function pruneEmptySubtree(rootDir) {
+  /** @type {string[]} */
+  const dirs = [rootDir];
+  for (let i = 0; i < dirs.length; i++) {
+    const current = dirs[i];
+    for (const entry of readdirSync(current, { withFileTypes: true })) {
+      if (!entry.isDirectory()) {
+        throw Object.assign(new Error(`Directory not empty: ${rootDir}`), { code: "ENOTEMPTY" });
+      }
+      dirs.push(join(current, entry.name));
+    }
+  }
+  for (let i = dirs.length - 1; i >= 0; i--) {
+    rmdirSync(dirs[i]);
+  }
+}
+
+/**
+ * Restore working-tree files in `repo` to match `target`.
+ * @param {string} repo
+ * @param {Readonly<Record<string, PrFile | null | undefined>>} target
+ * @param {Readonly<Record<string, PrFile | null | undefined>>} [current]
+ * @param {{ paths?: readonly string[] }} [options]
+ * @returns {void}
+ */
+export function restoreTree(repo, target, current, options) {
+  const live = current ?? (options?.paths === undefined ? snapshotPrTree(repo) : {});
+  const candidates = options?.paths !== undefined
+    ? [...new Set(options.paths)]
+    : [...new Set([...Object.keys(target), ...Object.keys(live)])].filter((p) => !sameFile(target[p] ?? null, live[p] ?? null));
+
+  // Phase 1: unlink disk symlinks shallowest-first (including ancestor prefixes) unless unchanged.
+  /** @type {Set<string>} */
+  const unlinkedSymlinks = new Set();
+  for (const p of [...new Set([...candidates, ...allAncestorsOf(candidates)])].sort(shallowFirst)) {
+    if (!statOf(repo, p)?.isSymbolicLink()) continue;
+    const targetFile = target[p] ?? null;
+    if (targetFile?.mode === "120000" && sameFile(workingFile(repo, p), targetFile)) continue;
+    rmSync(join(repo, p), { force: true });
+    unlinkedSymlinks.add(p);
+  }
+
+  // Phase 2: deletions (deepest-first + bounded empty-parent pruning).
+  const deletes = candidates
+    .filter((p) => (target[p] ?? null) === null && (!sameFile(live[p] ?? null, null) || unlinkedSymlinks.has(p) || statOf(repo, p) !== null))
+    .sort(deepFirst);
+  for (const p of deletes) {
+    if (statOf(repo, p) !== null) writeTreeFile(repo, p, null);
+    pruneEmptyParents(repo, p);
+  }
+
+  // Phase 3: restores (regular files shallowest-first before symlinks shallowest-first).
+  const restorePool = options?.paths !== undefined ? candidates : [...new Set([...candidates, ...Object.keys(target)])];
+  /** @type {{ path: string, file: PrFile }[]} */
+  const regularRestores = [];
+  /** @type {{ path: string, file: PrFile }[]} */
+  const symlinkRestores = [];
+  for (const p of restorePool) {
+    const file = target[p] ?? null;
+    if (!file) continue;
+    const needsRestore =
+      !sameFile(live[p] ?? null, file)
+      || unlinkedSymlinks.has(p)
+      || [...unlinkedSymlinks].some((u) => within(p, u))
+      || statOf(repo, p) === null;
+    if (!needsRestore) continue;
+    (file.mode === "120000" ? symlinkRestores : regularRestores).push({ path: p, file });
+  }
+  regularRestores.sort((a, b) => shallowFirst(a.path, b.path));
+  symlinkRestores.sort((a, b) => shallowFirst(a.path, b.path));
+  for (const { path: p, file } of [...regularRestores, ...symlinkRestores]) {
+    if (statOf(repo, p)?.isDirectory()) pruneEmptySubtree(join(repo, p));
+    writeTreeFile(repo, p, file);
+  }
+}
+
 // Whether the path is a symlink whose real target escapes every allowed root.
 /**
  * @param {string} repo
@@ -383,7 +546,7 @@ export function symlinkEscapes(repo, path, roots) {
     } catch {
       base = join(repo, root);
     }
-    return resolved === base || resolved.startsWith(`${base}/`);
+    return isContained(base, resolved);
   });
 }
 

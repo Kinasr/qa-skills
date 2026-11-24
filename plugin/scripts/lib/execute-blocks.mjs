@@ -10,7 +10,7 @@
 //                                            and (when Blocked before dispatch) its reason
 //   <run>/executions/<id>/guard.json         actions used, `at_login`, the sticky `stopped`, the trace
 //   <run>/executions/<id>/tester.report.md   the Tester's result and prose (lib/execution-report.mjs)
-//   <run>/dispatch.json                      (lib/execute-dispatch.mjs `dispatchMarks`) an Execution Blocked
+//   <run>/dispatch.json                      (lib/execute-state.mjs `dispatchMarks`) an Execution Blocked
 //                                            `unreachable` by `next`, or whose retries were spent with no report,
 //                                            or whose Tester was dispatched and returned with no report
 // `guard.stopped` overrides the report: the result is Blocked with that reason, `**Expected.**` goes,
@@ -38,9 +38,8 @@ import { realpathSync } from "node:fs";
 import { readAutomation } from "./execute-automation.mjs";
 import { executionDecision, notRunAutomation } from "./execute-chain.mjs";
 import { scrubRecordText, stripUrlQueries } from "./credentials.mjs";
-import { isPlan, readPlanFile } from "./execute-open.mjs";
 import { checkedReport } from "./execution-report.mjs";
-import { dispatchMarks } from "./execute-dispatch.mjs";
+import { dispatchMarks } from "./execute-state.mjs";
 import { GUARD_STOPS, executionDir, readGuard } from "./execution-guard.mjs";
 import { evidenceBlockLines, isExecutionEvidence } from "./evidence-record.mjs";
 import { AUTOMATION_DIAGNOSTIC_CAP, AUTOMATION_DIAGNOSTICS_MAX, oneLine } from "./schema.mjs";
@@ -48,10 +47,9 @@ import { CREDENTIAL_VARIANTS } from "./tester-request.mjs";
 import { maskCredentialText } from "./header-credential.mjs";
 
 /**
- * @import { ExecuteBlocked, ExecuteExecution, ExecutePlan } from "./execute.mjs"
+ * @import { ExecuteBlocked, ExecuteExecution, ExecutePlan } from "./execute-plan.mjs"
  * @import { ExecutionEvidence, ExecutionGuard, ExecutionGuardStop } from "./execution-guard.mjs"
- * @import { DispatchMark } from "./execute-dispatch.mjs"
- * @import { CandidatePlan } from "./execute-open.mjs"
+ * @import { DispatchMark } from "./execute-state.mjs"
  * @import { CheckedReportResult } from "./execute-dispatch.mjs"
  * @import { AutomationResult } from "./test-runner.mjs"
  */
@@ -136,16 +134,6 @@ const STOP_WHY = {
   "no-access": () => "The app sent the browser to a sign-in page on another origin, so the account had no access.",
   "connection-lost": () => "The browser or the application was lost, so the Execution was stopped.",
 };
-
-// The Run plan, or null when it is absent, not JSON or not the shape `execute plan` writes.
-/**
- * @param {string} runDir
- * @returns {ExecutePlan | null}
- */
-export function readPlan(runDir) {
-  const read = /** @type {{ error?: string, value?: ExecutePlan }} */ (readPlanFile(runDir));
-  return !read.error && isPlan(/** @type {CandidatePlan} */ (read.value)) ? /** @type {ExecutePlan} */ (read.value) : null;
-}
 
 // `iso` as the local date-time with its UTC offset, the form a record's `executed_at` takes.
 /**

@@ -55,3 +55,16 @@ export function sensitiveLiterals(text) {
 export function redactSensitiveLiterals(text) {
   return text.replace(LITERAL, (match, head, quote, value) => (value === "<redacted>" ? match : `${head}${quote}<redacted>${quote}`));
 }
+
+/**
+ * Whether `line` assigns or passes a non-empty, non-redacted string literal to a sensitive name.
+ * @param {string} line
+ * @returns {boolean}
+ */
+export function hasSensitiveLiteralValue(line) {
+  LITERAL.lastIndex = 0;
+  for (const match of line.matchAll(LITERAL)) {
+    if (match[3].length > 0 && match[3] !== "<redacted>") return true;
+  }
+  return false;
+}

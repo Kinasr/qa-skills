@@ -6,7 +6,7 @@
 // an Execution that was due but never started.
 import { displaySelector } from "./runners/index.mjs";
 /** @import { AutomationResult, AutomationSelection } from "./test-runner.mjs" */
-/** @import { ExecuteExecution } from "./execute.mjs" */
+/** @import { ExecuteExecution } from "./execute-plan.mjs" */
 
 // Worst first.
 /** @type {readonly ["failed", "blocked", "flaky", "passed"]} */

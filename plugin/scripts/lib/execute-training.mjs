@@ -2,9 +2,10 @@
 // Operating knowledge for /qa-execute. The reader takes a parsed train file, like
 // accessNotes; relational checks are shared by scan and the train draft gate.
 import { realpathSync, statSync } from "node:fs";
-import { join, sep } from "node:path";
+import { join } from "node:path";
 import { shownKey } from "./credentials.mjs";
 import { isFixtureName } from "./keys.mjs";
+import { isContained } from "./paths.mjs";
 import { EXECUTE_TRAIN_KEY, TRAIN_ENTRIES } from "./schema.mjs";
 
 /**
@@ -111,7 +112,7 @@ export function fixtureExists(root, name) {
   try {
     const directory = join(realpathSync(root), "fixtures");
     const path = realpathSync(join(directory, name));
-    return path.startsWith(directory + sep) && statSync(path).isFile();
+    return isContained(directory, path, { strict: true }) && statSync(path).isFile();
   } catch {
     return false;
   }

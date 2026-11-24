@@ -3,10 +3,11 @@
 // annotation, read by the source scan of lib/stacks/kotlin.mjs and written as its own line above
 // the function or class, with the import it needs.
 import { existsSync, readFileSync } from "node:fs";
-import { dirname, join, relative, resolve, sep } from "node:path";
+import { dirname, join, posix, relative, resolve, sep } from "node:path";
 import { carrierNames, filesUnder } from "../code-source.mjs";
 import { listFiles } from "../git.mjs";
-import { kotlinAssertionContracts, kotlinAssertionSpans, parseKotlin } from "./kotlin.mjs";
+import { isContained, isSafeRelativePath, resolvesInside, within } from "../paths.mjs";
+import { hasAnnotationClass, kotlinSupportRefs, parseKotlin, parseKotlinHeader } from "./kotlin.mjs";
 import { splice } from "./splice.mjs";
 import { isKotlinJUnit5Stack } from "./descriptors.mjs";
 
@@ -31,9 +32,11 @@ import { isKotlinJUnit5Stack } from "./descriptors.mjs";
  *   name: string,
  *   line: number,
  *   classPath: string,
+ *   classes?: KotlinTestClass[],
  *   carriers: KotlinAnnotation[],
  *   end: number,
  * }} KotlinTestFunction
+ */
 
 /**
  * A parsed Kotlin file: its package declaration, classes and functions.
@@ -247,24 +250,12 @@ import { isKotlinJUnit5Stack } from "./descriptors.mjs";
  *   sep: string,
  *   ownTrackerKeyScopes: boolean,
  *   words: KotlinAdapterWords,
- *   guard: KotlinGuard,
  *   render: (text: string, ops: KotlinRenderOps, carrier: KotlinWriteCarrier) => KotlinRenderResult,
  *   carrierText: (name: string, value: string) => string,
  *   codegen: CodegenAdapter,
  *   needsDeclaration: boolean,
  *   declaration: KotlinDeclaration,
  * }} KotlinAdapter
-
-/**
- * The tokens and assertion counter the shared test-code edit guards use: what a fix may never add,
- * and how many assertions a file holds.
- * @typedef {{
- *   never: readonly { id: string, pattern: RegExp }[],
- *   assertions: (text: string) => number,
- *   assertionAt: (text: string, line: number) => boolean,
- *   contracts: (text: string) => import("../fix-assertions.mjs").AssertionContract[],
- * }} KotlinGuard
- */
 
 /**
  * The stack a project names: its language and its framework.
@@ -311,39 +302,6 @@ export const KOTLIN_JUNIT5 = {
   load: () => ({ adapter: KOTLIN }),
 };
 
-// The assertion callees and matchers counted by `GUARD.assertions` and checked per line by
-// `GUARD.assertionAt`. Kept without the `g` flag so `.test()` stays stateless.
-/** @type {readonly RegExp[]} */
-const ASSERTION_PATTERNS = [
-  /\bassert(?:[A-Z]\w*)?\s*\(/,
-  /\bfail\s*\(/,
-  /\bverify\s*\(/,
-  /\bshould(?:Be|Equal|Contain|Not|Throw|Match)\w*\b/,
-];
-
-// The tokens a fix may never add, in the language this adapter reads. They are matched on added
-// lines only, so an existing disable elsewhere in the file is not a new one.
-/** @type {KotlinGuard} */
-const GUARD = {
-  contracts: kotlinAssertionContracts,
-  never: [
-    { id: "disable", pattern: /@(?:Disabled|Enabled)[A-Za-z]*\b|@Ignore\b/ },
-    { id: "focus", pattern: /@Focus\b/ },
-    { id: "assume", pattern: /\bassume(?:True|False|That)\s*\(|\bAssumptions\s*\./ },
-    { id: "sleep", pattern: /\b(?:Thread\s*\.\s*sleep|sleep|delay)\s*\(/ },
-    { id: "retry", pattern: /\bretry(?:Count|Times|When|Until)?\s*[:=(]/ },
-    { id: "timeout", pattern: /@Timeout\b|\bwithTimeout\s*\(|\btimeout\s*[:=]/ },
-  ],
-  assertions: (text) => {
-    let count = 0;
-    for (const pattern of ASSERTION_PATTERNS) {
-      for (const _ of text.matchAll(new RegExp(pattern.source, "g"))) count++;
-    }
-    return count;
-  },
-  assertionAt: (text, line) => kotlinAssertionSpans(text, ASSERTION_PATTERNS).some((span) => line >= span.start && line <= span.end),
-};
-
 /** @type {KotlinAdapter} */
 const KOTLIN = {
   extensions: [".kt"],
@@ -369,7 +327,6 @@ const KOTLIN = {
     keyCarrierTitle: "Automation-key annotation",
     write: "annotate",
   },
-  guard: GUARD,
   render,
   carrierText: (name, value) => `@${name}("${value}")`,
   codegen: codegenAdapter(),
@@ -437,11 +394,26 @@ function keys(carriers, names) {
  */
 function parse(text) {
   const { package: pkg, classes, functions } = parseKotlin(text);
-  const lines = text.replace(/\r\n/g, "\n").split("\n");
+  /** @type {Map<KotlinClass, KotlinTestClass>} */
+  const classMap = new Map();
+  const mappedClasses = classes.map((raw) => {
+    const { annotations, ...c } = raw;
+    const mapped = { ...c, carriers: annotations };
+    classMap.set(raw, mapped);
+    return mapped;
+  });
   return {
     package: pkg,
-    classes: classes.map(({ annotations, ...c }) => ({ ...c, carriers: annotations })),
-    functions: functions.map(({ annotations, ...f }) => ({ ...f, carriers: annotations, end: blockEnd(lines, f.line) })),
+    classes: mappedClasses,
+    functions: functions.map(({ annotations, classes: enclosing, endLine, ...f }) => ({
+      ...f,
+      classes: (enclosing ?? []).flatMap((c) => {
+        const mapped = classMap.get(c);
+        return mapped ? [mapped] : [];
+      }),
+      carriers: annotations,
+      end: endLine,
+    })),
   };
 }
 
@@ -476,8 +448,9 @@ function codegenAdapter() {
       } catch {
         continue;
       }
-      const pkg = packageOf(text);
-      for (const cls of parseKotlin(text).classes) {
+      const parsed = parseKotlin(text);
+      const pkg = parsed.package ?? "";
+      for (const cls of parsed.classes) {
         byFqn.set(pkg ? `${pkg}.${cls.name}` : cls.name, file);
         if (!byPackage.has(pkg)) byPackage.set(pkg, new Map());
         /** @type {Map<string, string>} */ (byPackage.get(pkg)).set(cls.name, file);
@@ -488,12 +461,14 @@ function codegenAdapter() {
 
   support(prepared, file, text) {
     const p = /** @type {KotlinCodegenPrepared} */ (prepared);
-    const pkg = packageOf(text);
+    const header = parseKotlinHeader(text);
+    const pkg = header.package?.name ?? "";
+    const imports = header.imports.filter((imp) => !imp.fqn.endsWith(".*"));
     /** @type {Map<string, string>} */
     const imported = new Map();
-    for (const fqn of importsOf(text)) {
-      const target = p.byFqn.get(fqn);
-      if (target) imported.set(fqn.slice(fqn.lastIndexOf(".") + 1), target);
+    for (const imp of imports) {
+      const target = p.byFqn.get(imp.fqn);
+      if (target) imported.set(imp.alias ?? imp.fqn.slice(imp.fqn.lastIndexOf(".") + 1), target);
     }
     /** @type {Set<string>} */
     const out = new Set();
@@ -506,16 +481,8 @@ function codegenAdapter() {
       const target = p.byFqn.get(name) ?? imported.get(simple) ?? p.byPackage.get(pkg)?.get(simple);
       if (target && target !== file) out.add(target);
     };
-    for (const fqn of importsOf(text)) resolve(fqn);
-    const clean = cleanedKotlin(text);
-    for (const m of clean.matchAll(/\b(?:class|interface|object)\s+\w+[^{}]*?(?::\s*([^{}]+))?\s*\{/g)) {
-      for (const name of m[1]?.matchAll(/\b([A-Z]\w*(?:\.[A-Z]\w*)?)/g) ?? []) resolve(name[1]);
-    }
-    for (const m of clean.matchAll(/@[\w.]+(?:\(([^)]*)\))?/g)) {
-      for (const name of m[1]?.matchAll(/\b([A-Z]\w*)::class\b/g) ?? []) resolve(name[1]);
-    }
-    // Constructor calls: a known class or an imported one, never a Kotlin or JUnit API.
-    for (const m of clean.matchAll(/\b([A-Z]\w*)\s*\(/g)) resolve(m[1]);
+    for (const imp of imports) resolve(imp.fqn);
+    for (const name of kotlinSupportRefs(text)) resolve(name);
     return [...out];
   },
 
@@ -537,15 +504,18 @@ function codegenAdapter() {
   };
 }
 
-// The directory shared by every module path (`app/src/test/kotlin` and `app/support` → `app`).
+// The directory shared by every module path (`app/src/test/kotlin` and `app/support` → `app`; `e2e` → `e2e`).
 /**
  * @param {readonly string[]} paths
  * @returns {string}
  */
 function commonRoot(paths) {
-  let common = dirname((paths[0] ?? ".").replace(/\/+$/, ""));
-  for (const p of paths.slice(1)) {
-    while (common !== "." && p !== common && !p.startsWith(`${common}/`)) common = dirname(common);
+  if (!paths.length) return ".";
+  const norm = (/** @type {string} */ p) => posix.normalize((p || ".").replace(/\\/g, "/")).replace(/\/+$/, "") || ".";
+  let common = norm(paths[0]);
+  for (const raw of paths.slice(1)) {
+    const p = norm(raw);
+    while (common !== "." && !within(p, common)) common = posix.dirname(common);
   }
   return common === "" ? "." : common;
 }
@@ -566,46 +536,12 @@ function ancestors(dir) {
 }
 
 /**
- * The Kotlin package a file declares, or "".
- * @param {string} text
- * @returns {string}
- */
-function packageOf(text) {
-  return /^\s*package\s+([\w.]+)/m.exec(cleanedKotlin(text))?.[1] ?? "";
-}
-
-/**
- * The fully-qualified names a file imports.
- * @param {string} text
- * @returns {string[]}
- */
-function importsOf(text) {
-  return [...cleanedKotlin(text).matchAll(/^\s*import\s+([\w.]+)/gm)].map((m) => m[1]);
-}
-
-// Kotlin with strings and comments blanked: enough to find declarations, annotations and calls
-// without a page of prose or a brace in a string counting as code.
-/**
- * @param {string} text
- * @returns {string}
- */
-function cleanedKotlin(text) {
-  return text
-    .replace(/"""(?:[\s\S]*?)"""/g, '""')
-    .replace(/\/\*[\s\S]*?\*\//g, " ")
-    .replace(/\/\/[^\n]*/g, " ")
-    .replace(/"(?:\\.|[^"\\])*"/g, '""')
-    .replace(/'(?:\\.|[^'\\])*'/g, "''");
-}
-
-/**
  * The parts of a Kotlin file a per-file cap keeps: package/imports and the class header, hooks, and
  * the first three tests. A function's annotations start its block.
  * @param {string} text
  * @returns {CodegenShape}
  */
 function codegenShape(text) {
-  const lines = text.replace(/\r\n/g, "\n").split("\n");
   const { functions } = parseKotlin(text);
   /** @type {{ line: number, end: number }[]} */
   const hooks = [];
@@ -613,7 +549,7 @@ function codegenShape(text) {
   const tests = [];
   for (const fn of functions) {
     const start = Math.min(fn.line, ...fn.annotations.map((a) => a.line));
-    const end = blockEnd(lines, fn.line);
+    const end = fn.endLine;
     if (fn.annotations.some((a) => KOTLIN_HOOKS.has(last(a.name)))) hooks.push({ line: start, end });
     if (fn.annotations.some((a) => JUNIT_TESTS.has(last(a.name)) || a.name.split(".")[0] === "Test")) tests.push({ line: start, end });
   }
@@ -624,64 +560,13 @@ function codegenShape(text) {
   return { imports: null, header, hooks: hooks.sort((a, b) => a.line - b.line), tests: tests.sort((a, b) => a.line - b.line) };
 }
 
-// The line closing the brace block a function opens, or the last line when it has none.
-/**
- * @param {string[]} lines
- * @param {number} from
- * @returns {number}
- */
-function blockEnd(lines, from) {
-  let depth = 0;
-  let started = false;
-  let block = false;
-  let raw = false;
-  for (let i = Math.max(from - 1, 0); i < lines.length; i++) {
-    const line = lines[i];
-    for (let j = 0; j < line.length; j++) {
-      if (block) {
-        if (line[j] === "*" && line[j + 1] === "/") {
-          block = false;
-          j++;
-        }
-        continue;
-      }
-      if (raw) {
-        if (line.startsWith('"""', j)) {
-          raw = false;
-          j += 2;
-        }
-        continue;
-      }
-      if (line.startsWith('"""', j)) {
-        raw = true;
-        j += 2;
-      } else if (line[j] === '"' || line[j] === "'") {
-        const quote = line[j];
-        j++;
-        while (j < line.length && line[j] !== quote) j += line[j] === "\\" ? 2 : 1;
-      } else if (line[j] === "/" && line[j + 1] === "/") break;
-      else if (line[j] === "/" && line[j + 1] === "*") {
-        block = true;
-        j++;
-      } else if (line[j] === "{") {
-        depth++;
-        started = true;
-      } else if (line[j] === "}") {
-        depth--;
-        if (started && depth === 0) return i + 1;
-      }
-    }
-  }
-  return lines.length;
-}
-
 
 // --- write side --------------------------------------------------------------------------------
 
 // One Kotlin file with its keys written: a new `@Name("aut_…")` line above each Unkeyed function, a
 // copied key swapped for a fresh one on its own annotation line, a Key prefix above its class, and
 // the imports the annotations need. `home` is the package a carrier is declared in (null while
-// nothing declares it, so nothing is imported). Every write is a byte-offset splice, verified by
+// nothing declares it, so nothing is imported). Every write is a UTF-16 code-unit splice, verified by
 // re-parsing the result.
 /**
  * @param {string} text
@@ -732,29 +617,38 @@ function render(text, { annotate, rekey, prefix }, { name, names, home, prefix: 
       fail("stale", `\`${fn.name}\` no longer carries \`${from}\` at line ${fn.line}`);
       continue;
     }
-    const before = rekeyed.get(ann.line) ?? lines[ann.line - 1].text;
-    rekeyed.set(ann.line, before.replace(new RegExp(`(?<![0-9A-Za-z_])${from}(?![0-9A-Za-z_])`), handle.key));
+    const re = new RegExp(`(?<![0-9A-Za-z_-])${escapeRegex(from)}(?![0-9A-Za-z_-])`);
+    for (let ln = ann.line; ln <= ann.endLine; ln++) {
+      const before = rekeyed.get(ln) ?? lines[ln - 1].text;
+      if (!re.test(before)) continue;
+      rekeyed.set(ln, before.replace(re, handle.key));
+      break;
+    }
   }
   const edits = [...rekeyed].map(([n, after]) => ({ at: lines[n - 1].start, del: lines[n - 1].text.length, ins: after }));
   const inserts = [
-    ...annotate.map(({ fn, handle }) => ({ line: fn.line, found: at(fn), missing: `no function \`${fn.name}\` at line ${fn.line}`, text: `@${name}("${handle.key}")` })),
-    ...prefix.map(({ cls, prefix: p }) => ({ line: cls.line, found: hasClass(cls), missing: `no class \`${cls.path}\` at line ${cls.line}`, text: `@${prefixCarrier.name}("${p}")` })),
+    ...annotate.map(({ fn, handle }) => ({ kind: /** @type {const} */ ("annotate"), line: fn.line, found: at(fn), missing: `no function \`${fn.name}\` at line ${fn.line}`, text: `@${name}("${handle.key}")` })),
+    ...prefix.map(({ cls, prefix: p }) => ({ kind: /** @type {const} */ ("prefix"), line: cls.line, found: hasClass(cls), missing: `no class \`${cls.path}\` at line ${cls.line}`, text: `@${prefixCarrier.name}("${p}")` })),
   ];
   // Bottom-up, as the errors are reported; on one line, the last insert lands on top.
   /** @type {SpliceEdit[]} */
   const above = [];
+  let landedAnnotate = 0;
+  let landedPrefix = 0;
   for (const ins of inserts.sort((a, b) => b.line - a.line)) {
     if (!ins.found) {
       fail("stale", ins.missing);
       continue;
     }
+    if (ins.kind === "annotate") landedAnnotate++;
+    else landedPrefix++;
     const line = lines[ins.line - 1];
     above.push({ at: line.start, del: 0, ins: `${/** @type {RegExpMatchArray} */ (line.text.match(/^\s*/))[0]}${ins.text}${eol}` });
   }
   // A new line above a rewritten one lands first: they share the line's offset.
   let out = splice(text, [...above.reverse(), ...edits]);
-  if (home && annotate.length) out = addImport(out, `${home}.${name}`, home, eol);
-  if (prefix.length && prefixCarrier.home) out = addImport(out, `${prefixCarrier.home}.${prefixCarrier.name}`, prefixCarrier.home, eol);
+  if (home && landedAnnotate > 0) out = addImport(out, `${home}.${name}`, home, eol);
+  if (landedPrefix > 0 && prefixCarrier.home) out = addImport(out, `${prefixCarrier.home}.${prefixCarrier.name}`, prefixCarrier.home, eol);
 
   // A key that did not land on a test or class the file no longer holds is stale like its write.
   const reparsed = parseKotlin(out);
@@ -762,7 +656,7 @@ function render(text, { annotate, rekey, prefix }, { name, names, home, prefix: 
   /** @type {(fn: KotlinFnRef, key: string, under: string[], kind?: "function" | "class") => boolean} */
   const carries = (fn, key, under, kind = "function") => (/** @type {KotlinReparsed[]} */ (kind === "class" ? reparsed.classes : reparsed.functions)).some((f) =>
     (kind === "class" ? f.path === fn.path : f.name === fn.name && f.classPath === (fn.class ?? ""))
-    && f.annotations.some((a) => under.includes(last(a.name)) && holds(a, key)));
+    && f.annotations.some((a) => under.some((n) => a.name === n || a.name.endsWith(`.${n}`)) && holds(a, key)));
   for (const { fn, handle } of annotate) if (!carries(fn, handle.key, [name])) fail(at(fn) ? "unlanded" : "stale", `\`${handle.key}\` did not land on \`${fn.name}\``);
   for (const op of rekey) if (!carries(op.fn, op.handle.key, op.names ?? names, op.kind)) fail(gone.has(op) ? "stale" : "unlanded", `\`${op.handle.key}\` did not land on \`${op.fn.name}\``);
   for (const { cls, prefix: p } of prefix) {
@@ -771,6 +665,13 @@ function render(text, { annotate, rekey, prefix }, { name, names, home, prefix: 
   }
   return { text: out, errors };
 }
+
+// RegExp-escaped literal string.
+/**
+ * @param {string} s
+ * @returns {string}
+ */
+const escapeRegex = (/** @type {string} */ s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 // The keys one string argument holds: several may be listed, separated by commas.
 /**
@@ -820,15 +721,9 @@ function linesOf(text) {
  */
 function addImport(text, fqn, pkg, eol) {
   const lines = linesOf(text);
-  const filePkg = lines.map((l) => l.text.match(/^\s*package\s+([\w.]+)/)?.[1]).find(Boolean) ?? "";
-  if (filePkg === pkg) return text;
-  /** @type {{ i: number, name: string }[]} */
-  const imports = [];
-  lines.forEach((l, i) => {
-    const m = l.text.match(/^import\s+([\w.*]+)/);
-    if (m) imports.push({ i, name: m[1] });
-  });
-  if (imports.some((x) => x.name === fqn || x.name === `${pkg}.*`)) return text;
+  const header = parseKotlinHeader(text);
+  if ((header.package?.name ?? "") === pkg) return text;
+  if (header.imports.some((x) => (x.fqn === fqn && x.alias === null) || x.fqn === `${pkg}.*`)) return text;
   // `content` as a line (or lines) of its own, before line `i`, or after the last line.
   /**
    * @param {number} i
@@ -837,12 +732,13 @@ function addImport(text, fqn, pkg, eol) {
    */
   const insert = (i, content) => splice(text, [i < lines.length ? { at: lines[i].start, del: 0, ins: `${content}${eol}` } : { at: text.length, del: 0, ins: `${eol}${content}` }]);
   const line = `import ${fqn}`;
-  if (imports.length) {
-    const after = imports.find((x) => x.name > fqn);
-    return insert(after ? after.i : imports[imports.length - 1].i + 1, line);
+  if (header.imports.length) {
+    const after = header.imports.find((x) => x.fqn > fqn);
+    return insert(after ? after.line - 1 : header.imports[header.imports.length - 1].line, line);
   }
-  const p = lines.findIndex((l) => /^\s*package\s/.test(l.text));
-  return p === -1 ? insert(0, line) : insert(p + 1, `${eol}${line}`);
+  if (header.package) return insert(header.package.line, `${eol}${line}`);
+  if (header.fileAnnotationsEndLine > 0) return insert(header.fileAnnotationsEndLine, `${eol}${line}`);
+  return insert(0, line);
 }
 
 // --- the carrier's declaration -----------------------------------------------------------------
@@ -895,15 +791,11 @@ function declarationState(ctx, role = "automation_key") {
 function findDeclaration(ctx, role) {
   const [name] = carrierNames(ctx.config.annotationMap, role);
   const sources = /** @type {{ file: string, text: string }[]} */ (kotlinSources(ctx).map((file) => ({ file, text: read(join(ctx.repo, file)) })).filter((s) => s.text !== null));
-  /** @type {(n: string) => RegExp} */
-  const declares = (n) => new RegExp(`^[ \\t]*(?:[\\w@.()]+[ \\t]+)*annotation[ \\t]+class[ \\t]+${n}\\b`, "m");
-  /** @type {(text: string) => string} */
-  const packageOf = (text) => text.match(/^[ \t]*package[ \t]+([\w.]+)/m)?.[1] ?? "";
-  const found = sources.find((s) => declares(name).test(s.text));
-  if (found) return { status: "declared", path: found.file, home: packageOf(found.text) };
+  const found = sources.find((s) => hasAnnotationClass(s.text, name));
+  if (found) return { status: "declared", path: found.file, home: parseKotlinHeader(found.text).package?.name ?? "" };
   for (const s of sources) {
-    const m = s.text.match(new RegExp(`^[ \\t]*import[ \\t]+([\\w.]+)\\.${name}[ \\t]*$`, "m"));
-    if (m) return { status: "imported", home: m[1] };
+    const imp = parseKotlinHeader(s.text).imports.find((x) => x.alias === null && x.fqn.endsWith(`.${name}`));
+    if (imp) return { status: "imported", home: imp.fqn.slice(0, -(name.length + 1)) };
   }
   /** @type {(path: string) => string} */
   const dirOf = (path) => path.slice(0, path.lastIndexOf("/") + 1);
@@ -920,9 +812,9 @@ function findDeclaration(ctx, role) {
   }
   if (proposed.path === null) {
     const beside = carrierNames(ctx.config.annotationMap, "tracker_key_fn")
-      .map((n) => sources.find((s) => declares(n).test(s.text)))
+      .map((n) => sources.find((s) => hasAnnotationClass(s.text, n)))
       .find(Boolean);
-    if (beside) proposed = { path: `${dirOf(beside.file)}${name}.kt`, home: packageOf(beside.text) || null };
+    if (beside) proposed = { path: `${dirOf(beside.file)}${name}.kt`, home: parseKotlinHeader(beside.text).package?.name || null };
   }
   return { status: "missing", proposed };
 }
@@ -980,9 +872,13 @@ function declarationItem(name, state) {
  */
 function checkDeclaration(repo, { n, path, package: pkg }) {
   if (typeof path !== "string" || typeof pkg !== "string") return { problem: { code: "needs_edit", message: `name the declaration's \`path\` and \`package\` (edit item ${n})` } };
-  const abs = resolve(repo, path);
-  const rel = relative(repo, abs).split(sep).join("/");
-  if (rel.startsWith("..") || !rel.endsWith(".kt")) return { problem: { code: "bad_path", message: `\`${path}\` is not a \`.kt\` path inside the repository` } };
+  if (!isSafeRelativePath(path)) return { problem: { code: "bad_path", message: `\`${path}\` is not a \`.kt\` path inside the repository` } };
+  const repoAbs = resolve(repo);
+  const abs = resolve(repoAbs, path);
+  const rel = relative(repoAbs, abs).split(sep).join("/");
+  if (!rel || !isContained(repoAbs, abs) || !rel.endsWith(".kt") || !resolvesInside(repoAbs, path)) {
+    return { problem: { code: "bad_path", message: `\`${path}\` is not a \`.kt\` path inside the repository` } };
+  }
   if (existsSync(abs)) return { problem: { code: "bad_path", message: `\`${path}\` already exists` } };
   if (!/^[A-Za-z_]\w*(\.[A-Za-z_]\w*)*$/.test(pkg)) return { problem: { code: "bad_package", message: `\`${pkg}\` is not a Kotlin package name` } };
   return { path: rel, home: pkg };

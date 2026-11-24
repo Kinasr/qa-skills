@@ -82,7 +82,7 @@ export function headerSteps({ name, source }) {
  * @param {string} s
  * @returns {string}
  */
-function shellWord(s) {
+export function shellWord(s) {
   return /^[\w@%+=:,./-]+$/.test(s) ? s : `'${s.replaceAll("'", `'\\''`)}'`;
 }
 
